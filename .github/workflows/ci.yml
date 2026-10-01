@@ -450,6 +450,10 @@ jobs:
           grep -F 'aliases:' /tmp/sbx-network-compose.yml
           grep -F 'external: true' /tmp/sbx-network-compose.yml
 
+          chosen_port="$(printf '7890\n' | docker_network_choose_port 2>/tmp/sbx-port-ui.txt)"
+          test "$chosen_port" = "7890"
+          grep -F '可用代理入口：' /tmp/sbx-port-ui.txt
+          grep -F '7890  默认入口 -> proxy' /tmp/sbx-port-ui.txt
           docker_network_env 7891 | grep -F "HTTP_PROXY='http://sing-box:7891'"
           docker_network_snippet 7892 | grep -F 'HTTP_PROXY: http://sing-box:7892'
           docker_network_status | grep -F 'Docker网络: READY'

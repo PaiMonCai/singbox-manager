@@ -291,8 +291,8 @@ PY
 docker_network_choose_port(){
   local default_port raw
   default_port="$(envval SING_BOX_MIXED_PORT 7890)"
-  printf '可用代理入口：\n'
-  docker_network_known_ports
+  printf '可用代理入口：\n' >&2
+  docker_network_known_ports >&2
   read -r -p "托管目标使用哪个代理入口端口 [$default_port]: " raw
   raw="${raw:-$default_port}"
   [[ "$raw" =~ ^[0-9]+$ ]] && ((raw >= 1 && raw <= 65535)) || die "端口无效: $raw"
