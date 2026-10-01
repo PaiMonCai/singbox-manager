@@ -256,6 +256,7 @@ jobs:
             --target auto
 
           python lib/sbx_nodes.py inbound-list
+          python lib/sbx_nodes.py inbound-endpoints --json | python -c 'import json,sys; x=json.load(sys.stdin); assert x[0]["id"]=="default"; assert x[0]["port"]==7890; assert len(x)==3'
           python lib/sbx_nodes.py validate
           python lib/sbx_nodes.py render
 
@@ -393,9 +394,11 @@ jobs:
           : > "$FAKE_DOCKER_LOG"
 
           python lib/sbx_docker_targets.py scan | grep -F 'new-api-old'
-          python lib/sbx_docker_targets.py add new-api-old --port 7891 | grep -F 'compose:new-api/app'
-          python lib/sbx_docker_targets.py add standalone --port 7892 | grep -F 'name:standalone'
+          python lib/sbx_docker_targets.py add new-api-old --inbound-id default | grep -F 'compose:new-api/app'
+          python lib/sbx_docker_targets.py add standalone --inbound-id deadbeef | grep -F 'name:standalone'
           chmod 600 "$SBX_DOCKER_MANAGED_FILE"
+          grep -F '"inbound_id": "default"' "$SBX_DOCKER_MANAGED_FILE"
+          grep -F '"inbound_id": "deadbeef"' "$SBX_DOCKER_MANAGED_FILE"
 
           python lib/sbx_docker_targets.py list --network singbox-proxy | grep -F 'compose:new-api/app'
           python lib/sbx_docker_targets.py sync --network singbox-proxy
@@ -415,6 +418,7 @@ jobs:
           export HOME_DIR="${{ github.workspace }}/.ci-docker-net-home"
           export ENV="$HOME_DIR/.env"
           export NODES="$HOME_DIR/nodes/nodes.json"
+          export HELPER="${{ github.workspace }}/lib/sbx_nodes.py"
           export SBX_DOCKER_NETWORK_COMPOSE="$HOME_DIR/compose.network.yml"
           export SBX_DOCKER_NETWORK_NO_APPLY=1
           export SBX_DOCKER_WATCH_NO_APPLY=1
@@ -450,12 +454,27 @@ jobs:
           grep -F 'aliases:' /tmp/sbx-network-compose.yml
           grep -F 'external: true' /tmp/sbx-network-compose.yml
 
-          chosen_port="$(printf '7890\n' | docker_network_choose_port 2>/tmp/sbx-port-ui.txt)"
-          test "$chosen_port" = "7890"
-          grep -F '可用代理入口：' /tmp/sbx-port-ui.txt
-          grep -F '7890  默认入口 -> proxy' /tmp/sbx-port-ui.txt
-          docker_network_env 7891 | grep -F "HTTP_PROXY='http://sing-box:7891'"
-          docker_network_snippet 7892 | grep -F 'HTTP_PROXY: http://sing-box:7892'
+          chosen_id="$(printf 'default\n' | docker_network_choose_inbound 2>/tmp/sbx-inbound-ui.txt)"
+          test "$chosen_id" = "default"
+          grep -F '可用代理入口（按 ID 选择）：' /tmp/sbx-inbound-ui.txt
+          grep -F 'default' /tmp/sbx-inbound-ui.txt
+          docker_network_urls | grep -F '[default] 默认入口'
+          docker_network_env default | grep -F "HTTP_PROXY='http://sing-box:7890'"
+          CUSTOM_INBOUND_ID="$(python lib/sbx_nodes.py inbound-endpoints --json | python -c 'import json,sys; x=json.load(sys.stdin); print(x[1]["id"])')"
+          test -n "$CUSTOM_INBOUND_ID"
+          docker_network_env "$CUSTOM_INBOUND_ID" | grep -F "HTTP_PROXY='http://sing-box:7891'"
+          docker_network_snippet "$CUSTOM_INBOUND_ID" | grep -F 'HTTP_PROXY: http://sing-box:7891'
+
+          python lib/sbx_nodes.py inbound-edit "$CUSTOM_INBOUND_ID" \
+            --name HK-entry --listen 127.0.0.1 --port 7991 --target node:11111111
+          docker_network_env "$CUSTOM_INBOUND_ID" | grep -F "HTTP_PROXY='http://sing-box:7991'"
+
+          cat > "$SBX_DOCKER_MANAGED_FILE" <<'EOF'
+          {"version":1,"targets":[{"type":"name","name":"legacy-app","port":7890}]}
+          EOF
+          docker_network_migrate_legacy_targets
+          grep -F '"inbound_id": "default"' "$SBX_DOCKER_MANAGED_FILE"
+          ! grep -F '"port":' "$SBX_DOCKER_MANAGED_FILE"
           docker_network_status | grep -F 'Docker网络: READY'
           docker_network_watch_on
           grep -F 'ExecStart=' "$SBX_DOCKER_WATCH_SERVICE"

@@ -138,20 +138,22 @@ def scan_rows() -> List[Dict[str, Any]]:
             "service": ident.get("service"),
             "key": key,
             "managed": key in managed,
-            "port": (managed.get(key) or {}).get("port"),
+            "inbound_id": (managed.get(key) or {}).get("inbound_id"),
+            "legacy_port": (managed.get(key) or {}).get("port"),
         })
     rows.sort(key=lambda x: (x.get("project") or "", x.get("service") or "", x["name"]))
     return rows
 
 
-def add_target(ref: str, port: int) -> Dict[str, Any]:
-    if not 1 <= port <= 65535:
-        raise ValueError("代理入口端口必须是 1-65535")
+def add_target(ref: str, inbound_id: str) -> Dict[str, Any]:
+    inbound_id = str(inbound_id or "").strip()
+    if not inbound_id:
+        raise ValueError("代理入口 ID 不能为空")
     obj = docker_json(ref)
     if is_manager_container(obj):
         raise ValueError("不能把 sing-box 自己加入托管目标")
     target = identity(obj)
-    target["port"] = port
+    target["inbound_id"] = inbound_id
     target["last_name"] = container_name(obj)
     state = load_state()
     key = target_key(target)
@@ -245,7 +247,8 @@ def print_scan(rows: List[Dict[str, Any]]) -> None:
         comp = ""
         if row["type"] == "compose":
             comp = f"{row.get('project')}/{row.get('service')}"
-        managed = f"YES:{row['port']}" if row["managed"] else "NO"
+        managed_ref = row.get("inbound_id") or (f"legacy:{row.get('legacy_port')}" if row.get("legacy_port") else "")
+        managed = f"YES:{managed_ref}" if row["managed"] else "NO"
         print(f"{idx:<4} {row['name'][:24]:<26} {('RUN' if row['running'] else 'STOP'):<8} {row['type']:<10} {comp[:30]:<32} {managed}")
 
 
@@ -253,11 +256,12 @@ def print_list(rows: List[Dict[str, Any]]) -> None:
     if not rows:
         print("暂无托管 Docker 目标。")
         return
-    print(f"{'KEY':<42} {'PORT':<7} {'MATCH':<24} {'RUN':<20} CONNECTED")
-    print("-" * 115)
+    print(f"{'KEY':<42} {'INBOUND_ID':<12} {'MATCH':<24} {'RUN':<20} CONNECTED")
+    print("-" * 122)
     for row in rows:
+        inbound_id = row.get("inbound_id") or (f"legacy:{row.get('port')}" if row.get("port") else "")
         print(
-            f"{row['key'][:40]:<42} {str(row.get('port','')):<7} "
+            f"{row['key'][:40]:<42} {str(inbound_id)[:10]:<12} "
             f"{','.join(row['matches'])[:22]:<24} {','.join(row['running'])[:18]:<20} "
             f"{','.join(row['connected'])}"
         )
@@ -273,7 +277,7 @@ def cmd_scan(args: argparse.Namespace) -> int:
 
 
 def cmd_add(args: argparse.Namespace) -> int:
-    target = add_target(args.container, args.port)
+    target = add_target(args.container, args.inbound_id)
     print(json.dumps({**target, "key": target_key(target)}, ensure_ascii=False))
     return 0
 
@@ -313,7 +317,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     a = sp.add_parser("add")
     a.add_argument("container")
-    a.add_argument("--port", type=int, required=True)
+    a.add_argument("--inbound-id", required=True)
     a.set_defaults(func=cmd_add)
 
     r = sp.add_parser("remove")

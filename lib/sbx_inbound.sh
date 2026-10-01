@@ -2,7 +2,7 @@
 # singbox-manager v0.6 multi-inbound routing integration.
 # Sourced after the node/proxy/bootstrap/image layers.
 
-VERSION="0.6.0"
+VERSION="0.10.0"
 
 inbound_tx(){
   local op="$1" ref="${2:-}" rollback rc=0
@@ -83,7 +83,7 @@ inbound_cmd(){
     help|-h|--help)
       cat <<'EOF'
 sbx inbound                       入口管理菜单
-sbx inbound list                  查看自定义入口
+sbx inbound list                  查看全部入口及唯一 ID
 sbx inbound add                   添加 mixed 入口
 sbx inbound edit [ID|名称]        编辑入口
 sbx inbound delete [ID|名称]      删除入口
@@ -106,7 +106,7 @@ inbound_menu(){
   while true; do
     clear
     printf '%b入口路由管理%b\n' "$C" "$N"
-    printf '默认入口: %s:%s -> proxy（受全局 strategy / route 控制）\n\n'       "$(envval SING_BOX_BIND_ADDR 127.0.0.1)" "$(envval SING_BOX_MIXED_PORT 7890)"
+    printf '每个代理入口都有稳定 ID；Docker 托管建议按 ID 绑定。\n\n'
     python3 "$HELPER" inbound-list || true
     printf '\n1 添加  2 编辑  3 删除  4 详情  5 测试  0 返回\n'
     read -r -p '请选择: ' x || return

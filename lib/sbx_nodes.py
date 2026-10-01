@@ -203,13 +203,52 @@ def default_host_port() -> int:
         return 7890
 
 
+def inbound_endpoints(data: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
+    data = data or load_registry()
+    items: List[Dict[str, Any]] = [{
+        "id": "default",
+        "name": "默认入口",
+        "type": "mixed",
+        "listen": read_env_file().get("SING_BOX_BIND_ADDR", "127.0.0.1"),
+        "port": default_host_port(),
+        "target": {"type": "proxy"},
+        "builtin": True,
+    }]
+    for inbound in data.get("inbounds", []):
+        item = dict(inbound)
+        item["builtin"] = False
+        items.append(item)
+    return items
+
+
+def resolve_inbound_endpoint(data: Dict[str, Any], ref: Optional[str]) -> Dict[str, Any]:
+    items = inbound_endpoints(data)
+    raw = (ref or "default").strip()
+    exact = [x for x in items if str(x.get("id")) == raw]
+    if len(exact) == 1:
+        return exact[0]
+    prefix = [x for x in items if str(x.get("id", "")).startswith(raw)]
+    if len(prefix) == 1:
+        return prefix[0]
+    named = [x for x in items if x.get("name") == raw]
+    if len(named) == 1:
+        return named[0]
+    if raw.isdigit():
+        by_port = [x for x in items if int(x.get("port", 0)) == int(raw)]
+        if len(by_port) == 1:
+            return by_port[0]
+    if len(prefix) > 1 or len(named) > 1:
+        raise ValueError("匹配到多个代理入口，请使用完整 ID")
+    raise ValueError(f"未找到代理入口: {raw}")
+
+
 def resolve_inbound(data: Dict[str, Any], ref: Optional[str]) -> Dict[str, Any]:
     items = data.get("inbounds", [])
     if not items:
         raise ValueError("当前没有自定义入口")
     if not ref:
-        list_inbounds(data)
-        ref = prompt("请输入入口 ID 或名称", required=True)
+        list_inbounds(data, include_default=False)
+        ref = prompt("请输入自定义入口 ID 或名称", required=True)
     exact = [x for x in items if x.get("id") == ref]
     if len(exact) == 1:
         return exact[0]
@@ -789,17 +828,18 @@ def list_nodes(data: Optional[Dict[str, Any]] = None) -> None:
         print(f"{mark:<4} {n.get('id',''):<10} {n.get('type',''):<12} {n.get('name','')[:20]:<22} {src[:12]:<14} {n.get('server')}:{n.get('server_port')}")
 
 
-def list_inbounds(data: Optional[Dict[str, Any]] = None) -> None:
+def list_inbounds(data: Optional[Dict[str, Any]] = None, include_default: bool = True) -> None:
     data = data or load_registry()
-    items = data.get("inbounds", [])
+    items = inbound_endpoints(data) if include_default else list(data.get("inbounds", []))
     if not items:
-        print("暂无自定义入口。默认入口仍由 .env 中的 SING_BOX_MIXED_PORT 提供。")
+        print("暂无自定义入口。")
         return
     print(f"{'ID':<10} {'名称':<22} {'监听':<24} 出口")
     print("-" * 90)
     for item in items:
         addr = f"{item.get('listen')}:{item.get('port')}"
-        print(f"{item.get('id',''):<10} {item.get('name','')[:20]:<22} {addr:<24} {target_label(data, item.get('target'))}")
+        label = "proxy" if item.get("id") == "default" else target_label(data, item.get("target"))
+        print(f"{item.get('id',''):<10} {item.get('name','')[:20]:<22} {addr:<24} {label}")
 
 
 def list_subscriptions(data: Optional[Dict[str, Any]] = None) -> None:
@@ -886,6 +926,30 @@ def cmd_inbound_list(_: argparse.Namespace) -> int:
     list_inbounds(); return 0
 
 
+def cmd_inbound_endpoints(args: argparse.Namespace) -> int:
+    data = load_registry()
+    items = inbound_endpoints(data)
+    if args.json:
+        out = []
+        for item in items:
+            row = dict(item)
+            row["resolved_outbound"] = "proxy" if item.get("id") == "default" else target_tag(data, item.get("target"))
+            out.append(row)
+        print(json.dumps(out, ensure_ascii=False))
+    else:
+        list_inbounds(data)
+    return 0
+
+
+def cmd_inbound_endpoint(args: argparse.Namespace) -> int:
+    data = load_registry()
+    item = resolve_inbound_endpoint(data, args.ref)
+    out = dict(item)
+    out["resolved_outbound"] = "proxy" if item.get("id") == "default" else target_tag(data, item.get("target"))
+    print(json.dumps(out, ensure_ascii=False))
+    return 0
+
+
 def cmd_inbound_add(args: argparse.Namespace) -> int:
     data = load_registry()
     inbound = build_inbound(data, name=args.name, listen=args.listen, port=args.port, target_ref=args.target)
@@ -915,8 +979,10 @@ def cmd_inbound_delete(args: argparse.Namespace) -> int:
 
 
 def cmd_inbound_show(args: argparse.Namespace) -> int:
-    data = load_registry(); inbound = resolve_inbound(data, args.ref)
-    out = dict(inbound); out["resolved_outbound"] = target_tag(data, inbound.get("target"))
+    data = load_registry()
+    inbound = resolve_inbound_endpoint(data, args.ref)
+    out = dict(inbound)
+    out["resolved_outbound"] = "proxy" if inbound.get("id") == "default" else target_tag(data, inbound.get("target"))
     print(json.dumps(out, ensure_ascii=False, indent=2)); return 0
 
 
@@ -986,6 +1052,8 @@ def parser() -> argparse.ArgumentParser:
     iu=sub.add_parser("import-uri"); iu.add_argument("uri", nargs="?"); iu.set_defaults(func=cmd_import_uri)
     im=sub.add_parser("import-file"); im.add_argument("file"); im.add_argument("--source"); im.set_defaults(func=cmd_import_file)
     il=sub.add_parser("inbound-list"); il.set_defaults(func=cmd_inbound_list)
+    ieps=sub.add_parser("inbound-endpoints"); ieps.add_argument("--json", action="store_true"); ieps.set_defaults(func=cmd_inbound_endpoints)
+    iep=sub.add_parser("inbound-endpoint"); iep.add_argument("ref", nargs="?", default="default"); iep.set_defaults(func=cmd_inbound_endpoint)
     ia=sub.add_parser("inbound-add"); ia.add_argument("--name"); ia.add_argument("--listen"); ia.add_argument("--port", type=int); ia.add_argument("--target"); ia.set_defaults(func=cmd_inbound_add)
     ie=sub.add_parser("inbound-edit"); ie.add_argument("ref", nargs="?"); ie.add_argument("--name"); ie.add_argument("--listen"); ie.add_argument("--port", type=int); ie.add_argument("--target"); ie.set_defaults(func=cmd_inbound_edit)
     idel=sub.add_parser("inbound-delete"); idel.add_argument("ref", nargs="?"); idel.add_argument("--yes", action="store_true"); idel.set_defaults(func=cmd_inbound_delete)

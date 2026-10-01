@@ -2,7 +2,7 @@
 
 面向 Linux 服务器的 sing-box Docker 管理层。sing-box 保持官方镜像运行，宿主机通过 `sbx` 完成安装、节点管理、配置生成、校验、测试、备份恢复与升级。
 
-当前版本：**0.9.1**
+当前版本：**0.10.0**
 
 ## 一键交互式安装
 
@@ -204,6 +204,64 @@ sbx route cn-direct-full
 
 
 
+
+
+## 0.10：代理入口唯一 ID 绑定
+
+Docker 托管目标不再绑定入口端口，而是绑定稳定的代理入口 ID。
+
+所有代理入口现在统一显示 ID：
+
+```text
+ID        名称       监听                 出口
+default   默认入口   127.0.0.1:7890       proxy
+a1b2c3d4  香港入口   127.0.0.1:7891       香港节点
+e5f6a7b8  日本入口   127.0.0.1:7892       日本节点
+```
+
+默认入口的稳定 ID 为：
+
+```text
+default
+```
+
+自定义入口继续使用创建时生成的 8 位唯一 ID，不会因为改名或修改端口而变化。
+
+Docker 托管现在保存：
+
+```json
+{
+  "inbound_id": "a1b2c3d4"
+}
+```
+
+而不是：
+
+```json
+{
+  "port": 7891
+}
+```
+
+因此如果把 `a1b2c3d4` 的端口从 7891 改为 7901，Docker 托管关系仍绑定同一个入口，manager 会按 ID 动态解析当前端口。
+
+推荐命令：
+
+```bash
+sbx inbound list
+sbx docker-network manage new-api-A default
+sbx docker-network manage new-api-B a1b2c3d4
+sbx docker-network env a1b2c3d4
+sbx docker-network snippet a1b2c3d4
+```
+
+交互式“扫描并托管”也改为按入口 ID 选择：
+
+```text
+代理入口 ID [default]:
+```
+
+旧版 `docker-managed.json` 中已经保存的 `port` 会在第一次查看/同步时按当前入口表迁移为 `inbound_id`。为了兼容旧脚本，数字端口仍可作为查询引用使用，但新的托管状态只保存 ID。
 
 ## 0.9.1：修复扫描托管端口选择
 

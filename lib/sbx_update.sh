@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # singbox-manager v0.7 self-update integration.
 
-VERSION="0.9.1"
+VERSION="0.10.0"
 
 UPDATE_REPO="${SBX_UPDATE_REPO:-PaiMonCai/singbox-manager}"
 UPDATE_BRANCH="${SBX_UPDATE_BRANCH:-main}"
@@ -239,7 +239,7 @@ EOF
 }
 
 version(){
-  printf 'singbox-manager: %s\npinned sing-box: %s\nimage: %s\nstrategy: %s\nroute: %s\ncustom inbounds: %s\nproxy: %s\n'     "$(manager_local_version)" "$(image_version)" "$(image_ref)"     "$(python3 "$HELPER" strategy)" "$(python3 "$HELPER" route-mode)"     "$(python3 "$HELPER" inbound-list 2>/dev/null | awk 'NR>2{n++} END{print n+0}')"     "$(proxy_url)"
+  printf 'singbox-manager: %s\npinned sing-box: %s\nimage: %s\nstrategy: %s\nroute: %s\ncustom inbounds: %s\nproxy: %s\n'     "$(manager_local_version)" "$(image_version)" "$(image_ref)"     "$(python3 "$HELPER" strategy)" "$(python3 "$HELPER" route-mode)"     "$(python3 "$HELPER" inbound-endpoints --json 2>/dev/null | python3 -c 'import json,sys; print(max(0,len(json.load(sys.stdin))-1))' 2>/dev/null || printf '0')"     "$(proxy_url)"
 }
 
 menu(){
@@ -249,7 +249,7 @@ menu(){
     printf '%b' "$C"
     cat <<'EOF'
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-        singbox-manager 0.9.1
+        singbox-manager 0.10
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
  1 状态      2 启动      3 停止      4 重启
  5 日志      6 节点管理  7 导入      8 订阅管理

@@ -182,38 +182,23 @@ docker_network_disconnect(){
 }
 
 docker_network_urls(){
-  local host="$DOCKER_NETWORK_ALIAS" default_port
-  default_port="$(envval SING_BOX_MIXED_PORT 7890)"
-  printf '默认入口\n'
-  printf '  HTTP/HTTPS: http://%s:%s\n' "$host" "$default_port"
-  printf '  SOCKS5:     socks5h://%s:%s\n' "$host" "$default_port"
-
-  if [[ -f "$NODES" ]]; then
-    python3 - "$NODES" "$host" <<'PY'
-import json, sys
-from pathlib import Path
-p = Path(sys.argv[1])
-host = sys.argv[2]
-try:
-    data = json.loads(p.read_text(encoding="utf-8"))
-except Exception:
-    raise SystemExit(0)
-for item in data.get("inbounds", []):
-    name = item.get("name", item.get("id", "inbound"))
-    port = item.get("port")
-    target = item.get("target") or {}
-    target_type = target.get("type", "?")
-    print()
-    print(f"{name} -> {target_type}")
-    print(f"  HTTP/HTTPS: http://{host}:{port}")
-    print(f"  SOCKS5:     socks5h://{host}:{port}")
+  local host="$DOCKER_NETWORK_ALIAS" items
+  items="$(python3 "$HELPER" inbound-endpoints --json)" || return 1
+  python3 - "$host" "$items" <<'PY'
+import json,sys
+host=sys.argv[1]
+items=json.loads(sys.argv[2])
+for i,item in enumerate(items):
+    if i: print()
+    print(f"[{item['id']}] {item['name']} -> {item.get('resolved_outbound','') or (item.get('target') or {}).get('type','?')}")
+    print(f"  HTTP/HTTPS: http://{host}:{item['port']}")
+    print(f"  SOCKS5:     socks5h://{host}:{item['port']}")
 PY
-  fi
 }
 
 docker_network_env(){
-  local port="${1:-$(envval SING_BOX_MIXED_PORT 7890)}"
-  [[ "$port" =~ ^[0-9]+$ ]] && ((port >= 1 && port <= 65535)) || die "端口无效: $port"
+  local inbound_ref="${1:-default}" port
+  port="$(docker_network_inbound_port "$inbound_ref")" || die "代理入口不存在: $inbound_ref"
   printf "export HTTP_PROXY='http://%s:%s'\n" "$DOCKER_NETWORK_ALIAS" "$port"
   printf "export HTTPS_PROXY='http://%s:%s'\n" "$DOCKER_NETWORK_ALIAS" "$port"
   printf "export ALL_PROXY='socks5h://%s:%s'\n" "$DOCKER_NETWORK_ALIAS" "$port"
@@ -225,9 +210,9 @@ docker_network_env(){
 }
 
 docker_network_snippet(){
-  local port="${1:-$(envval SING_BOX_MIXED_PORT 7890)}" net
+  local inbound_ref="${1:-default}" port net
   net="$(docker_network_name)"
-  [[ "$port" =~ ^[0-9]+$ ]] && ((port >= 1 && port <= 65535)) || die "端口无效: $port"
+  port="$(docker_network_inbound_port "$inbound_ref")" || die "代理入口不存在: $inbound_ref"
   cat <<EOF
 services:
   your-app:
@@ -271,33 +256,86 @@ docker_network_status(){
   fi
 }
 
-docker_network_known_ports(){
-  printf '  %s  默认入口 -> proxy\n' "$(envval SING_BOX_MIXED_PORT 7890)"
-  if [[ -f "$NODES" ]]; then
-    python3 - "$NODES" <<'PY'
-import json, sys
-from pathlib import Path
-try:
-    data=json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
-except Exception:
-    raise SystemExit(0)
-for item in data.get("inbounds", []):
-    target=(item.get("target") or {}).get("type","?")
-    print(f"  {item.get('port')}  {item.get('name', item.get('id','inbound'))} -> {target}")
-PY
-  fi
+docker_network_endpoints_json(){
+  python3 "$HELPER" inbound-endpoints --json
 }
 
-docker_network_choose_port(){
-  local default_port raw
-  default_port="$(envval SING_BOX_MIXED_PORT 7890)"
-  printf '可用代理入口：\n' >&2
-  docker_network_known_ports >&2
-  read -r -p "托管目标使用哪个代理入口端口 [$default_port]: " raw
-  raw="${raw:-$default_port}"
-  [[ "$raw" =~ ^[0-9]+$ ]] && ((raw >= 1 && raw <= 65535)) || die "端口无效: $raw"
-  printf '%s\n' "$raw"
+docker_network_known_inbounds(){
+  python3 "$HELPER" inbound-endpoints
 }
+
+docker_network_resolve_inbound(){
+  local ref="${1:-default}"
+  python3 "$HELPER" inbound-endpoint "$ref"
+}
+
+docker_network_inbound_id(){
+  local ref="${1:-default}"
+  docker_network_resolve_inbound "$ref" | python3 -c 'import json,sys; print(json.load(sys.stdin)["id"])'
+}
+
+docker_network_inbound_port(){
+  local ref="${1:-default}"
+  docker_network_resolve_inbound "$ref" | python3 -c 'import json,sys; print(json.load(sys.stdin)["port"])'
+}
+
+docker_network_inbound_name(){
+  local ref="${1:-default}"
+  docker_network_resolve_inbound "$ref" | python3 -c 'import json,sys; print(json.load(sys.stdin)["name"])'
+}
+
+docker_network_choose_inbound(){
+  local raw resolved
+  printf '可用代理入口（按 ID 选择）：\n' >&2
+  docker_network_known_inbounds >&2
+  read -r -p '代理入口 ID [default]: ' raw
+  raw="${raw:-default}"
+  resolved="$(docker_network_resolve_inbound "$raw")" || return 1
+  printf '%s\n' "$resolved" | python3 -c 'import json,sys; print(json.load(sys.stdin)["id"])'
+}
+
+docker_network_migrate_legacy_targets(){
+  [[ -f "$DOCKER_MANAGED_FILE" ]] || return 0
+  local endpoints
+  endpoints="$(docker_network_endpoints_json)" || return 1
+  SBX_DOCKER_MANAGED_FILE="$DOCKER_MANAGED_FILE" python3 - "$DOCKER_MANAGED_FILE" "$endpoints" <<'PY'
+import json, os, sys, tempfile
+from pathlib import Path
+path=Path(sys.argv[1])
+endpoints=json.loads(sys.argv[2])
+try:
+    data=json.loads(path.read_text(encoding="utf-8"))
+except Exception:
+    raise SystemExit(0)
+by_port={int(x["port"]): str(x["id"]) for x in endpoints}
+changed=False
+for target in data.get("targets", []):
+    if target.get("inbound_id"):
+        continue
+    port=target.get("port")
+    try:
+        port=int(port)
+    except (TypeError, ValueError):
+        continue
+    if port in by_port:
+        target["inbound_id"]=by_port[port]
+        target.pop("port", None)
+        changed=True
+if changed:
+    fd,tmp=tempfile.mkstemp(prefix=".docker-managed.",dir=str(path.parent))
+    try:
+        with os.fdopen(fd,"w",encoding="utf-8") as f:
+            json.dump(data,f,ensure_ascii=False,indent=2)
+            f.write("\n")
+        os.chmod(tmp,0o600)
+        os.replace(tmp,path)
+        os.chmod(path,0o600)
+    finally:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
+PY
+}
+
 
 docker_network_watch_on(){
   command -v systemctl >/dev/null 2>&1 || { warn "当前系统没有 systemd，无法启用 Docker watcher；可手工执行 sbx docker-network sync。"; return 1; }
@@ -359,6 +397,7 @@ docker_network_sync(){
   net="$(docker_network_name)"
   docker_network_create_if_missing "$net"
   [[ -f "$DOCKER_TARGET_HELPER" ]] || die "缺少 Docker 托管 helper: $DOCKER_TARGET_HELPER"
+  docker_network_migrate_legacy_targets || true
   if ((quiet)); then
     SBX_DOCKER_MANAGED_FILE="$DOCKER_MANAGED_FILE" python3 "$DOCKER_TARGET_HELPER" sync --network "$net" --quiet
   else
@@ -367,30 +406,51 @@ docker_network_sync(){
 }
 
 docker_network_managed_list(){
-  local net
+  local net rows endpoints
   net="$(docker_network_name)"
   [[ -f "$DOCKER_TARGET_HELPER" ]] || die "缺少 Docker 托管 helper。"
-  SBX_DOCKER_MANAGED_FILE="$DOCKER_MANAGED_FILE" python3 "$DOCKER_TARGET_HELPER" list --network "$net"
+  docker_network_migrate_legacy_targets || true
+  rows="$(SBX_DOCKER_MANAGED_FILE="$DOCKER_MANAGED_FILE" python3 "$DOCKER_TARGET_HELPER" list --network "$net" --json)"
+  endpoints="$(docker_network_endpoints_json)"
+  python3 - "$rows" "$endpoints" <<'PY'
+import json,sys
+rows=json.loads(sys.argv[1]); eps=json.loads(sys.argv[2])
+by_id={str(x["id"]):x for x in eps}
+if not rows:
+    print("暂无托管 Docker 目标。")
+    raise SystemExit(0)
+print(f"{'KEY':<42} {'INBOUND_ID':<12} {'入口':<18} {'PORT':<7} {'RUN':<18} CONNECTED")
+print("-"*125)
+for r in rows:
+    iid=str(r.get("inbound_id") or "")
+    ep=by_id.get(iid)
+    name=(ep or {}).get("name","MISSING")
+    port=str((ep or {}).get("port","-"))
+    print(f"{r['key'][:40]:<42} {iid[:10]:<12} {name[:16]:<18} {port:<7} {','.join(r.get('running',[]))[:16]:<18} {','.join(r.get('connected',[]))}")
+PY
 }
 
 docker_network_manage(){
-  local container="${1:-}" port="${2:-}" net
+  local container="${1:-}" inbound_ref="${2:-default}" net inbound_json inbound_id port name
   net="$(docker_network_name)"
-  [[ -n "$container" ]] || die "用法: sbx docker-network manage <容器> [入口端口]"
+  [[ -n "$container" ]] || die "用法: sbx docker-network manage <容器> [入口ID]"
   docker inspect "$container" >/dev/null 2>&1 || die "未找到容器: $container"
-  if [[ -z "$port" ]]; then
-    port="$(docker_network_choose_port)"
-  fi
-  [[ "$port" =~ ^[0-9]+$ ]] && ((port >= 1 && port <= 65535)) || die "端口无效: $port"
+
+  inbound_json="$(docker_network_resolve_inbound "$inbound_ref")" || die "代理入口不存在: $inbound_ref"
+  inbound_id="$(printf '%s\n' "$inbound_json" | python3 -c 'import json,sys; print(json.load(sys.stdin)["id"])')"
+  port="$(printf '%s\n' "$inbound_json" | python3 -c 'import json,sys; print(json.load(sys.stdin)["port"])')"
+  name="$(printf '%s\n' "$inbound_json" | python3 -c 'import json,sys; print(json.load(sys.stdin)["name"])')"
 
   docker_network_enabled || docker_network_on "$net"
-  SBX_DOCKER_MANAGED_FILE="$DOCKER_MANAGED_FILE" python3 "$DOCKER_TARGET_HELPER" add "$container" --port "$port"
+  docker_network_migrate_legacy_targets || true
+  SBX_DOCKER_MANAGED_FILE="$DOCKER_MANAGED_FILE" python3 "$DOCKER_TARGET_HELPER" add "$container" --inbound-id "$inbound_id"
   docker_network_sync
   if command -v systemctl >/dev/null 2>&1; then
     docker_network_watch_on || true
   fi
   info "已纳入托管。容器重建后 watcher 会按 Compose project/service 或名称重新接入。"
-  printf '建议应用代理：http://%s:%s\n' "$DOCKER_NETWORK_ALIAS" "$port"
+  printf '代理入口: [%s] %s\n' "$inbound_id" "$name"
+  printf '当前代理：http://%s:%s\n' "$DOCKER_NETWORK_ALIAS" "$port"
 }
 
 docker_network_unmanage(){
@@ -406,7 +466,7 @@ docker_network_unmanage(){
 
 docker_network_scan_manage(){
   [[ -f "$DOCKER_TARGET_HELPER" ]] || die "缺少 Docker 托管 helper。"
-  local json selection port token idx name
+  local json selection inbound_id token idx name
   json="$(SBX_DOCKER_MANAGED_FILE="$DOCKER_MANAGED_FILE" python3 "$DOCKER_TARGET_HELPER" scan --json)"
   python3 - "$json" <<'PY'
 import json,sys
@@ -418,7 +478,8 @@ print(f"{'#':<4} {'容器':<26} {'状态':<8} {'类型':<10} {'Compose project/s
 print("-"*105)
 for i,r in enumerate(rows,1):
     comp=f"{r.get('project')}/{r.get('service')}" if r.get('type')=="compose" else ""
-    managed=f"YES:{r.get('port')}" if r.get('managed') else "NO"
+    managed_ref=r.get("inbound_id") or (f"legacy:{r.get('legacy_port')}" if r.get("legacy_port") else "")
+    managed=f"YES:{managed_ref}" if r.get('managed') else "NO"
     print(f"{i:<4} {r.get('name','')[:24]:<26} {('RUN' if r.get('running') else 'STOP'):<8} {r.get('type',''):<10} {comp[:32]:<34} {managed}")
 PY
   if [[ "$(python3 - "$json" <<'PY'
@@ -431,7 +492,7 @@ PY
 
   read -r -p '选择要托管的编号（支持 1,2,5；0 返回）: ' selection
   [[ "$selection" != "0" && -n "$selection" ]] || return 0
-  port="$(docker_network_choose_port)"
+  inbound_id="$(docker_network_choose_inbound)" || return 1
 
   IFS=',' read -ra choices <<< "$selection"
   for token in "${choices[@]}"; do
@@ -445,7 +506,7 @@ if 1 <= idx <= len(rows): print(rows[idx-1]["name"])
 PY
 )"
     [[ -n "$name" ]] || { warn "编号不存在: $idx"; continue; }
-    docker_network_manage "$name" "$port"
+    docker_network_manage "$name" "$inbound_id"
   done
 }
 
@@ -518,7 +579,7 @@ sbx docker-network on [network]       创建并启用共享代理网络
 sbx docker-network off                关闭 sing-box 的持久共享网络接入
 sbx docker-network status             查看状态
 sbx docker-network scan               扫描 Docker 并按编号选择托管
-sbx docker-network manage <container> [port]
+sbx docker-network manage <container> [入口ID]
 sbx docker-network unmanage <container|KEY>
 sbx docker-network managed            查看托管目标
 sbx docker-network sync [--quiet]     立即按托管清单补接网络
@@ -527,8 +588,8 @@ sbx docker-network connect <container>    临时接入当前容器实例
 sbx docker-network disconnect <container> 临时移除当前容器实例
 sbx docker-network list               查看网络成员
 sbx docker-network urls               查看默认/自定义入口的容器内代理地址
-sbx docker-network env [port]         输出容器侧代理环境变量
-sbx docker-network snippet [port]     输出其他 Compose 项目的接入模板
+sbx docker-network env [入口ID]       输出容器侧代理环境变量
+sbx docker-network snippet [入口ID]   输出其他 Compose 项目的接入模板
 EOF
       ;;
     *) die "未知 docker-network 命令: $op" ;;
