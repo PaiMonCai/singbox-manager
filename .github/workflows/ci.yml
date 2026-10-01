@@ -17,6 +17,7 @@ jobs:
         run: |
           bash -n install.sh
           bash -n bin/sbx
+          bash -n lib/sbx_v3.sh
 
       - name: Python syntax
         run: python -m py_compile lib/sbx_nodes.py
@@ -102,6 +103,19 @@ jobs:
             ]
           }
           JSON
+          python lib/sbx_nodes.py validate
+          python lib/sbx_nodes.py render
+          python -m json.tool "$SBX_HOME/config/config.json" >/dev/null
+
+      - name: Exercise imports and automatic routing
+        env:
+          SBX_HOME: ${{ github.workspace }}/.ci-home
+        run: |
+          python lib/sbx_nodes.py import-uri 'ss://YWVzLTI1Ni1nY206cGFzcw==@example.com:8388#SS-import'
+          printf '%s\n' 'trojan://secret@example.com:443?security=tls&sni=example.com#Trojan-import' > /tmp/sbx-sub.txt
+          python lib/sbx_nodes.py import-file /tmp/sbx-sub.txt --source ci-subscription
+          python lib/sbx_nodes.py strategy auto
+          python lib/sbx_nodes.py route-mode cn-direct-full
           python lib/sbx_nodes.py validate
           python lib/sbx_nodes.py render
           python -m json.tool "$SBX_HOME/config/config.json" >/dev/null

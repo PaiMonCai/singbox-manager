@@ -2,7 +2,7 @@
 
 面向 Linux 服务器的 sing-box Docker 管理层。sing-box 保持官方镜像运行，宿主机通过 `sbx` 完成安装、节点管理、配置生成、校验、测试、备份恢复与升级。
 
-当前版本：**0.2.0**
+当前版本：**0.3.0**
 
 ## 一键交互式安装
 
@@ -114,6 +114,86 @@ sbx node test 12ab34cd
 sbx node test Tokyo-01
 ```
 
+
+## 分享链接与订阅导入
+
+现在可以直接导入常见节点分享链接：
+
+```bash
+sbx import uri
+```
+
+也可以把 URI 直接作为参数传入：
+
+```bash
+sbx import uri 'vless://...'
+```
+
+当前支持导入：
+
+- Shadowsocks `ss://`
+- VLESS `vless://`
+- Trojan `trojan://`
+- Hysteria2 `hysteria2://` / `hy2://`
+- SOCKS5 `socks://` / `socks5://`
+
+订阅管理：
+
+```bash
+sbx subscription
+sbx subscription add
+sbx subscription list
+sbx subscription update
+sbx subscription delete
+```
+
+订阅内容支持逐行 URI 列表，也支持整段 Base64 编码的 URI 列表。更新订阅时只替换该订阅上一次导入的节点，不会清空手工节点或其他订阅节点。
+
+订阅 URL 会作为本机敏感配置保存在 `nodes/nodes.json`，不会提交到 Git。下载订阅时会先尝试直连；如果直连失败且当前 sing-box 正在运行，会自动通过本机 sing-box 再尝试一次。
+
+## 自动测速与出口策略
+
+每个真实节点会进入一个 sing-box `urltest` 出站组 `auto`，同时由 `selector` 出站组 `proxy` 统一作为路由出口。
+
+默认仍然保持手动策略：
+
+```bash
+sbx strategy manual
+```
+
+开启自动测速：
+
+```bash
+sbx strategy auto
+```
+
+修改 URLTest 参数：
+
+```bash
+sbx urltest \
+  --url https://www.gstatic.com/generate_204 \
+  --interval 3m \
+  --tolerance 50
+```
+
+切回某个手动节点时，`sbx node default <节点>` 会自动把策略切回 `manual`。
+
+## 路由模板
+
+提供三档模式：
+
+```bash
+sbx route global
+sbx route cn-direct-lite
+sbx route cn-direct-full
+```
+
+- `global`：私网地址直连，其余流量走 `proxy`。
+- `cn-direct-lite`：在 global 基础上增加 `.cn` 域名直连，不依赖外部规则集。
+- `cn-direct-full`：增加中国 GeoIP / Geosite 二进制 rule-set，用于更完整的国内直连；首次使用需要能够下载规则集。
+
+升级到 0.3 后不会自动改变原有流量策略：旧节点库会迁移到新格式，但默认保持 `manual + global`，需要你主动开启 `auto` 或国内直连模式。
+
 ## 常用命令
 
 ```bash
@@ -175,9 +255,7 @@ export HTTPS_PROXY=http://127.0.0.1:7890
 
 下一层计划：
 
-- 分享链接 / URI 导入
-- 订阅导入
-- selector / urltest 自动选路
-- 国内直连 / 国际代理路由模板
 - Docker / APT / Git / npm 一键代理
+- 订阅定时更新与健康检查
+- 更丰富的路由规则管理
 - TUN / 透明代理

@@ -112,7 +112,7 @@ get_source() {
     script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd || true)"
   fi
 
-  if [[ -n "$script_dir" && -f "$script_dir/compose.yml" && -f "$script_dir/bin/sbx" && -f "$script_dir/lib/sbx_nodes.py" ]]; then
+  if [[ -n "$script_dir" && -f "$script_dir/compose.yml" && -f "$script_dir/bin/sbx" && -f "$script_dir/lib/sbx_nodes.py" && -f "$script_dir/lib/sbx_v3.sh" ]]; then
     SOURCE_DIR="$script_dir"
     return
   fi
@@ -125,7 +125,7 @@ get_source() {
     -o "$archive"
   tar -xzf "$archive" -C "$TMP_DIR"
   for candidate in "$TMP_DIR"/*/; do
-    if [[ -f "${candidate}compose.yml" && -f "${candidate}bin/sbx" && -f "${candidate}lib/sbx_nodes.py" ]]; then
+    if [[ -f "${candidate}compose.yml" && -f "${candidate}bin/sbx" && -f "${candidate}lib/sbx_nodes.py" && -f "${candidate}lib/sbx_v3.sh" ]]; then
       SOURCE_DIR="${candidate%/}"
       break
     fi
@@ -196,6 +196,7 @@ install -m 0644 "$SOURCE_DIR/.env.example" "$INSTALL_DIR/.env.example"
 install -m 0644 "$SOURCE_DIR/config/config.example.json" "$INSTALL_DIR/config/config.example.json"
 install -m 0755 "$SOURCE_DIR/bin/sbx" "$INSTALL_DIR/bin/sbx"
 install -m 0755 "$SOURCE_DIR/lib/sbx_nodes.py" "$INSTALL_DIR/lib/sbx_nodes.py"
+install -m 0755 "$SOURCE_DIR/lib/sbx_v3.sh" "$INSTALL_DIR/lib/sbx_v3.sh"
 write_env "$version" "$bind" "$port"
 
 chmod 700 "$INSTALL_DIR/config" "$INSTALL_DIR/nodes" "$INSTALL_DIR/data" "$INSTALL_DIR/backup"

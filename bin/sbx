@@ -145,4 +145,5 @@ __HELP__
 }
 
 main(){ root "$@"; ready; local cmd="${1:-menu}"; shift||true; case "$cmd" in menu)menu;;node)node "$@";;status|ps)status;;start|up)start;;stop|down)stop;;restart)restart;;logs|log)logs;;check)check;;test)test_current;;backup)backup;;restore)restore "${1:-}";;version|-v|--version)version;;upgrade)upgrade "${1:-}";;pull|update)pull;;edit|config)edit;;help|-h|--help)help;;*)die "未知命令: $cmd";;esac; }
+[[ -f "$HOME_DIR/lib/sbx_v3.sh" ]] && source "$HOME_DIR/lib/sbx_v3.sh"
 main "$@"

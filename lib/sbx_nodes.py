@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import argparse
+import base64
 import getpass
 import ipaddress
 import json
@@ -8,13 +9,22 @@ import re
 import secrets
 import sys
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Iterable, List, Optional, Tuple
+from urllib.parse import parse_qs, unquote, urlsplit
 
 HOME = Path(os.environ.get("SBX_HOME", "/opt/singbox-manager"))
 REGISTRY = HOME / "nodes" / "nodes.json"
 CONFIG = HOME / "config" / "config.json"
-
 SUPPORTED = ("shadowsocks", "vless", "trojan", "hysteria2", "socks")
+DEFAULT_SETTINGS = {
+    "strategy": "manual",
+    "route_mode": "global",
+    "urltest": {
+        "url": "https://www.gstatic.com/generate_204",
+        "interval": "3m",
+        "tolerance": 50,
+    },
+}
 
 
 def eprint(*args: Any) -> None:
@@ -31,19 +41,36 @@ def atomic_json(path: Path, data: Any, mode: int = 0o600) -> None:
     os.replace(tmp, path)
 
 
+def merged_settings(value: Any) -> Dict[str, Any]:
+    out = json.loads(json.dumps(DEFAULT_SETTINGS))
+    if isinstance(value, dict):
+        if value.get("strategy") in ("manual", "auto"):
+            out["strategy"] = value["strategy"]
+        if value.get("route_mode") in ("global", "cn-direct-lite", "cn-direct-full"):
+            out["route_mode"] = value["route_mode"]
+        if isinstance(value.get("urltest"), dict):
+            out["urltest"].update({k: v for k, v in value["urltest"].items() if k in out["urltest"]})
+    return out
+
+
 def load_registry() -> Dict[str, Any]:
     if not REGISTRY.exists():
-        return {"version": 1, "default": None, "nodes": []}
+        return {"version": 2, "default": None, "settings": merged_settings(None), "subscriptions": [], "nodes": []}
     with REGISTRY.open("r", encoding="utf-8") as f:
         data = json.load(f)
     if not isinstance(data, dict) or not isinstance(data.get("nodes"), list):
         raise ValueError("节点库格式无效")
-    data.setdefault("version", 1)
+    data["version"] = max(int(data.get("version", 1)), 2)
     data.setdefault("default", None)
+    data["settings"] = merged_settings(data.get("settings"))
+    if not isinstance(data.get("subscriptions"), list):
+        data["subscriptions"] = []
     return data
 
 
 def save_registry(data: Dict[str, Any]) -> None:
+    data["version"] = 2
+    data["settings"] = merged_settings(data.get("settings"))
     atomic_json(REGISTRY, data)
 
 
@@ -100,6 +127,31 @@ def prompt_port(text: str, default: Optional[int] = None) -> int:
         print("端口必须是 1-65535 的整数。")
 
 
+def truthy(value: Optional[str]) -> bool:
+    return str(value or "").lower() in ("1", "true", "yes", "on")
+
+
+def first(qs: Dict[str, List[str]], *keys: str, default: str = "") -> str:
+    for key in keys:
+        vals = qs.get(key)
+        if vals:
+            return vals[0]
+    return default
+
+
+def b64decode_loose(value: str) -> str:
+    raw = value.strip()
+    raw += "=" * (-len(raw) % 4)
+    for alt in (None, b"-_"):
+        try:
+            if alt is None:
+                return base64.b64decode(raw).decode("utf-8")
+            return base64.b64decode(raw, altchars=alt).decode("utf-8")
+        except Exception:
+            pass
+    raise ValueError("Base64 内容无法解码")
+
+
 def is_ip(value: str) -> bool:
     try:
         ipaddress.ip_address(value)
@@ -108,7 +160,7 @@ def is_ip(value: str) -> bool:
         return False
 
 
-def new_id(existing: List[Dict[str, Any]]) -> str:
+def new_id(existing: Iterable[Dict[str, Any]]) -> str:
     used = {n.get("id") for n in existing}
     while True:
         candidate = secrets.token_hex(4)
@@ -127,32 +179,44 @@ def resolve_node(data: Dict[str, Any], ref: Optional[str]) -> Dict[str, Any]:
     if not ref:
         list_nodes(data)
         ref = prompt("请输入节点 ID 或名称", required=True)
-    exact_id = [n for n in nodes if n.get("id") == ref]
-    if len(exact_id) == 1:
-        return exact_id[0]
+    exact = [n for n in nodes if n.get("id") == ref]
+    if len(exact) == 1:
+        return exact[0]
     prefix = [n for n in nodes if str(n.get("id", "")).startswith(ref)]
     if len(prefix) == 1:
         return prefix[0]
-    by_name = [n for n in nodes if n.get("name") == ref]
-    if len(by_name) == 1:
-        return by_name[0]
-    if len(prefix) > 1 or len(by_name) > 1:
+    named = [n for n in nodes if n.get("name") == ref]
+    if len(named) == 1:
+        return named[0]
+    if len(prefix) > 1 or len(named) > 1:
         raise ValueError("匹配到多个节点，请使用完整 ID")
     raise ValueError(f"未找到节点: {ref}")
 
 
+def resolve_subscription(data: Dict[str, Any], ref: Optional[str]) -> Dict[str, Any]:
+    subs = data.get("subscriptions", [])
+    if not subs:
+        raise ValueError("当前没有订阅")
+    if not ref:
+        list_subscriptions(data)
+        ref = prompt("请输入订阅 ID 或名称", required=True)
+    exact = [s for s in subs if s.get("id") == ref]
+    if len(exact) == 1:
+        return exact[0]
+    prefix = [s for s in subs if str(s.get("id", "")).startswith(ref)]
+    if len(prefix) == 1:
+        return prefix[0]
+    named = [s for s in subs if s.get("name") == ref]
+    if len(named) == 1:
+        return named[0]
+    raise ValueError(f"未找到订阅: {ref}")
+
+
 def choose_protocol(current: Optional[str] = None) -> str:
-    items = [
-        ("1", "shadowsocks", "Shadowsocks"),
-        ("2", "vless", "VLESS"),
-        ("3", "trojan", "Trojan"),
-        ("4", "hysteria2", "Hysteria2"),
-        ("5", "socks", "SOCKS5"),
-    ]
+    items = [("1", "shadowsocks", "Shadowsocks"), ("2", "vless", "VLESS"), ("3", "trojan", "Trojan"), ("4", "hysteria2", "Hysteria2"), ("5", "socks", "SOCKS5")]
     print("\n支持的节点协议：")
     for num, key, label in items:
-        suffix = "  <- 当前" if current == key else ""
-        print(f"  {num}. {label}{suffix}")
+        print(f"  {num}. {label}" + ("  <- 当前" if current == key else ""))
     default_num = next((num for num, key, _ in items if key == current), None)
     while True:
         raw = prompt("请选择协议", default_num, required=True)
@@ -164,65 +228,44 @@ def choose_protocol(current: Optional[str] = None) -> str:
 
 def tls_fields(existing: Optional[Dict[str, Any]], server: str, required: bool = False, allow_reality: bool = False) -> Optional[Dict[str, Any]]:
     existing = existing or {}
-    enabled_default = bool(existing.get("enabled", required))
-    enabled = True if required else prompt_bool("启用 TLS", enabled_default)
+    enabled = True if required else prompt_bool("启用 TLS", bool(existing.get("enabled", required)))
     if not enabled:
         return None
-    default_sni = str(existing.get("server_name") or ("" if is_ip(server) else server))
-    sni = prompt("TLS Server Name / SNI", default_sni)
-    insecure = prompt_bool("跳过证书校验（不推荐）", bool(existing.get("insecure", False)))
-    tls: Dict[str, Any] = {"enabled": True, "insecure": insecure}
+    sni = prompt("TLS Server Name / SNI", str(existing.get("server_name") or ("" if is_ip(server) else server)))
+    tls: Dict[str, Any] = {"enabled": True, "insecure": prompt_bool("跳过证书校验（不推荐）", bool(existing.get("insecure", False)))}
     if sni:
         tls["server_name"] = sni
-
     if allow_reality:
-        old_reality = existing.get("reality") if isinstance(existing.get("reality"), dict) else {}
-        use_reality = prompt_bool("使用 Reality", bool(old_reality and old_reality.get("enabled")))
-        if use_reality:
-            public_key = prompt_secret("Reality Public Key", old_reality.get("public_key"), required=True)
-            short_id = prompt("Reality Short ID", old_reality.get("short_id", ""), required=True)
-            if not re.fullmatch(r"[0-9a-fA-F]{0,16}", short_id):
-                raise ValueError("Reality Short ID 必须是 0-16 位十六进制字符串")
-            tls["reality"] = {
-                "enabled": True,
-                "public_key": public_key,
-                "short_id": short_id,
-            }
+        old = existing.get("reality") if isinstance(existing.get("reality"), dict) else {}
+        if prompt_bool("使用 Reality", bool(old and old.get("enabled"))):
+            tls["reality"] = {"enabled": True, "public_key": prompt_secret("Reality Public Key", old.get("public_key"), True), "short_id": prompt("Reality Short ID", old.get("short_id", ""), True)}
     return tls
 
 
 def transport_fields(existing: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
     existing = existing or {}
-    old_type = existing.get("type", "")
     choices = {"1": "", "2": "ws", "3": "grpc", "4": "httpupgrade"}
     reverse = {v: k for k, v in choices.items()}
-    print("\n传输方式：")
-    print("  1. TCP / 默认")
-    print("  2. WebSocket")
-    print("  3. gRPC")
-    print("  4. HTTPUpgrade")
-    raw = prompt("请选择传输方式", reverse.get(old_type, "1"), required=True)
-    kind = choices.get(raw)
+    print("\n传输方式：\n  1. TCP / 默认\n  2. WebSocket\n  3. gRPC\n  4. HTTPUpgrade")
+    kind = choices.get(prompt("请选择传输方式", reverse.get(existing.get("type", ""), "1"), True))
     if kind is None:
         raise ValueError("无效传输方式")
     if not kind:
         return None
     if kind == "ws":
-        path = prompt("WebSocket Path", existing.get("path", "/"))
+        result: Dict[str, Any] = {"type": "ws", "path": prompt("WebSocket Path", existing.get("path", "/")) or "/"}
         host = prompt("WebSocket Host（可留空）", (existing.get("headers") or {}).get("Host", ""))
-        result: Dict[str, Any] = {"type": "ws", "path": path or "/"}
         if host:
             result["headers"] = {"Host": host}
         return result
     if kind == "grpc":
-        service = prompt("gRPC Service Name", existing.get("service_name", ""))
         result = {"type": "grpc"}
+        service = prompt("gRPC Service Name", existing.get("service_name", ""))
         if service:
             result["service_name"] = service
         return result
+    result = {"type": "httpupgrade", "path": prompt("HTTPUpgrade Path", existing.get("path", "/")) or "/"}
     host = prompt("HTTPUpgrade Host（可留空）", existing.get("host", ""))
-    path = prompt("HTTPUpgrade Path", existing.get("path", "/"))
-    result = {"type": "httpupgrade", "path": path or "/"}
     if host:
         result["host"] = host
     return result
@@ -231,305 +274,414 @@ def transport_fields(existing: Optional[Dict[str, Any]]) -> Optional[Dict[str, A
 def build_node(existing: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     existing = existing or {}
     protocol = choose_protocol(existing.get("type"))
-    name = prompt("节点名称", existing.get("name"), required=True)
-    server = prompt("服务器地址", existing.get("server"), required=True)
+    name = prompt("节点名称", existing.get("name"), True)
+    server = prompt("服务器地址", existing.get("server"), True)
     port = prompt_port("服务器端口", existing.get("server_port"))
-
-    node: Dict[str, Any] = {
-        "id": existing.get("id"),
-        "name": name,
-        "type": protocol,
-        "server": server,
-        "server_port": port,
-    }
-
+    node: Dict[str, Any] = {"id": existing.get("id"), "name": name, "type": protocol, "server": server, "server_port": port, "source": existing.get("source", "manual")}
     if protocol == "shadowsocks":
-        method = prompt("加密方式", existing.get("method", "aes-256-gcm"), required=True)
-        password = prompt_secret("密码", existing.get("password"), required=True)
-        node.update(method=method, password=password)
-
+        node.update(method=prompt("加密方式", existing.get("method", "aes-256-gcm"), True), password=prompt_secret("密码", existing.get("password"), True))
     elif protocol == "socks":
-        username = prompt("用户名（可留空）", existing.get("username", ""))
-        password = prompt_secret("密码（可留空）", existing.get("password")) if username else ""
-        node["version"] = "5"
+        username = prompt("用户名（可留空）", existing.get("username", "")); node["version"] = "5"
         if username:
-            node["username"] = username
-            node["password"] = password
-
+            node.update(username=username, password=prompt_secret("密码（可留空）", existing.get("password")))
     elif protocol == "trojan":
-        password = prompt_secret("Trojan 密码", existing.get("password"), required=True)
-        node["password"] = password
-        node["tls"] = tls_fields(existing.get("tls"), server, required=True)
-        transport = transport_fields(existing.get("transport"))
-        if transport:
-            node["transport"] = transport
-
+        node["password"] = prompt_secret("Trojan 密码", existing.get("password"), True); node["tls"] = tls_fields(existing.get("tls"), server, True)
+        transport = transport_fields(existing.get("transport"));
+        if transport: node["transport"] = transport
     elif protocol == "vless":
-        uuid = prompt_secret("VLESS UUID", existing.get("uuid"), required=True)
-        if not re.fullmatch(r"[0-9a-fA-F-]{32,36}", uuid):
-            print("提示：UUID 格式看起来不标准，仍将保存并交给 sing-box check 验证。")
-        flow = prompt("Flow（通常留空；Reality Vision 可填 xtls-rprx-vision）", existing.get("flow", ""))
-        node["uuid"] = uuid
-        if flow:
-            node["flow"] = flow
-        tls = tls_fields(existing.get("tls"), server, required=False, allow_reality=True)
-        if tls:
-            node["tls"] = tls
-        transport = transport_fields(existing.get("transport"))
-        if transport:
-            node["transport"] = transport
-
+        node["uuid"] = prompt_secret("VLESS UUID", existing.get("uuid"), True)
+        flow = prompt("Flow（通常留空）", existing.get("flow", ""));
+        if flow: node["flow"] = flow
+        tls = tls_fields(existing.get("tls"), server, False, True); transport = transport_fields(existing.get("transport"))
+        if tls: node["tls"] = tls
+        if transport: node["transport"] = transport
     elif protocol == "hysteria2":
-        password = prompt_secret("Hysteria2 密码", existing.get("password"), required=True)
-        node["password"] = password
-        node["tls"] = tls_fields(existing.get("tls"), server, required=True)
-        old_obfs = existing.get("obfs") if isinstance(existing.get("obfs"), dict) else {}
-        use_obfs = prompt_bool("启用 Salamander 混淆", bool(old_obfs))
-        if use_obfs:
-            obfs_password = prompt_secret("Obfs 密码", old_obfs.get("password"), required=True)
-            node["obfs"] = {"type": "salamander", "password": obfs_password}
-
+        node["password"] = prompt_secret("Hysteria2 密码", existing.get("password"), True); node["tls"] = tls_fields(existing.get("tls"), server, True)
+        old = existing.get("obfs") if isinstance(existing.get("obfs"), dict) else {}
+        if prompt_bool("启用 Salamander 混淆", bool(old)):
+            node["obfs"] = {"type": "salamander", "password": prompt_secret("Obfs 密码", old.get("password"), True)}
     return node
+
+
+def transport_from_query(qs: Dict[str, List[str]]) -> Optional[Dict[str, Any]]:
+    kind = first(qs, "type", "network").lower()
+    if kind in ("", "tcp", "none"):
+        return None
+    if kind == "ws":
+        result: Dict[str, Any] = {"type": "ws", "path": unquote(first(qs, "path", default="/")) or "/"}
+        host = first(qs, "host")
+        if host: result["headers"] = {"Host": host}
+        return result
+    if kind == "grpc":
+        result = {"type": "grpc"}; service = first(qs, "serviceName", "service_name")
+        if service: result["service_name"] = service
+        return result
+    if kind in ("httpupgrade", "http-upgrade"):
+        result = {"type": "httpupgrade", "path": unquote(first(qs, "path", default="/")) or "/"}; host = first(qs, "host")
+        if host: result["host"] = host
+        return result
+    raise ValueError(f"暂不支持分享链接传输类型: {kind}")
+
+
+def tls_from_query(qs: Dict[str, List[str]], server: str, force: bool = False, reality: bool = False) -> Optional[Dict[str, Any]]:
+    security = first(qs, "security").lower()
+    enabled = force or reality or security in ("tls", "reality")
+    if not enabled:
+        return None
+    tls: Dict[str, Any] = {"enabled": True, "insecure": truthy(first(qs, "insecure", "allowInsecure"))}
+    sni = first(qs, "sni", "peer") or ("" if is_ip(server) else server)
+    if sni: tls["server_name"] = sni
+    fp = first(qs, "fp", "fingerprint")
+    if fp and fp.lower() not in ("none", "off"):
+        tls["utls"] = {"enabled": True, "fingerprint": fp}
+    if reality or security == "reality":
+        pbk = first(qs, "pbk", "publicKey", "public_key"); sid = first(qs, "sid", "shortId", "short_id")
+        if not pbk: raise ValueError("Reality 分享链接缺少 public key (pbk)")
+        tls["reality"] = {"enabled": True, "public_key": pbk, "short_id": sid}
+    return tls
+
+
+def parsed_name(parts: Any, fallback: str) -> str:
+    return unquote(parts.fragment).strip() or fallback
+
+
+def parse_ss_uri(uri: str) -> Dict[str, Any]:
+    raw = uri[len("ss://"):]
+    fragment = ""
+    if "#" in raw:
+        raw, fragment = raw.split("#", 1)
+    if "?" in raw:
+        raw, _query = raw.split("?", 1)
+    method = password = host = ""; port = 0
+    if "@" in raw:
+        userinfo, endpoint = raw.rsplit("@", 1)
+        if ":" not in unquote(userinfo):
+            userinfo = b64decode_loose(userinfo)
+        userinfo = unquote(userinfo)
+        method, password = userinfo.split(":", 1)
+        p = urlsplit("x://" + endpoint)
+        host, port = p.hostname or "", int(p.port or 0)
+    else:
+        decoded = b64decode_loose(raw)
+        creds, endpoint = decoded.rsplit("@", 1)
+        method, password = creds.split(":", 1)
+        p = urlsplit("x://" + endpoint)
+        host, port = p.hostname or "", int(p.port or 0)
+    if not method or not password or not host or not port:
+        raise ValueError("Shadowsocks 分享链接不完整")
+    return {"name": unquote(fragment) or f"SS-{host}", "type": "shadowsocks", "server": host, "server_port": port, "method": method, "password": password}
+
+
+def parse_uri(uri: str) -> Dict[str, Any]:
+    uri = uri.strip()
+    if uri.lower().startswith("ss://"):
+        return parse_ss_uri(uri)
+    parts = urlsplit(uri)
+    scheme = parts.scheme.lower()
+    if scheme not in ("vless", "trojan", "hysteria2", "hy2", "socks", "socks5"):
+        raise ValueError(f"不支持的分享链接协议: {scheme or 'unknown'}")
+    if not parts.hostname or not parts.port:
+        raise ValueError("分享链接缺少服务器地址或端口")
+    qs = parse_qs(parts.query, keep_blank_values=True)
+    server, port = parts.hostname, int(parts.port)
+    name = parsed_name(parts, f"{scheme.upper()}-{server}")
+    if scheme == "vless":
+        node: Dict[str, Any] = {"name": name, "type": "vless", "server": server, "server_port": port, "uuid": unquote(parts.username or "")}
+        if not node["uuid"]: raise ValueError("VLESS 分享链接缺少 UUID")
+        flow = first(qs, "flow");
+        if flow: node["flow"] = flow
+        tls = tls_from_query(qs, server, reality=first(qs, "security").lower() == "reality"); transport = transport_from_query(qs)
+        if tls: node["tls"] = tls
+        if transport: node["transport"] = transport
+        return node
+    if scheme == "trojan":
+        node = {"name": name, "type": "trojan", "server": server, "server_port": port, "password": unquote(parts.username or "")}
+        if not node["password"]: raise ValueError("Trojan 分享链接缺少密码")
+        node["tls"] = tls_from_query(qs, server, force=True); transport = transport_from_query(qs)
+        if transport: node["transport"] = transport
+        return node
+    if scheme in ("hysteria2", "hy2"):
+        password = unquote(parts.username or "")
+        if parts.password is not None: password = unquote(f"{parts.username or ''}:{parts.password}")
+        node = {"name": name, "type": "hysteria2", "server": server, "server_port": port, "password": password, "tls": tls_from_query(qs, server, force=True)}
+        if not password: raise ValueError("Hysteria2 分享链接缺少密码")
+        obfs = first(qs, "obfs"); obfs_password = first(qs, "obfs-password", "obfs_password")
+        if obfs:
+            node["obfs"] = {"type": obfs, "password": obfs_password}
+        return node
+    username = unquote(parts.username or ""); password = unquote(parts.password or "")
+    node = {"name": name, "type": "socks", "server": server, "server_port": port, "version": "5"}
+    if username: node.update(username=username, password=password)
+    return node
+
+
+def decode_subscription_text(text: str) -> str:
+    stripped = text.strip().lstrip("\ufeff")
+    if not stripped:
+        return ""
+    if "://" in stripped:
+        return stripped
+    compact = "".join(stripped.split())
+    try:
+        decoded = b64decode_loose(compact)
+        if "://" in decoded:
+            return decoded
+    except Exception:
+        pass
+    return stripped
+
+
+def parse_subscription(text: str) -> Tuple[List[Dict[str, Any]], List[str]]:
+    decoded = decode_subscription_text(text)
+    nodes: List[Dict[str, Any]] = []; errors: List[str] = []
+    for index, line in enumerate(decoded.replace("\r", "\n").split("\n"), 1):
+        item = line.strip()
+        if not item or item.startswith("#"): continue
+        try:
+            nodes.append(parse_uri(item))
+        except Exception as exc:
+            errors.append(f"第 {index} 行: {exc}")
+    return nodes, errors
+
+
+def ensure_unique_name(data: Dict[str, Any], name: str, ignore_ids: Optional[set] = None) -> str:
+    ignore_ids = ignore_ids or set()
+    existing = {n.get("name") for n in data["nodes"] if n.get("id") not in ignore_ids}
+    if name not in existing: return name
+    i = 2
+    while f"{name}-{i}" in existing: i += 1
+    return f"{name}-{i}"
+
+
+def add_imported_nodes(data: Dict[str, Any], nodes: List[Dict[str, Any]], source: str = "import", replace_ids: Optional[List[str]] = None) -> List[str]:
+    replace_set = set(replace_ids or [])
+    if replace_set:
+        data["nodes"] = [n for n in data["nodes"] if n.get("id") not in replace_set]
+    ids: List[str] = []
+    for raw in nodes:
+        node = dict(raw); node["id"] = new_id(data["nodes"]); node["name"] = ensure_unique_name(data, node.get("name") or node["type"].upper()); node["source"] = source
+        data["nodes"].append(node); ids.append(node["id"])
+    if not data.get("default") or data.get("default") in replace_set:
+        data["default"] = ids[0] if ids else (data["nodes"][0]["id"] if data["nodes"] else None)
+    return ids
 
 
 def outbound_from_node(node: Dict[str, Any]) -> Dict[str, Any]:
     typ = node["type"]
-    out: Dict[str, Any] = {
-        "type": typ,
-        "tag": node_tag(node),
-        "server": node["server"],
-        "server_port": int(node["server_port"]),
-    }
-    if typ == "shadowsocks":
-        out.update(method=node["method"], password=node["password"])
+    out: Dict[str, Any] = {"type": typ, "tag": node_tag(node), "server": node["server"], "server_port": int(node["server_port"])}
+    if typ == "shadowsocks": out.update(method=node["method"], password=node["password"])
     elif typ == "socks":
         out["version"] = node.get("version", "5")
-        if node.get("username"):
-            out["username"] = node["username"]
-            out["password"] = node.get("password", "")
+        if node.get("username"): out.update(username=node["username"], password=node.get("password", ""))
     elif typ == "trojan":
-        out["password"] = node["password"]
-        out["tls"] = node["tls"]
-        if node.get("transport"):
-            out["transport"] = node["transport"]
+        out.update(password=node["password"], tls=node["tls"])
+        if node.get("transport"): out["transport"] = node["transport"]
     elif typ == "vless":
         out["uuid"] = node["uuid"]
-        if node.get("flow"):
-            out["flow"] = node["flow"]
-        if node.get("tls"):
-            out["tls"] = node["tls"]
-        if node.get("transport"):
-            out["transport"] = node["transport"]
+        if node.get("flow"): out["flow"] = node["flow"]
+        if node.get("tls"): out["tls"] = node["tls"]
+        if node.get("transport"): out["transport"] = node["transport"]
     elif typ == "hysteria2":
-        out["password"] = node["password"]
-        out["tls"] = node["tls"]
-        if node.get("obfs"):
-            out["obfs"] = node["obfs"]
-    else:
-        raise ValueError(f"暂不支持协议: {typ}")
+        out.update(password=node["password"], tls=node["tls"])
+        if node.get("obfs"): out["obfs"] = node["obfs"]
+    else: raise ValueError(f"暂不支持协议: {typ}")
     return out
 
 
+def make_proxy_groups(data: Dict[str, Any], outbounds: List[Dict[str, Any]]) -> str:
+    tags = [node_tag(n) for n in data["nodes"]]
+    if not tags:
+        return "direct"
+    settings = data["settings"]; default_node = next((n for n in data["nodes"] if n.get("id") == data.get("default")), None)
+    auto_tag = "auto"
+    outbounds.append({"type": "urltest", "tag": auto_tag, "outbounds": tags, "url": settings["urltest"].get("url") or "https://www.gstatic.com/generate_204", "interval": settings["urltest"].get("interval") or "3m", "tolerance": int(settings["urltest"].get("tolerance", 50)), "interrupt_exist_connections": True})
+    selector_default = auto_tag if settings.get("strategy") == "auto" else (node_tag(default_node) if default_node else tags[0])
+    outbounds.append({"type": "selector", "tag": "proxy", "outbounds": [auto_tag] + tags, "default": selector_default, "interrupt_exist_connections": True})
+    return "proxy"
+
+
+def route_config(data: Dict[str, Any], proxy_tag: str) -> Dict[str, Any]:
+    mode = data["settings"].get("route_mode", "global")
+    route: Dict[str, Any] = {"rules": [{"ip_is_private": True, "action": "route", "outbound": "direct"}], "final": proxy_tag, "auto_detect_interface": True}
+    if mode in ("cn-direct-lite", "cn-direct-full"):
+        route["rules"].append({"domain_suffix": [".cn"], "action": "route", "outbound": "direct"})
+    if mode == "cn-direct-full":
+        route["rules"].append({"rule_set": ["geosite-cn", "geoip-cn"], "action": "route", "outbound": "direct"})
+        route["rule_set"] = [
+            {"type": "remote", "tag": "geosite-cn", "format": "binary", "url": "https://testingcf.jsdelivr.net/gh/SagerNet/sing-geosite@rule-set/geosite-cn.srs"},
+            {"type": "remote", "tag": "geoip-cn", "format": "binary", "url": "https://testingcf.jsdelivr.net/gh/SagerNet/sing-geoip@rule-set/geoip-cn.srs"},
+        ]
+    return route
+
+
 def make_config(data: Dict[str, Any], listen_port: int = 7890, only_node: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-    nodes = [only_node] if only_node else data["nodes"]
-    outbounds = [outbound_from_node(n) for n in nodes]
-    outbounds.append({"type": "direct", "tag": "direct"})
-
     if only_node:
-        final = node_tag(only_node)
+        outbounds = [outbound_from_node(only_node), {"type": "direct", "tag": "direct"}]
+        route = {"rules": [{"ip_is_private": True, "action": "route", "outbound": "direct"}], "final": node_tag(only_node), "auto_detect_interface": True}
     else:
-        default_id = data.get("default")
-        default_node = next((n for n in data["nodes"] if n.get("id") == default_id), None)
-        final = node_tag(default_node) if default_node else "direct"
-
-    return {
-        "$schema": "https://sing-box.sagernet.org/schema.json",
-        "log": {"level": "info", "timestamp": True},
-        "inbounds": [
-            {
-                "type": "mixed",
-                "tag": "mixed-in",
-                "listen": "0.0.0.0",
-                "listen_port": int(listen_port),
-            }
-        ],
-        "outbounds": outbounds,
-        "route": {"final": final},
-    }
+        outbounds = [outbound_from_node(n) for n in data["nodes"]]
+        proxy_tag = make_proxy_groups(data, outbounds)
+        outbounds.append({"type": "direct", "tag": "direct"})
+        route = route_config(data, proxy_tag)
+    cfg: Dict[str, Any] = {"$schema": "https://sing-box.sagernet.org/schema.json", "log": {"level": "info", "timestamp": True}, "inbounds": [{"type": "mixed", "tag": "mixed-in", "listen": "0.0.0.0", "listen_port": int(listen_port)}], "outbounds": outbounds, "route": route}
+    if data["settings"].get("route_mode") == "cn-direct-full" and not only_node:
+        cfg["experimental"] = {"cache_file": {"enabled": True}}
+    return cfg
 
 
 def render(data: Optional[Dict[str, Any]] = None, target: Optional[Path] = None, port: int = 7890) -> None:
-    data = data or load_registry()
-    atomic_json(target or CONFIG, make_config(data, port))
+    data = data or load_registry(); atomic_json(target or CONFIG, make_config(data, port))
 
 
 def list_nodes(data: Optional[Dict[str, Any]] = None) -> None:
-    data = data or load_registry()
-    nodes = data["nodes"]
-    if not nodes:
-        print("暂无节点。")
-        return
-    print(f"{'默认':<4} {'ID':<10} {'协议':<12} {'名称':<20} 地址")
-    print("-" * 78)
+    data = data or load_registry(); nodes = data["nodes"]
+    if not nodes: print("暂无节点。"); return
+    print(f"{'默认':<4} {'ID':<10} {'协议':<12} {'名称':<22} {'来源':<14} 地址")
+    print("-" * 96)
     for n in nodes:
-        mark = "*" if n.get("id") == data.get("default") else ""
-        addr = f"{n.get('server')}:{n.get('server_port')}"
-        print(f"{mark:<4} {n.get('id',''):<10} {n.get('type',''):<12} {n.get('name','')[:18]:<20} {addr}")
+        mark = "*" if n.get("id") == data.get("default") else ""; src = str(n.get("source", "manual"))
+        print(f"{mark:<4} {n.get('id',''):<10} {n.get('type',''):<12} {n.get('name','')[:20]:<22} {src[:12]:<14} {n.get('server')}:{n.get('server_port')}")
+
+
+def list_subscriptions(data: Optional[Dict[str, Any]] = None) -> None:
+    data = data or load_registry(); subs = data.get("subscriptions", [])
+    if not subs: print("暂无订阅。"); return
+    print(f"{'ID':<10} {'名称':<22} {'节点数':<8} URL")
+    print("-" * 90)
+    for s in subs: print(f"{s.get('id',''):<10} {s.get('name','')[:20]:<22} {len(s.get('node_ids',[])):<8} {s.get('url','')}")
 
 
 def redact(value: Any, key: str = "") -> Any:
-    secret_keys = {"password", "uuid", "public_key"}
-    if isinstance(value, dict):
-        return {k: redact(v, k) for k, v in value.items()}
-    if isinstance(value, list):
-        return [redact(v, key) for v in value]
-    if key in secret_keys and isinstance(value, str) and value:
-        if len(value) <= 8:
-            return "***"
-        return value[:4] + "..." + value[-4:]
+    if isinstance(value, dict): return {k: redact(v, k) for k, v in value.items()}
+    if isinstance(value, list): return [redact(v, key) for v in value]
+    if key in {"password", "uuid", "public_key", "url"} and isinstance(value, str) and value:
+        return "***" if len(value) <= 12 else value[:5] + "..." + value[-5:]
     return value
 
 
-def cmd_init(_: argparse.Namespace) -> int:
-    data = load_registry()
-    REGISTRY.parent.mkdir(parents=True, exist_ok=True)
-    save_registry(data)
-    if not CONFIG.exists():
-        render(data)
-    return 0
-
-
-def cmd_list(_: argparse.Namespace) -> int:
-    list_nodes()
-    return 0
-
-
-def cmd_add(_: argparse.Namespace) -> int:
-    data = load_registry()
-    print("\n=== 添加节点 ===")
-    node = build_node()
-    node["id"] = new_id(data["nodes"])
-    data["nodes"].append(node)
-    if not data.get("default"):
-        data["default"] = node["id"]
-    save_registry(data)
-    render(data)
-    print(f"\n已添加节点：{node['name']} ({node['id']})")
-    if data.get("default") == node["id"]:
-        print("该节点已设为默认出口。")
-    return 0
-
-
-def cmd_edit(args: argparse.Namespace) -> int:
-    data = load_registry()
-    node = resolve_node(data, args.ref)
-    print(f"\n=== 编辑节点：{node['name']} ({node['id']}) ===")
-    updated = build_node(node)
-    updated["id"] = node["id"]
-    idx = data["nodes"].index(node)
-    data["nodes"][idx] = updated
-    save_registry(data)
-    render(data)
-    print("节点已更新。")
-    return 0
-
-
-def cmd_delete(args: argparse.Namespace) -> int:
-    data = load_registry()
-    node = resolve_node(data, args.ref)
-    if not args.yes:
-        answer = prompt(f"确认删除节点 {node['name']} ({node['id']})？输入 DELETE")
-        if answer != "DELETE":
-            print("已取消。")
-            return 1
-    data["nodes"] = [n for n in data["nodes"] if n.get("id") != node.get("id")]
-    if data.get("default") == node.get("id"):
-        data["default"] = data["nodes"][0]["id"] if data["nodes"] else None
-    save_registry(data)
-    render(data)
-    print("节点已删除。")
-    return 0
-
-
-def cmd_default(args: argparse.Namespace) -> int:
-    data = load_registry()
-    node = resolve_node(data, args.ref)
-    data["default"] = node["id"]
-    save_registry(data)
-    render(data)
-    print(f"默认出口已切换为：{node['name']} ({node['id']})")
-    return 0
-
-
-def cmd_show(args: argparse.Namespace) -> int:
-    data = load_registry()
-    node = resolve_node(data, args.ref)
-    print(json.dumps(redact(node), ensure_ascii=False, indent=2))
-    return 0
-
-
-def cmd_render(args: argparse.Namespace) -> int:
-    render(port=args.port)
-    print(str(CONFIG))
-    return 0
-
-
-def cmd_test_config(args: argparse.Namespace) -> int:
-    data = load_registry()
-    node = resolve_node(data, args.ref)
-    target = Path(args.output)
-    atomic_json(target, make_config(data, args.port, only_node=node), 0o600)
-    return 0
-
-
-def cmd_validate(_: argparse.Namespace) -> int:
-    data = load_registry()
-    ids = [n.get("id") for n in data["nodes"]]
-    if len(ids) != len(set(ids)):
-        raise ValueError("节点 ID 重复")
+def validate(data: Optional[Dict[str, Any]] = None) -> None:
+    data = data or load_registry(); ids = [n.get("id") for n in data["nodes"]]
+    if len(ids) != len(set(ids)): raise ValueError("节点 ID 重复")
     for n in data["nodes"]:
-        if n.get("type") not in SUPPORTED:
-            raise ValueError(f"不支持的节点协议: {n.get('type')}")
-        if not n.get("id") or not n.get("name") or not n.get("server"):
-            raise ValueError("节点缺少必要字段")
-        port = int(n.get("server_port", 0))
-        if not 1 <= port <= 65535:
-            raise ValueError(f"节点端口无效: {n.get('name')}")
+        if n.get("type") not in SUPPORTED: raise ValueError(f"不支持的节点协议: {n.get('type')}")
+        if not n.get("id") or not n.get("name") or not n.get("server"): raise ValueError("节点缺少必要字段")
+        if not 1 <= int(n.get("server_port", 0)) <= 65535: raise ValueError(f"节点端口无效: {n.get('name')}")
         outbound_from_node(n)
-    if data.get("default") is not None and data.get("default") not in ids:
-        raise ValueError("默认节点不存在")
+    if data.get("default") is not None and data.get("default") not in ids: raise ValueError("默认节点不存在")
+    if data["settings"]["strategy"] not in ("manual", "auto"): raise ValueError("strategy 无效")
+    if data["settings"]["route_mode"] not in ("global", "cn-direct-lite", "cn-direct-full"): raise ValueError("route_mode 无效")
     make_config(data)
-    print("OK")
+
+
+def cmd_init(_: argparse.Namespace) -> int:
+    data = load_registry(); save_registry(data); render(data); return 0
+def cmd_list(_: argparse.Namespace) -> int: list_nodes(); return 0
+def cmd_add(_: argparse.Namespace) -> int:
+    data = load_registry(); node = build_node(); node["id"] = new_id(data["nodes"]); data["nodes"].append(node)
+    if not data.get("default"): data["default"] = node["id"]
+    save_registry(data); render(data); print(f"已添加节点：{node['name']} ({node['id']})"); return 0
+def cmd_edit(args: argparse.Namespace) -> int:
+    data = load_registry(); old = resolve_node(data, args.ref); node = build_node(old); node["id"] = old["id"]; data["nodes"][data["nodes"].index(old)] = node; save_registry(data); render(data); print("节点已更新。"); return 0
+def cmd_delete(args: argparse.Namespace) -> int:
+    data = load_registry(); node = resolve_node(data, args.ref)
+    if not args.yes and prompt(f"确认删除 {node['name']}？输入 DELETE") != "DELETE": print("已取消。"); return 1
+    data["nodes"] = [n for n in data["nodes"] if n.get("id") != node["id"]]
+    for s in data.get("subscriptions", []): s["node_ids"] = [x for x in s.get("node_ids", []) if x != node["id"]]
+    if data.get("default") == node["id"]: data["default"] = data["nodes"][0]["id"] if data["nodes"] else None
+    save_registry(data); render(data); print("节点已删除。"); return 0
+def cmd_default(args: argparse.Namespace) -> int:
+    data = load_registry(); node = resolve_node(data, args.ref); data["default"] = node["id"]; data["settings"]["strategy"] = "manual"; save_registry(data); render(data); print(f"默认出口：{node['name']}；策略已切到 manual。"); return 0
+def cmd_show(args: argparse.Namespace) -> int:
+    data = load_registry(); print(json.dumps(redact(resolve_node(data, args.ref)), ensure_ascii=False, indent=2)); return 0
+def cmd_render(args: argparse.Namespace) -> int: render(port=args.port); print(str(CONFIG)); return 0
+def cmd_test_config(args: argparse.Namespace) -> int:
+    data = load_registry(); atomic_json(Path(args.output), make_config(data, args.port, resolve_node(data, args.ref)), 0o600); return 0
+def cmd_validate(_: argparse.Namespace) -> int: validate(); print("OK"); return 0
+def cmd_import_uri(args: argparse.Namespace) -> int:
+    uri = args.uri or prompt_secret("粘贴分享链接", required=True); data = load_registry(); node = parse_uri(uri); ids = add_imported_nodes(data, [node], "import-uri"); save_registry(data); render(data); print(f"导入成功: {data['nodes'][-1]['name']} ({ids[0]})"); return 0
+def cmd_import_file(args: argparse.Namespace) -> int:
+    text = Path(args.file).read_text(encoding="utf-8", errors="replace"); nodes, errors = parse_subscription(text)
+    if not nodes: raise ValueError("没有解析到支持的节点" + (("；" + errors[0]) if errors else ""))
+    data = load_registry(); ids = add_imported_nodes(data, nodes, args.source or "import-file"); save_registry(data); render(data)
+    print(f"导入 {len(ids)} 个节点。")
+    for err in errors[:10]: eprint("跳过:", err)
+    if len(errors) > 10: eprint(f"另有 {len(errors)-10} 条错误未显示。")
     return 0
+def cmd_strategy(args: argparse.Namespace) -> int:
+    data = load_registry()
+    if not args.value: print(data["settings"]["strategy"]); return 0
+    if args.value not in ("manual", "auto"): raise ValueError("策略只能是 manual 或 auto")
+    if args.value == "auto" and not data["nodes"]: raise ValueError("没有节点，无法启用自动测速")
+    data["settings"]["strategy"] = args.value; save_registry(data); render(data); print(f"strategy={args.value}"); return 0
+def cmd_route(args: argparse.Namespace) -> int:
+    data = load_registry()
+    if not args.value: print(data["settings"]["route_mode"]); return 0
+    if args.value not in ("global", "cn-direct-lite", "cn-direct-full"): raise ValueError("路由模式只能是 global / cn-direct-lite / cn-direct-full")
+    data["settings"]["route_mode"] = args.value; save_registry(data); render(data); print(f"route_mode={args.value}"); return 0
+def cmd_urltest(args: argparse.Namespace) -> int:
+    data = load_registry(); ut = data["settings"]["urltest"]
+    if args.url: ut["url"] = args.url
+    if args.interval: ut["interval"] = args.interval
+    if args.tolerance is not None: ut["tolerance"] = args.tolerance
+    save_registry(data); render(data); print(json.dumps(ut, ensure_ascii=False, indent=2)); return 0
+def cmd_sub_list(_: argparse.Namespace) -> int: list_subscriptions(); return 0
+def cmd_sub_register(args: argparse.Namespace) -> int:
+    data = load_registry(); sub_id = args.id or new_id(data.get("subscriptions", [])); existing = next((s for s in data.get("subscriptions", []) if s.get("id") == sub_id), None)
+    meta = {"id": sub_id, "name": args.name or f"subscription-{sub_id[:4]}", "url": args.url, "node_ids": []}
+    if existing: existing.update(meta)
+    else: data["subscriptions"].append(meta)
+    save_registry(data); print(sub_id); return 0
+def cmd_sub_apply(args: argparse.Namespace) -> int:
+    data = load_registry(); sub = resolve_subscription(data, args.ref); text = Path(args.file).read_text(encoding="utf-8", errors="replace"); nodes, errors = parse_subscription(text)
+    if not nodes: raise ValueError("订阅未解析到支持的节点" + (("；" + errors[0]) if errors else ""))
+    ids = add_imported_nodes(data, nodes, f"sub:{sub['id']}", sub.get("node_ids", [])); sub["node_ids"] = ids; save_registry(data); render(data); print(f"订阅 {sub['name']} 已导入 {len(ids)} 个节点。")
+    for err in errors[:10]: eprint("跳过:", err)
+    return 0
+def cmd_sub_delete(args: argparse.Namespace) -> int:
+    data = load_registry(); sub = resolve_subscription(data, args.ref); ids = set(sub.get("node_ids", [])); data["nodes"] = [n for n in data["nodes"] if n.get("id") not in ids]; data["subscriptions"] = [s for s in data["subscriptions"] if s.get("id") != sub["id"]]
+    if data.get("default") in ids: data["default"] = data["nodes"][0]["id"] if data["nodes"] else None
+    save_registry(data); render(data); print(f"订阅及其 {len(ids)} 个节点已删除。"); return 0
+def cmd_sub_get(args: argparse.Namespace) -> int:
+    data = load_registry(); sub = resolve_subscription(data, args.ref)
+    if args.field:
+        value = sub.get(args.field, "")
+        if isinstance(value, (dict, list)):
+            print(json.dumps(value, ensure_ascii=False))
+        else:
+            print(value)
+        return 0
+    print(json.dumps(redact(sub), ensure_ascii=False, indent=2) if not args.raw else json.dumps(sub, ensure_ascii=False)); return 0
 
 
 def parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(description="singbox-manager node helper")
-    sub = p.add_subparsers(dest="cmd", required=True)
-    sub.add_parser("init").set_defaults(func=cmd_init)
-    sub.add_parser("list").set_defaults(func=cmd_list)
-    a = sub.add_parser("add"); a.set_defaults(func=cmd_add)
-    e = sub.add_parser("edit"); e.add_argument("ref", nargs="?"); e.set_defaults(func=cmd_edit)
-    d = sub.add_parser("delete"); d.add_argument("ref", nargs="?"); d.add_argument("--yes", action="store_true"); d.set_defaults(func=cmd_delete)
-    df = sub.add_parser("default"); df.add_argument("ref", nargs="?"); df.set_defaults(func=cmd_default)
-    s = sub.add_parser("show"); s.add_argument("ref", nargs="?"); s.set_defaults(func=cmd_show)
-    r = sub.add_parser("render"); r.add_argument("--port", type=int, default=7890); r.set_defaults(func=cmd_render)
-    t = sub.add_parser("test-config"); t.add_argument("ref", nargs="?"); t.add_argument("--output", required=True); t.add_argument("--port", type=int, default=7891); t.set_defaults(func=cmd_test_config)
+    p = argparse.ArgumentParser(description="singbox-manager helper"); sub = p.add_subparsers(dest="cmd", required=True)
+    sub.add_parser("init").set_defaults(func=cmd_init); sub.add_parser("list").set_defaults(func=cmd_list); sub.add_parser("add").set_defaults(func=cmd_add)
+    e=sub.add_parser("edit"); e.add_argument("ref", nargs="?"); e.set_defaults(func=cmd_edit)
+    d=sub.add_parser("delete"); d.add_argument("ref", nargs="?"); d.add_argument("--yes", action="store_true"); d.set_defaults(func=cmd_delete)
+    df=sub.add_parser("default"); df.add_argument("ref", nargs="?"); df.set_defaults(func=cmd_default)
+    s=sub.add_parser("show"); s.add_argument("ref", nargs="?"); s.set_defaults(func=cmd_show)
+    r=sub.add_parser("render"); r.add_argument("--port", type=int, default=7890); r.set_defaults(func=cmd_render)
+    t=sub.add_parser("test-config"); t.add_argument("ref", nargs="?"); t.add_argument("--output", required=True); t.add_argument("--port", type=int, default=7891); t.set_defaults(func=cmd_test_config)
     sub.add_parser("validate").set_defaults(func=cmd_validate)
+    iu=sub.add_parser("import-uri"); iu.add_argument("uri", nargs="?"); iu.set_defaults(func=cmd_import_uri)
+    im=sub.add_parser("import-file"); im.add_argument("file"); im.add_argument("--source"); im.set_defaults(func=cmd_import_file)
+    st=sub.add_parser("strategy"); st.add_argument("value", nargs="?"); st.set_defaults(func=cmd_strategy)
+    rt=sub.add_parser("route-mode"); rt.add_argument("value", nargs="?"); rt.set_defaults(func=cmd_route)
+    ut=sub.add_parser("urltest"); ut.add_argument("--url"); ut.add_argument("--interval"); ut.add_argument("--tolerance", type=int); ut.set_defaults(func=cmd_urltest)
+    sub.add_parser("sub-list").set_defaults(func=cmd_sub_list)
+    sr=sub.add_parser("sub-register"); sr.add_argument("url"); sr.add_argument("--name"); sr.add_argument("--id"); sr.set_defaults(func=cmd_sub_register)
+    sa=sub.add_parser("sub-apply"); sa.add_argument("ref"); sa.add_argument("file"); sa.set_defaults(func=cmd_sub_apply)
+    sd=sub.add_parser("sub-delete"); sd.add_argument("ref", nargs="?"); sd.set_defaults(func=cmd_sub_delete)
+    sg=sub.add_parser("sub-get"); sg.add_argument("ref", nargs="?"); sg.add_argument("--raw", action="store_true"); sg.add_argument("--field"); sg.set_defaults(func=cmd_sub_get)
     return p
 
 
 def main() -> int:
     try:
-        args = parser().parse_args()
-        return int(args.func(args) or 0)
-    except (ValueError, KeyError, json.JSONDecodeError) as exc:
-        eprint(f"错误: {exc}")
-        return 2
+        args = parser().parse_args(); return int(args.func(args) or 0)
+    except (ValueError, KeyError, json.JSONDecodeError, OSError) as exc:
+        eprint(f"错误: {exc}"); return 2
     except KeyboardInterrupt:
-        eprint("\n已取消。")
-        return 130
+        eprint("\n已取消。"); return 130
 
-
-if __name__ == "__main__":
-    raise SystemExit(main())
+if __name__ == "__main__": raise SystemExit(main())
