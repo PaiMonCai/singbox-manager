@@ -2,7 +2,7 @@
 
 面向 Linux 服务器的 sing-box Docker 管理层。sing-box 保持官方镜像运行，宿主机通过 `sbx` 完成安装、节点管理、配置生成、校验、测试、备份恢复与升级。
 
-当前版本：**0.10.1**
+当前版本：**0.11.0**
 
 ## 一键交互式安装
 
@@ -206,6 +206,105 @@ sbx route cn-direct-full
 
 
 
+
+
+## 0.11：可验证性与一键诊断
+
+0.11 不再增加 Web 面板，重点增强现有 CLI 的“可验证性”。
+
+### 一键诊断
+
+```bash
+sbx doctor
+```
+
+会依次检查：
+
+```text
+manager 版本
+节点库 / 生成配置结构
+sing-box 实际配置 check
+sing-box 容器运行状态
+所有代理入口的真实 HTTP 代理请求
+Docker 共享网络
+sing-box 是否加入共享网络
+Docker Watcher
+托管目标是否已经接入网络
+托管容器应用层快速检查
+```
+
+每项输出：
+
+```text
+PASS  正常
+WARN  网络可用但仍有配置风险 / 无法完全判断
+FAIL  明确失败
+```
+
+### 验证指定 Docker 容器
+
+```bash
+sbx docker-network verify new-api-A
+```
+
+会检查：
+
+```text
+容器是否运行
+singbox-proxy 是否存在
+目标容器是否在 singbox-proxy
+sing-box 是否在 singbox-proxy
+Docker 托管目标绑定的是哪个 inbound_id
+该 ID 当前对应哪个端口
+容器 HTTP_PROXY / HTTPS_PROXY / ALL_PROXY 是否指向正确入口
+Docker Watcher 是否运行
+从目标容器网络命名空间通过该入口发起真实代理请求
+代理出口 IP
+```
+
+真实出口测试使用宿主机的 `nsenter + curl` 进入目标容器的网络命名空间，因此不要求目标镜像内部安装 curl、wget 或 Python。
+
+### 验证全部托管容器
+
+```bash
+sbx docker-network verify-all
+```
+
+默认使用快速模式检查所有正在运行的托管目标，不对每个容器重复请求外部 IP 服务。
+
+如果需要单个容器的真实出口测试，使用：
+
+```bash
+sbx docker-network verify <container>
+```
+
+### 如何理解结果
+
+仅看到：
+
+```text
+CONNECTED
+```
+
+只能证明 Docker network membership 已经建立。
+
+真正判断代理链路可用，应至少看到：
+
+```text
+PASS  目标容器已加入 singbox-proxy
+PASS  sing-box 已加入 singbox-proxy
+PASS  托管关系: ... -> [入口ID] ... -> :端口
+PASS  从目标容器网络命名空间通过代理访问互联网成功
+      代理出口 IP: ...
+```
+
+如果同时看到：
+
+```text
+WARN  未检测到 HTTP_PROXY/HTTPS_PROXY/ALL_PROXY 环境变量
+```
+
+表示“代理路径已经可用”，但 manager 无法证明应用自身已经配置为使用该代理。应用也可能在自己的配置文件、数据库或启动参数中设置代理。
 
 ## 0.10.1：代理入口改为序号选择
 

@@ -543,7 +543,8 @@ docker_network_menu(){
     printf '4 取消托管    5 临时接入容器  6 临时移除容器\n'
     printf '7 查看成员    8 查看代理地址  9 Compose 模板\n'
     printf '10 Watcher开启 11 Watcher关闭 12 开启共享网络\n'
-    printf '13 关闭共享网络                              0 返回\n'
+    printf '13 关闭共享网络 14 验证容器代理 15 验证全部托管\n'
+    printf '0 返回\n'
     read -r -p '请选择: ' x || return
     case "$x" in
       1) docker_network_scan_manage ;;
@@ -559,6 +560,8 @@ docker_network_menu(){
       11) docker_network_watch_off ;;
       12) docker_network_on ;;
       13) docker_network_off ;;
+      14) read -r -p '容器名称/ID: ' c; python3 "$HOME_DIR/lib/sbx_verify.py" docker "$c" || true ;;
+      15) python3 "$HOME_DIR/lib/sbx_verify.py" docker-all || true ;;
       0) return ;;
       *) warn "无效选项" ;;
     esac
@@ -581,6 +584,8 @@ docker_network_cmd(){
     unmanage) docker_network_unmanage "${1:-}" ;;
     managed) docker_network_managed_list ;;
     sync) docker_network_sync "${1:-}" ;;
+    verify) python3 "$HOME_DIR/lib/sbx_verify.py" docker "${1:-}" "${2:-}" ;;
+    verify-all) python3 "$HOME_DIR/lib/sbx_verify.py" docker-all ;;
     watch)
       case "${1:-status}" in
         on) docker_network_watch_on ;;
@@ -605,6 +610,8 @@ sbx docker-network manage <container> [入口ID]
 sbx docker-network unmanage <container|KEY>
 sbx docker-network managed            查看托管目标
 sbx docker-network sync [--quiet]     立即按托管清单补接网络
+sbx docker-network verify <container> [入口ID]
+sbx docker-network verify-all          快速验证全部托管容器
 sbx docker-network watch on|off|status
 sbx docker-network connect <container>    临时接入当前容器实例
 sbx docker-network disconnect <container> 临时移除当前容器实例

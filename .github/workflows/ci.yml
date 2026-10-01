@@ -31,6 +31,7 @@ jobs:
         run: |
           python -m py_compile lib/sbx_nodes.py
           python -m py_compile lib/sbx_docker_targets.py
+          python -m py_compile lib/sbx_verify.py
 
       - name: Verify installer prefers raw source
         run: |
@@ -40,6 +41,7 @@ jobs:
           grep -F 'lib/sbx_inbound.sh' install.sh
           grep -F 'lib/sbx_docker_network.sh' install.sh
           grep -F 'lib/sbx_docker_targets.py' install.sh
+          grep -F 'lib/sbx_verify.py' install.sh
           grep -F 'bin/sbx-docker-watch' install.sh
           grep -F 'lib/sbx_update.sh' install.sh
           grep -F 'bin/sbx-install' install.sh
@@ -79,6 +81,7 @@ jobs:
           test -x /tmp/sbx-ci-bin/sbx-install
           test -x /tmp/sbx-manager-only/lib/sbx_update.sh
           test -x /tmp/sbx-manager-only/lib/sbx_docker_targets.py
+          test -x /tmp/sbx-manager-only/lib/sbx_verify.py
           test -x /tmp/sbx-manager-only/bin/sbx-docker-watch
 
       - name: Exercise auto-update timer generation
@@ -412,6 +415,96 @@ jobs:
           grep -F 'network connect singbox-proxy standalone' "$FAKE_DOCKER_LOG"
           python lib/sbx_docker_targets.py remove compose:new-api/app
           ! grep -F 'compose:new-api/app' <(python lib/sbx_docker_targets.py list --network singbox-proxy)
+
+      - name: Exercise Docker proxy verification
+        run: |
+          rm -rf /tmp/sbx-verify-home /tmp/sbx-verify-bin
+          mkdir -p /tmp/sbx-verify-home/nodes /tmp/sbx-verify-bin
+          export SBX_HOME=/tmp/sbx-verify-home
+          export SBX_DOCKER_MANAGED_FILE=/tmp/sbx-verify-home/docker-managed.json
+          cat > /tmp/sbx-verify-home/.env <<'EOF'
+          SING_BOX_CONTAINER_NAME=sing-box
+          SING_BOX_MIXED_PORT=7890
+          SING_BOX_DOCKER_NETWORK=singbox-proxy
+          EOF
+          cat > /tmp/sbx-verify-home/nodes/nodes.json <<'EOF'
+          {
+            "version":3,
+            "default":null,
+            "settings":{"strategy":"manual","route_mode":"global","urltest":{"url":"https://www.gstatic.com/generate_204","interval":"3m","tolerance":50}},
+            "subscriptions":[],
+            "inbounds":[],
+            "nodes":[]
+          }
+          EOF
+          cat > /tmp/sbx-verify-home/docker-managed.json <<'EOF'
+          {
+            "version":1,
+            "targets":[
+              {"type":"compose","project":"newapi","service":"app","inbound_id":"default","last_name":"new-api-A"}
+            ]
+          }
+          EOF
+          cp lib/sbx_nodes.py /tmp/sbx-verify-home/lib-sbx_nodes.py
+          mkdir -p /tmp/sbx-verify-home/lib
+          cp lib/sbx_nodes.py /tmp/sbx-verify-home/lib/sbx_nodes.py
+          cp lib/sbx_docker_targets.py /tmp/sbx-verify-home/lib/sbx_docker_targets.py
+
+          cat > /tmp/sbx-verify-bin/docker <<'EOF'
+          #!/usr/bin/env python3
+          import json,sys
+          args=sys.argv[1:]
+          target={
+            "Id":"aaa111","Name":"/new-api-A",
+            "Config":{"Image":"example/new-api:1","Labels":{"com.docker.compose.project":"newapi","com.docker.compose.service":"app"},"Env":["HTTP_PROXY=http://sing-box:7890","HTTPS_PROXY=http://sing-box:7890"]},
+            "State":{"Running":True,"Pid":4321},
+            "NetworkSettings":{"Networks":{"singbox-proxy":{"IPAddress":"172.30.0.3"}}}
+          }
+          sbx={
+            "Id":"sss111","Name":"/sing-box",
+            "Config":{"Image":"ghcr.io/sagernet/sing-box:v1.14.2","Labels":{},"Env":[]},
+            "State":{"Running":True,"Pid":4322},
+            "NetworkSettings":{"Networks":{"singbox-proxy":{"IPAddress":"172.30.0.2"}}}
+          }
+          items=[target,sbx]
+          if args[:2]==["ps","-aq"]:
+            print("aaa111\nsss111"); raise SystemExit(0)
+          if args and args[0]=="inspect":
+            refs=args[1:]
+            out=[]
+            for ref in refs:
+              for item in items:
+                if ref in (item["Id"],item["Name"].lstrip("/")):
+                  out.append(item); break
+            if not out: raise SystemExit(1)
+            print(json.dumps(out)); raise SystemExit(0)
+          if args[:2]==["network","inspect"]:
+            print(json.dumps([{
+              "Name":"singbox-proxy",
+              "Containers":{
+                "aaa111":{"Name":"new-api-A","IPv4Address":"172.30.0.3/16"},
+                "sss111":{"Name":"sing-box","IPv4Address":"172.30.0.2/16"}
+              }
+            }])); raise SystemExit(0)
+          raise SystemExit(1)
+          EOF
+          chmod +x /tmp/sbx-verify-bin/docker
+
+          cat > /tmp/sbx-verify-bin/systemctl <<'EOF'
+          #!/usr/bin/env bash
+          if [[ "$1" == "is-active" ]]; then exit 0; fi
+          exit 1
+          EOF
+          chmod +x /tmp/sbx-verify-bin/systemctl
+          export PATH="/tmp/sbx-verify-bin:$PATH"
+
+          python lib/sbx_verify.py docker new-api-A --quick | tee /tmp/sbx-verify.out
+          grep -F 'PASS  容器运行中: new-api-A' /tmp/sbx-verify.out
+          grep -F 'PASS  目标容器已加入 singbox-proxy' /tmp/sbx-verify.out
+          grep -F 'PASS  托管关系: new-api-A -> [default] 默认入口 -> :7890' /tmp/sbx-verify.out
+          grep -F 'PASS  容器代理环境变量指向 sing-box:7890' /tmp/sbx-verify.out
+          grep -F 'PASS  Watcher 正在运行' /tmp/sbx-verify.out
+          grep -F 'FAIL=0' /tmp/sbx-verify.out
 
       - name: Exercise Docker shared proxy network
         run: |
