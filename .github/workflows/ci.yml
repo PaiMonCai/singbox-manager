@@ -44,7 +44,8 @@ jobs:
 
       - name: Exercise manager-only update mode
         run: |
-          test "$(tr -d '[:space:]' < VERSION)" = "0.7.0"
+          EXPECTED_MANAGER_VERSION="$(tr -d '[:space:]' < VERSION)"
+          test -n "$EXPECTED_MANAGER_VERSION"
           rm -rf /tmp/sbx-manager-only /tmp/sbx-ci-bin
           mkdir -p /tmp/sbx-manager-only/nodes /tmp/sbx-manager-only/config /tmp/sbx-ci-bin
           cat > /tmp/sbx-manager-only/.env <<'EOF'
@@ -69,7 +70,7 @@ jobs:
             SBX_INSTALLER_LINK=/tmp/sbx-ci-bin/sbx-install \
             bash install.sh
           sha256sum -c /tmp/before.sha
-          test "$(tr -d '[:space:]' < /tmp/sbx-manager-only/VERSION)" = "0.7.0"
+          test "$(tr -d '[:space:]' < /tmp/sbx-manager-only/VERSION)" = "$EXPECTED_MANAGER_VERSION"
           test -x /tmp/sbx-ci-bin/sbx-install
           test -x /tmp/sbx-manager-only/lib/sbx_update.sh
 
