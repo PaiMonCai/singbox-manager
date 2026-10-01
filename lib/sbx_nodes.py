@@ -722,7 +722,8 @@ def make_proxy_groups(data: Dict[str, Any], outbounds: List[Dict[str, Any]]) -> 
 
 def route_config(data: Dict[str, Any], proxy_tag: str) -> Dict[str, Any]:
     mode = data["settings"].get("route_mode", "global")
-    inbound_rules = [{"inbound": [inbound_tag(x)], "action": "route", "outbound": target_tag(data, x.get("target"))} for x in data.get("inbounds", [])]\n    route: Dict[str, Any] = {"rules": inbound_rules + [{"ip_is_private": True, "action": "route", "outbound": "direct"}], "final": proxy_tag, "auto_detect_interface": True}
+    inbound_rules = [{"inbound": [inbound_tag(x)], "action": "route", "outbound": target_tag(data, x.get("target"))} for x in data.get("inbounds", [])]
+    route: Dict[str, Any] = {"rules": inbound_rules + [{"ip_is_private": True, "action": "route", "outbound": "direct"}], "final": proxy_tag, "auto_detect_interface": True}
     if mode in ("cn-direct-lite", "cn-direct-full"):
         route["rules"].append({"domain_suffix": [".cn"], "action": "route", "outbound": "direct"})
     if mode == "cn-direct-full":
