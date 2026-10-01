@@ -47,22 +47,6 @@ dc(){
 }
 envval(){ grep -E "^$1=" "$ENV" 2>/dev/null | tail -n1 | cut -d= -f2- || printf '%s' "$2"; }
 setenv(){ local k="$1" v="$2" t; t=$(mktemp); awk -v k="$k" -v v="$v" 'BEGIN{f=0} index($0,k"=")==1{print k"="v;f=1;next}{print} END{if(!f)print k"="v}' "$ENV">"$t"; cat "$t">"$ENV"; rm -f "$t"; chmod 600 "$ENV"; }
-# sing-box 本机可达地址。放在这里（lib 之前）是因为 sbx_proxy.sh / sbx_v3.sh /
-# sbx_update.sh 都要用；安装时 BIND_ADDR 可能是具体网卡地址或 IPv6。
-proxy_host(){
-  local bind
-  bind=$(envval SING_BOX_BIND_ADDR 127.0.0.1)
-  case "$bind" in
-    0.0.0.0|"") printf '127.0.0.1' ;;
-    "::"|"[::]") printf '[::1]' ;;
-    *:*)
-      bind="${bind#[}"
-      bind="${bind%]}"
-      printf '[%s]' "$bind"
-      ;;
-    *) printf '%s' "$bind" ;;
-  esac
-}
 running(){ dc ps --status running --services 2>/dev/null | grep -qx sing-box; }
 status(){ dc ps; }
 stop(){ dc stop sing-box; }

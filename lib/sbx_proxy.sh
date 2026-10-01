@@ -11,7 +11,22 @@ GIT_PROXY_FILE="${SBX_GIT_PROXY_FILE:-/etc/singbox-manager/git-proxy.conf}"
 NPM_BLOCK_BEGIN="# >>> singbox-manager proxy >>>"
 NPM_BLOCK_END="# <<< singbox-manager proxy <<<"
 
-# proxy_host() 定义已上移到 bin/sbx（加载更早，供 sbx_v3.sh / sbx_update.sh 复用）。
+# 定义留在本文件：sbx_proxy.sh 会被单独 source（CI 与手工调试都是这样），
+# 依赖 bin/sbx 里先定义会让本文件单独加载时不可用。
+proxy_host(){
+  local bind
+  bind=$(envval SING_BOX_BIND_ADDR 127.0.0.1)
+  case "$bind" in
+    0.0.0.0|"") printf '127.0.0.1' ;;
+    "::"|"[::]") printf '[::1]' ;;
+    *:*)
+      bind="${bind#[}"
+      bind="${bind%]}"
+      printf '[%s]' "$bind"
+      ;;
+    *) printf '%s' "$bind" ;;
+  esac
+}
 proxy_port(){ envval SING_BOX_MIXED_PORT 7890; }
 proxy_url(){ printf 'http://%s:%s' "$(proxy_host)" "$(proxy_port)"; }
 proxy_socks_url(){ printf 'socks5h://%s:%s' "$(proxy_host)" "$(proxy_port)"; }
