@@ -2,7 +2,7 @@
 
 面向 Linux 服务器的 sing-box Docker 管理层。sing-box 保持官方镜像运行，宿主机通过 `sbx` 完成安装、节点管理、配置生成、校验、测试、备份恢复与升级。
 
-当前版本：**0.5.2**
+当前版本：**0.5.3**
 
 ## 一键交互式安装
 
@@ -197,6 +197,51 @@ sbx route cn-direct-full
 
 
 
+
+
+## 0.5.3：安装器优先走 raw 源
+
+修复一种国内服务器常见情况：入口 `install.sh` 可以从 `raw.githubusercontent.com` 下载，但安装器随后访问 `github.com/<repo>/archive/...tar.gz` 超时。
+
+现在源码获取顺序改为：
+
+```text
+本地完整源码目录
+        ↓
+raw.githubusercontent.com 分文件下载
+        ↓
+GitHub archive 兜底
+```
+
+因此只要最开始这条命令能成功：
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/PaiMonCai/singbox-manager/main/install.sh \
+  -o /tmp/sbx-install.sh
+```
+
+安装器后续会优先沿用同类 raw 源，不再先依赖 GitHub archive。
+
+如果你有自己的国内 CDN、对象存储或仓库镜像，可以通过环境变量切换源码根地址：
+
+```bash
+sudo SBX_SOURCE_BASE_URL=https://example.com/singbox-manager/main \
+  bash /tmp/sbx-install.sh
+```
+
+该地址下需要保持与仓库一致的相对路径，例如：
+
+```text
+compose.yml
+.env.example
+config/config.example.json
+bin/sbx
+lib/sbx_nodes.py
+lib/sbx_v3.sh
+lib/sbx_proxy.sh
+lib/sbx_bootstrap.sh
+lib/sbx_image.sh
+```
 
 ## 0.5.2：修复重复 inbound tag
 

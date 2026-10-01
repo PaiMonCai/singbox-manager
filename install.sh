@@ -7,6 +7,8 @@ INSTALL_DIR="${SBX_INSTALL_DIR:-/opt/singbox-manager}"
 BIN_LINK="${SBX_BIN_LINK:-/usr/local/bin/sbx}"
 DEFAULT_VERSION="${SBX_DEFAULT_VERSION:-v1.14.2}"
 NONINTERACTIVE="${SBX_NONINTERACTIVE:-0}"
+SOURCE_BASE_URL="${SBX_SOURCE_BASE_URL:-https://raw.githubusercontent.com/${REPO}/${BRANCH}}"
+ARCHIVE_URL="${SBX_ARCHIVE_URL:-https://github.com/${REPO}/archive/refs/heads/${BRANCH}.tar.gz}"
 
 TMP_DIR=""
 SOURCE_DIR=""
@@ -107,29 +109,76 @@ ensure_docker() {
 }
 
 get_source() {
-  local script_dir=""
+  local script_dir="" raw_dir="" archive="" candidate="" path=""
+  local required=(
+    "compose.yml"
+    ".env.example"
+    "config/config.example.json"
+    "bin/sbx"
+    "lib/sbx_nodes.py"
+    "lib/sbx_v3.sh"
+    "lib/sbx_proxy.sh"
+    "lib/sbx_bootstrap.sh"
+    "lib/sbx_image.sh"
+  )
+
   if [[ -n "${BASH_SOURCE[0]:-}" && "${BASH_SOURCE[0]}" != "bash" ]]; then
     script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd || true)"
   fi
 
-  if [[ -n "$script_dir" && -f "$script_dir/compose.yml" && -f "$script_dir/bin/sbx" && -f "$script_dir/lib/sbx_nodes.py" && -f "$script_dir/lib/sbx_v3.sh" && -f "$script_dir/lib/sbx_proxy.sh" && -f "$script_dir/lib/sbx_bootstrap.sh" && -f "$script_dir/lib/sbx_image.sh" ]]; then
-    SOURCE_DIR="$script_dir"
-    return
+  if [[ -n "$script_dir" ]]; then
+    local complete=1
+    for path in "${required[@]}"; do
+      [[ -f "$script_dir/$path" ]] || { complete=0; break; }
+    done
+    if (( complete )); then
+      SOURCE_DIR="$script_dir"
+      return
+    fi
   fi
 
   TMP_DIR="$(mktemp -d)"
-  local archive="$TMP_DIR/source.tar.gz"
-  info "正在下载 singbox-manager ($BRANCH)..."
-  curl -fL --retry 3 --connect-timeout 10 \
-    "https://github.com/${REPO}/archive/refs/heads/${BRANCH}.tar.gz" \
-    -o "$archive"
+  raw_dir="$TMP_DIR/raw"
+  mkdir -p "$raw_dir/config" "$raw_dir/bin" "$raw_dir/lib"
+
+  info "正在通过 raw 源下载 singbox-manager ($BRANCH)..."
+  local raw_ok=1
+  for path in "${required[@]}"; do
+    mkdir -p "$raw_dir/$(dirname "$path")"
+    if ! curl -fL --retry 2 --connect-timeout 8 --max-time 30 \
+      "${SOURCE_BASE_URL%/}/$path" \
+      -o "$raw_dir/$path"; then
+      warn "raw 源下载失败: $path"
+      raw_ok=0
+      break
+    fi
+  done
+
+  if (( raw_ok )); then
+    SOURCE_DIR="$raw_dir"
+    info "源码已通过 raw 源准备完成。"
+    return
+  fi
+
+  warn "raw 源不可用，回退 GitHub archive..."
+  archive="$TMP_DIR/source.tar.gz"
+  if ! curl -fL --retry 2 --connect-timeout 10 --max-time 60 "$ARCHIVE_URL" -o "$archive"; then
+    die "无法下载 singbox-manager 源码。可设置 SBX_SOURCE_BASE_URL 指向你自己的 raw/CDN 镜像。"
+  fi
+
   tar -xzf "$archive" -C "$TMP_DIR"
   for candidate in "$TMP_DIR"/*/; do
-    if [[ -f "${candidate}compose.yml" && -f "${candidate}bin/sbx" && -f "${candidate}lib/sbx_nodes.py" && -f "${candidate}lib/sbx_v3.sh" && -f "${candidate}lib/sbx_proxy.sh" && -f "${candidate}lib/sbx_bootstrap.sh" && -f "${candidate}lib/sbx_image.sh" ]]; then
+    [[ "$candidate" == "$raw_dir/" ]] && continue
+    local complete=1
+    for path in "${required[@]}"; do
+      [[ -f "${candidate}$path" ]] || { complete=0; break; }
+    done
+    if (( complete )); then
       SOURCE_DIR="${candidate%/}"
       break
     fi
   done
+
   [[ -n "$SOURCE_DIR" ]] || die "无法识别下载的源码目录。"
 }
 

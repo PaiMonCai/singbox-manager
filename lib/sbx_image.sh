@@ -2,7 +2,7 @@
 # Runtime image guard for singbox-manager.
 # Prevents Docker/Compose from implicitly pulling sing-box during check/start/import flows.
 
-VERSION="0.5.2"
+VERSION="0.5.3"
 
 image_repo() {
   envval SING_BOX_IMAGE ghcr.io/sagernet/sing-box

@@ -25,6 +25,14 @@ jobs:
       - name: Python syntax
         run: python -m py_compile lib/sbx_nodes.py
 
+      - name: Verify installer prefers raw source
+        run: |
+          grep -F 'SBX_SOURCE_BASE_URL' install.sh
+          grep -F 'raw.githubusercontent.com' install.sh
+          grep -F 'raw 源不可用，回退 GitHub archive' install.sh
+          awk '/get_source\(\)/,/read_env_value\(\)/' install.sh | grep -F 'SOURCE_BASE_URL'
+          awk '/get_source\(\)/,/read_env_value\(\)/' install.sh | grep -F 'ARCHIVE_URL'
+
       - name: Validate example JSON
         run: python -m json.tool config/config.example.json >/dev/null
 
