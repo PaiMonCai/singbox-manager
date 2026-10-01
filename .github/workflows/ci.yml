@@ -465,13 +465,14 @@ jobs:
           printf '%s' "$plain" | grep -F 'singbox-manager'
 
           # 安装器同样：默认明绿，NO_COLOR 关闭
-          cp install.sh /tmp/sbx-theme-install.sh
+          # 直接跑仓库里的 install.sh（它检测到完整源码目录就不会联网下载）
           theme_inst() {
-            env -u NO_COLOR PATH="$THEME_BIN:$PATH" TERM=xterm "$@" \
+            # 必须是 root：install.sh 会以“请使用 root 运行”直接退出（CI runner 非 root）
+            sudo env -u NO_COLOR PATH="$THEME_BIN:$PATH" TERM=xterm "$@" \
               SBX_MANAGER_ONLY=1 SBX_NONINTERACTIVE=1 \
               SBX_INSTALL_DIR=/tmp/sbx-manager-only \
               SBX_BIN_LINK=/tmp/sbx-ci-bin/sbx SBX_INSTALLER_LINK=/tmp/sbx-ci-bin/sbx-install \
-              bash /tmp/sbx-theme-install.sh
+              bash install.sh
           }
           theme_inst > /tmp/sbx-theme-install.log 2>&1
           grep -qF $'\033[92m' /tmp/sbx-theme-install.log
