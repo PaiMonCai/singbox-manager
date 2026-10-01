@@ -48,11 +48,9 @@ dc(){
 envval(){ grep -E "^$1=" "$ENV" 2>/dev/null | tail -n1 | cut -d= -f2- || printf '%s' "$2"; }
 setenv(){ local k="$1" v="$2" t; t=$(mktemp); awk -v k="$k" -v v="$v" 'BEGIN{f=0} index($0,k"=")==1{print k"="v;f=1;next}{print} END{if(!f)print k"="v}' "$ENV">"$t"; cat "$t">"$ENV"; rm -f "$t"; chmod 600 "$ENV"; }
 running(){ dc ps --status running --services 2>/dev/null | grep -qx sing-box; }
-check(){ info "检查 sing-box 配置..."; dc run --rm --no-deps sing-box check -c /etc/sing-box/config.json -D /var/lib/sing-box; }
 status(){ dc ps; }
 start(){ check || die "配置检查失败。"; dc up -d sing-box; status; }
 stop(){ dc stop sing-box; }
-restart(){ check || die "配置检查失败，未替换运行容器。"; dc up -d --force-recreate sing-box; status; }
 logs(){ dc logs --tail=100 -f sing-box; }
 
 BACKUP_RESULT=""
@@ -105,76 +103,10 @@ http_test(){
   ip=$(curl --proxy "$p" --connect-timeout 5 --max-time 10 -sS https://api.ipify.org 2>/dev/null || true); [[ -n "$ip" ]] && info "代理出口 IP: $ip"; return 0
 }
 test_current(){ running || die "sing-box 未运行。"; local port; port=$(envval SING_BOX_MIXED_PORT 7890); http_test "http://127.0.0.1:$port" && info "当前代理测试通过。" || die "当前代理测试失败。"; }
-test_node(){
-  local ref="${1:-}" t c image port rc=0; t=$(mktemp -d); c="sbx-node-test-$$"; image="ghcr.io/sagernet/sing-box:$(envval SING_BOX_VERSION v1.14.2)"
-  python3 "$HELPER" test-config ${ref:+"$ref"} --output "$t/config.json" --port 7891 || { rm -rf "$t"; return 1; }
-  docker run --rm -v "$t:/etc/sing-box:ro" "$image" check -c /etc/sing-box/config.json -D /tmp/sing-box || { rm -rf "$t"; return 1; }
-  docker run -d --rm --name "$c" -p '127.0.0.1::7891/tcp' -v "$t:/etc/sing-box:ro" "$image" -D /tmp/sing-box -c /etc/sing-box/config.json run >/dev/null || { rm -rf "$t"; return 1; }
-  sleep 1; port=$(docker port "$c" 7891/tcp 2>/dev/null | head -n1 | awk -F: '{print $NF}')
-  [[ -n "$port" ]] && http_test "http://127.0.0.1:$port" || rc=1
-  ((rc)) && { warn "节点测试失败，临时日志："; docker logs "$c" 2>&1 | tail -n40 || true; } || info "节点完整代理测试通过。"
-  docker rm -f "$c" >/dev/null 2>&1 || true; rm -rf "$t"; return "$rc"
-}
-node(){
-  local op="${1:-menu}" ref="${2:-}"
-  case "$op" in
-    list|ls) python3 "$HELPER" list;;
-    add|edit|delete|del|rm|default|use) case "$op" in del|rm) op=delete;; use) op=default;; esac; node_tx "$op" "$ref";;
-    show) python3 "$HELPER" show ${ref:+"$ref"};;
-    test) test_node "$ref";;
-    render) backup; python3 "$HELPER" render >/dev/null; check; running && restart || true;;
-    help|-h|--help) cat <<'__NODEHELP__'
-sbx node list | add | edit [ID|name] | delete [ID|name]
-sbx node default [ID|name] | show [ID|name] | test [ID|name] | render
-__NODEHELP__
-      ;;
-    menu) node_menu;;
-    *) die "未知 node 命令: $op";;
-  esac
-}
-version(){ printf 'singbox-manager: %s\npinned sing-box: %s\n' "$VERSION" "$(envval SING_BOX_VERSION v1.14.2)"; }
-upgrade(){
-  local new="${1:-}" old; [[ -n "$new" ]] || die "用法: sbx upgrade v1.14.2"; [[ "$new" == v* ]] || new="v$new"; [[ "$new" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$ ]] || die "版本格式无效"; old=$(envval SING_BOX_VERSION v1.14.2); backup; setenv SING_BOX_VERSION "$new"
-  if ! dc pull sing-box || ! check || ! dc up -d --force-recreate sing-box; then setenv SING_BOX_VERSION "$old"; dc up -d --force-recreate sing-box >/dev/null 2>&1 || true; die "升级失败，已尝试回滚到 $old"; fi; version
-}
-pull(){ backup; dc pull sing-box; check; dc up -d --force-recreate sing-box; }
 edit(){ local e="${SBX_EDITOR:-${EDITOR:-vi}}"; command -v "$e" >/dev/null || die "找不到编辑器 $e"; backup; warn "config.json 由节点库生成，后续节点操作会覆盖手工改动。"; "$e" "$CONFIG"; check; }
 
 pause(){ read -r -p '按 Enter 返回...' _ || true; }
 node_menu(){ local x r; while true; do clear; printf '%b节点管理%b\n' "$C" "$N"; printf '1 查看     2 添加     3 编辑     4 删除\n5 默认     6 详情     7 测试     8 重建配置\n\n0 返回\n'; read -r -p '请选择: ' x || return; case "$x" in 1) node list;;2) node_tx add;;3) read -r -p 'ID/名称(留空后选择): ' r; node_tx edit "$r"||true;;4) read -r -p 'ID/名称(留空后选择): ' r; node_tx delete "$r"||true;;5) read -r -p 'ID/名称(留空后选择): ' r; node_tx default "$r"||true;;6) read -r -p 'ID/名称(留空后选择): ' r; python3 "$HELPER" show ${r:+"$r"}||true;;7) read -r -p 'ID/名称(留空后选择): ' r; test_node "$r"||true;;8) node render;;0) return;;*) warn "无效选项";; esac; [[ "$x" != 0 ]] && pause; done; }
-menu(){ local x v f; while true; do clear; printf '%b' "$C"; cat <<'__MENU__'
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-        singbox-manager 0.2
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-【服务控制】
-   1  状态          2  启动
-   3  停止          4  重启
-   5  日志
-
-【节点与入口】
-   6  节点管理
-
-【维护与诊断】
-   7  检查配置      8  测试代理
-   9  备份         10  恢复
-  11  版本         12  升级
-  13  拉取当前版本 14  高级编辑配置
-
-   0  退出
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-__MENU__
-    printf '%b' "$N"; read -r -p '请选择: ' x || exit; case "$x" in 1) status;;2) start;;3) stop;;4) restart;;5) logs||true;;6) node_menu; continue;;7) check||true;;8) test_current||true;;9) backup;;10) read -r -p '备份文件(留空最新): ' f; restore "$f"||true;;11) version;;12) read -r -p '目标版本: ' v; [[ -n "$v" ]]&&upgrade "$v"||true;;13) pull;;14) edit||true;;0) exit;;*) warn "无效选项";; esac; pause; done; }
-help(){ cat <<'__HELP__'
-sbx                    交互菜单
-sbx node               节点管理菜单
-sbx node add/list/edit/delete/default/show/test
-sbx status/start/stop/restart/logs/check/test
-sbx backup/restore [file]
-sbx version/upgrade <version>/pull
-__HELP__
-}
-
-main(){ root "$@"; ready; local cmd="${1:-menu}"; shift||true; case "$cmd" in menu)menu;;node)node "$@";;status|ps)status;;start|up)start;;stop|down)stop;;restart)restart;;logs|log)logs;;check)check;;test)test_current;;backup)backup;;restore)restore "${1:-}";;version|-v|--version)version;;upgrade)upgrade "${1:-}";;pull|update)pull;;edit|config)edit;;help|-h|--help)help;;*)die "未知命令: $cmd";;esac; }
 [[ -f "$HOME_DIR/lib/sbx_v3.sh" ]] && source "$HOME_DIR/lib/sbx_v3.sh"
 [[ -f "$HOME_DIR/lib/sbx_proxy.sh" ]] && source "$HOME_DIR/lib/sbx_proxy.sh"
 [[ -f "$HOME_DIR/lib/sbx_bootstrap.sh" ]] && source "$HOME_DIR/lib/sbx_bootstrap.sh"

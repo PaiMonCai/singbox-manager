@@ -192,12 +192,6 @@ node(){
   esac
 }
 
-version(){
-  printf 'singbox-manager: %s\npinned sing-box: %s\nstrategy: %s\nroute: %s\n' \
-    "$VERSION" "$(envval SING_BOX_VERSION v1.14.2)" \
-    "$(python3 "$HELPER" strategy)" "$(python3 "$HELPER" route-mode)"
-}
-
 subscription_menu(){
   local x r
   while true; do
@@ -274,83 +268,6 @@ route_menu(){
   done
 }
 
-menu(){
-  local x v f
-  while true; do
-    clear
-    printf '%b' "$C"
-    cat <<'__MENU__'
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-        singbox-manager 0.3
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-【服务控制】
-   1  状态          2  启动
-   3  停止          4  重启
-   5  日志
-
-【节点与入口】
-   6  节点管理      7  导入
-   8  订阅管理
-
-【出口与分流】
-   9  出口策略     10  路由模式
-
-【维护与诊断】
-  11  检查         12  测试代理
-  13  备份         14  恢复
-  15  版本         16  升级
-  17  拉取当前版本 18  高级编辑配置
-
-   0  退出
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-__MENU__
-    printf '%b' "$N"
-    read -r -p '请选择: ' x || exit
-    case "$x" in
-      1) status ;;
-      2) start ;;
-      3) stop ;;
-      4) restart ;;
-      5) logs || true ;;
-      6) node_menu; continue ;;
-      7) import_menu; continue ;;
-      8) subscription_menu; continue ;;
-      9) strategy_menu; continue ;;
-      10) route_menu; continue ;;
-      11) check || true ;;
-      12) test_current || true ;;
-      13) backup ;;
-      14) read -r -p '备份文件(留空最新): ' f; restore "$f" || true ;;
-      15) version ;;
-      16) read -r -p '目标版本: ' v; [[ -n "$v" ]] && upgrade "$v" || true ;;
-      17) pull ;;
-      18) edit || true ;;
-      0) exit ;;
-      *) warn "无效选项" ;;
-    esac
-    pause
-  done
-}
-
-help(){
-  cat <<'__HELP__'
-sbx                                  交互菜单
-sbx node                             节点管理菜单
-sbx import uri [URI]                 导入分享链接
-sbx import file <path>               导入本地订阅/URI 列表
-sbx subscription                    订阅管理菜单
-sbx subscription add [URL] [name]
-sbx subscription update [ID|name]
-sbx subscription list/delete/show
-sbx strategy manual|auto             手动节点 / URLTest 自动测速
-sbx route global|cn-direct-lite|cn-direct-full
-sbx urltest --url URL --interval 3m --tolerance 50
-sbx status/start/stop/restart/logs/check/test
-sbx backup/restore [file]
-sbx version/upgrade <version>/pull
-__HELP__
-}
-
 import_cmd(){
   local op="${1:-menu}"
   shift || true
@@ -360,36 +277,5 @@ import_cmd(){
     subscription|sub) sub_add "${1:-}" "${2:-}" ;;
     menu) import_menu ;;
     *) die "未知 import 命令: $op" ;;
-  esac
-}
-
-main(){
-  root "$@"
-  ready
-  local cmd="${1:-menu}"
-  shift || true
-  case "$cmd" in
-    menu) menu ;;
-    node) node "$@" ;;
-    import) import_cmd "$@" ;;
-    subscription|sub) subscription "$@" ;;
-    strategy) strategy "${1:-}" ;;
-    route) route_mode "${1:-}" ;;
-    urltest) urltest "$@" ;;
-    status|ps) status ;;
-    start|up) start ;;
-    stop|down) stop ;;
-    restart) restart ;;
-    logs|log) logs ;;
-    check) check ;;
-    test) test_current ;;
-    backup) backup ;;
-    restore) restore "${1:-}" ;;
-    version|-v|--version) version ;;
-    upgrade) upgrade "${1:-}" ;;
-    pull|update) pull ;;
-    edit|config) edit ;;
-    help|-h|--help) help ;;
-    *) die "未知命令: $cmd" ;;
   esac
 }
