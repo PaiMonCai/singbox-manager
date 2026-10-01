@@ -83,6 +83,10 @@ jobs:
           grep -F 'SBX_MIRROR_PRESET' bin/sbx-install
           grep -F 'manager_race_fetch' lib/sbx_update.sh
           grep -F 'manager_candidate_bases' lib/sbx_update.sh
+          grep -F 'manager_resolve_remote_version' lib/sbx_update.sh
+          grep -F 'RACE_PREFER_BASES' lib/sbx_update.sh
+          grep -F 'order_candidates_by_version' bin/sbx-install
+          grep -F 'source_version_cmp' install.sh
 
       - name: Exercise installer source race (fastest wins, failover)
         run: |
@@ -107,6 +111,7 @@ jobs:
             esac
           done
           [ -n "$url" ] || exit 2
+          url="${url%%\?*}"   # 忽略缓存破坏参数
           if [ -n "${SBX_TEST_REQUIRE_PROXY:-}" ] && [ -z "$proxy" ]; then exit 28; fi
           delay=""; template=""
           while IFS=$'\t' read -r prefix delay template; do
@@ -206,6 +211,18 @@ jobs:
           test "$(tr -d '[:space:]' < "$RACE/work/sequential/install/VERSION")" = '9.9.9-fast'
           grep -q 'source=fast' "$RACE/work/sequential/install/bin/sbx"
 
+          # 4) 命中 CDN 分支缓存的旧源再快也不能胜出（jsDelivr @branch 可缓存 12 小时）
+          mkdir -p "$RACE/fixtures/stale" "$RACE/fixtures/fresh"
+          cp -a "$RACE/fixtures/fast/." "$RACE/fixtures/stale/"
+          printf '0.11.2\n' > "$RACE/fixtures/stale/VERSION"
+          cp -a "$RACE/fixtures/slow/." "$RACE/fixtures/fresh/"
+          printf '0.11.4\n' > "$RACE/fixtures/fresh/VERSION"
+          printf '%s\t100\tstale/{rel}\n%s\t1200\tfresh/{rel}\n%s\t100\tmissing.tar.gz\n' "$RAW" "$JSD" "$ARCH" > "$RACE/m5.map"
+          run_case stale "$RACE/m5.map"
+          test "$(tr -d '[:space:]' < "$RACE/work/stale/install/VERSION")" = '0.11.4'
+          grep -q 'source=slow' "$RACE/work/stale/install/bin/sbx"
+          grep -F '过期' "$RACE/work/stale/run.log"
+
       - name: Exercise launcher and updater source race
         run: |
           set -e
@@ -237,7 +254,8 @@ jobs:
             echo '显式单源时不应并发' >&2; exit 1
           fi
 
-          # manager_remote_version：远端版本号也取自最快源
+          # manager_remote_version：远端版本号取所有候选里的最大版本，
+          # 不能取“最快返回者”——命中 CDN 缓存的旧源往往更快
           ver="$(sudo env PATH="$RACE/fake-bin:$PATH" SBX_TEST_MAP="$RACE/m4.map" \
             SBX_TEST_FIXTURES="$RACE/fixtures" bash -c '
               HOME_DIR=/tmp/sbx-race/home
@@ -247,6 +265,28 @@ jobs:
               source lib/sbx_update.sh
               manager_remote_version')"
           test "$ver" = '9.9.9-fast'
+
+          # 更快但版本过期的源不能胜出（sbx-install 只在“报告最新版本”的来源里抢速）
+          mkdir -p "$RACE/fixtures/launcher-stale" "$RACE/fixtures/launcher-fresh"
+          printf '#!/usr/bin/env bash\necho WINNER=stale\n' > "$RACE/fixtures/launcher-stale/install.sh"
+          printf '0.11.2\n' > "$RACE/fixtures/launcher-stale/VERSION"
+          printf '#!/usr/bin/env bash\necho WINNER=fresh\n' > "$RACE/fixtures/launcher-fresh/install.sh"
+          printf '0.11.4\n' > "$RACE/fixtures/launcher-fresh/VERSION"
+          printf '%s\t50\tlauncher-stale/{rel}\n%s\t1200\tlauncher-fresh/{rel}\n' "$RAW" "$JSD" > "$RACE/m5.map"
+          out="$(sudo env PATH="$RACE/fake-bin:$PATH" SBX_TEST_MAP="$RACE/m5.map" \
+            SBX_TEST_FIXTURES="$RACE/fixtures" bash bin/sbx-install)"
+          printf '%s\n' "$out" | grep -F 'WINNER=fresh'
+
+          # 版本号同样取最大：过期源(0.11.2)更快，但远端版本必须读成 0.11.4
+          ver="$(sudo env PATH="$RACE/fake-bin:$PATH" SBX_TEST_MAP="$RACE/m5.map" \
+            SBX_TEST_FIXTURES="$RACE/fixtures" bash -c '
+              HOME_DIR=/tmp/sbx-race/home
+              info(){ :; }
+              warn(){ :; }
+              die(){ printf "ERROR: %s\n" "$*" >&2; return 1; }
+              source lib/sbx_update.sh
+              manager_remote_version')"
+          test "$ver" = '0.11.4'
 
       - name: Exercise manager-only update mode
         run: |

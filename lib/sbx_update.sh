@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # singbox-manager v0.7 self-update integration.
 
-VERSION="0.11.4"
+VERSION="0.11.5"
 
 UPDATE_REPO="${SBX_UPDATE_REPO:-PaiMonCai/singbox-manager}"
 UPDATE_BRANCH="${SBX_UPDATE_BRANCH:-main}"
@@ -68,20 +68,121 @@ manager_candidate_bases(){
   return 0
 }
 
-# 并发抢速：向所有候选地址同时请求同一个文件，最先完整落地者胜出。
-# mode=file   → 内容写入 dest，并在 stdout 打印胜出的基础地址
-# mode=stdout → 内容打印到 stdout
-manager_race_fetch_once(){
-  local mode="$1" dest="$2" rel="$3"; shift 3
-  local -a bases=() urls=() outs=() pids=()
-  local i n=0 won=-1 alive=0 deadline dir line=""
+# 给 HTTP(S) 地址加缓存破坏参数；file:// 等其它协议原样返回
+# （raw CDN 对单个文件有几分钟缓存，发版后立刻更新时可能拿到旧内容）
+manager_bust_url(){
+  case "$1" in
+    http://*|https://*) printf '%s?sbx=%s\n' "$1" "$(date +%s)" ;;
+    *) printf '%s\n' "$1" ;;
+  esac
+}
+
+# 并发取每个候选源的 VERSION，输出 "base<TAB>version"。
+# 失败/为空的候选不输出。可选参数原样传给 curl（例如 --proxy）。
+manager_collect_versions(){
+  local -a bases=() pids=() outs=()
+  local i n dir line base v
   while IFS= read -r line; do
     [[ -n "$line" ]] || continue
     bases+=("$line")
   done < <(manager_candidate_bases)
   n=${#bases[@]}
   (( n )) || return 1
-  for ((i=0;i<n;i++)); do urls[i]="${bases[$i]%/}/$rel"; done
+  dir="$(mktemp -d "${TMPDIR:-/tmp}/sbx-manager-ver.XXXXXX")"
+  for ((i=0;i<n;i++)); do
+    outs[i]="$dir/$i"
+    (
+      curl -fsSL "$@" --connect-timeout 8 --max-time 20 \
+        "$(manager_bust_url "${bases[$i]%/}/VERSION")" -o "${outs[$i]}"
+    ) >/dev/null 2>&1 &
+    pids[i]=$!
+  done
+  for ((i=0;i<n;i++)); do wait "${pids[$i]}" 2>/dev/null || true; done
+  for ((i=0;i<n;i++)); do
+    [[ -s "${outs[$i]}" ]] || continue
+    v="$(tr -d '[:space:]' < "${outs[$i]}")"
+    [[ -n "$v" ]] || continue
+    printf '%s\t%s\n' "${bases[$i]}" "$v"
+  done
+  rm -rf "$dir"
+  return 0
+}
+
+# 远端版本 = 所有候选源里“最大的那个版本号”，并记下报告该版本的来源。
+# 不能取“最快返回者”：CDN 对分支路径有缓存（jsDelivr 可长达 12 小时），
+# 快但过期的源会让“有更新”被误判成“已是最新 / 远端更旧”，把更新永久挡住。
+# 结果写入 REMOTE_VERSION 与 REMOTE_FRESH_BASES（逗号分隔的可用来源）。
+manager_resolve_remote_version(){
+  local line base v best="" best_list="" cmp lines proxy=""
+  REMOTE_VERSION=""
+  REMOTE_FRESH_BASES=""
+
+  lines="$(manager_collect_versions 2>/dev/null)" || true
+  if [[ -z "$lines" ]]; then
+    proxy="$(manager_proxy_url)"
+    warn "直连更新源失败，尝试通过本机 sing-box: $proxy"
+    lines="$(manager_collect_versions --proxy "$proxy" 2>/dev/null)" || true
+  fi
+  [[ -n "$lines" ]] || return 1
+
+  while IFS=$'\t' read -r base v; do
+    [[ -n "$v" ]] || continue
+    if [[ -z "$best" ]]; then
+      best="$v"; best_list="$base"; continue
+    fi
+    # 注意：成功时也要显式赋值，不能写 `manager_version_cmp .. || cmp=$?`
+    # （成功不进入 || 分支，cmp 会保留上一轮的旧值）
+    if manager_version_cmp "$best" "$v"; then
+      cmp=0
+    else
+      cmp=$?
+    fi
+    case "$cmp" in
+      0) best="$v"; best_list="$base" ;;          # v 更新 → 换成它
+      1) best_list="$best_list,$base" ;;          # 相同 → 并列最新
+    esac
+  done <<<"$lines"
+
+  REMOTE_VERSION="$best"
+  REMOTE_FRESH_BASES="$best_list"
+  [[ -n "$best" ]]
+}
+
+# 并发抢速：向所有候选地址同时请求同一个文件，最先完整落地者胜出。
+# RACE_PREFER_BASES（逗号分隔）里的来源优先，其余按原顺序垫后 ——
+# 用来把“版本过期（命中 CDN 缓存）的来源”排到后面，避免装上旧安装器。
+# mode=file   → 内容写入 dest，并在 stdout 打印胜出的基础地址
+# mode=stdout → 内容打印到 stdout
+manager_race_fetch_once(){
+  local mode="$1" dest="$2" rel="$3"; shift 3
+  local -a bases=() urls=() outs=() pids=()
+  local -a prefer=() keep=()
+  local i n=0 won=-1 alive=0 deadline dir line="" b p hit=0
+  while IFS= read -r line; do
+    [[ -n "$line" ]] || continue
+    bases+=("$line")
+  done < <(manager_candidate_bases)
+  n=${#bases[@]}
+  (( n )) || return 1
+
+  if [[ -n "${RACE_PREFER_BASES:-}" ]]; then
+    # 只在这些来源里抢速：命中 CDN 缓存的旧源再快也不能让它先落地。
+    # 它们全都取不到时返回失败，由调用方退回“全量候选”再试一次。
+    IFS=',' read -r -a prefer <<<"$RACE_PREFER_BASES"
+    for b in ${bases[@]+"${bases[@]}"}; do
+      hit=0
+      for p in ${prefer[@]+"${prefer[@]}"}; do
+        if [[ "$b" == "$p" ]]; then hit=1; break; fi
+      done
+      (( hit )) && keep+=("$b")
+    done
+    bases=()
+    for b in ${keep[@]+"${keep[@]}"}; do bases+=("$b"); done
+    n=${#bases[@]}
+    (( n )) || { rm -rf "$dir" 2>/dev/null || true; return 1; }
+  fi
+
+  for ((i=0;i<n;i++)); do urls[i]="$(manager_bust_url "${bases[$i]%/}/$rel")"; done
 
   dir="$(mktemp -d "${TMPDIR:-/tmp}/sbx-manager-race.XXXXXX")"
   for ((i=0;i<n;i++)); do
@@ -138,7 +239,8 @@ manager_race_fetch(){
 }
 
 manager_remote_version(){
-  manager_race_fetch stdout "" VERSION | tr -d '[:space:]'
+  manager_resolve_remote_version || return 1
+  printf '%s\n' "$REMOTE_VERSION"
 }
 
 # 版本号比较（纯 bash，不依赖 GNU sort -V；busybox 环境也不会静默失效）：
@@ -194,10 +296,10 @@ manager_update(){
   done
 
   local_v="$(manager_local_version)"
-  remote_v="$(manager_remote_version)" || {
-    ((quiet)) || warn "无法获取远端版本。"
+  if ! remote_v="$(manager_remote_version)"; then
+    ((quiet)) || warn "无法获取远端版本（已尝试全部候选更新源）。"
     return 1
-  }
+  fi
 
   # 只有"远端严格更新"才自动执行；远端更旧时不降级（--force 是唯一降级路径）。
   # 版本号无法解析时按"有可用更新"处理，避免解析失败把更新永久挡住。
@@ -218,12 +320,27 @@ manager_update(){
   tmp="$(mktemp /tmp/sbx-manager-update.XXXXXX.sh)"
   trap 'rm -f "$tmp"' RETURN
 
-  local src=""
-  if ! src="$(manager_race_fetch file "$tmp" install.sh)"; then
+  # 只从“报告了最新版本的那些来源”里优先取 install.sh：
+  # 否则命中 CDN 缓存的旧源可能最快返回，结果装回一个旧安装器
+  # （后续 VERSION 校验会失败并报错，但没必要白跑一趟）。
+  local src="" preferred="${REMOTE_FRESH_BASES:-}" race_rc=0
+  RACE_PREFER_BASES="$preferred"
+  src="$(manager_race_fetch file "$tmp" install.sh)" || race_rc=$?
+  RACE_PREFER_BASES=""
+  if (( race_rc )) && [[ -n "$preferred" ]]; then
+    # 报告最新版本的来源全取不到 → 退回全量候选（拿到的可能是旧安装器，
+    # 但后面的 VERSION 校验会拦住，不会静默降级）
+    ((quiet)) || warn "报告最新版本的来源都取不到 install.sh，退回全部候选源重试..."
+    src="$(manager_race_fetch file "$tmp" install.sh)" || race_rc=$?
+  fi
+  if (( race_rc )); then
     rm -f "$tmp"
     trap - RETURN
     warn "下载 install.sh 失败（已并发尝试全部候选更新源），未做任何改动。"
     return 1
+  fi
+  if [[ -n "$preferred" ]] && [[ ",$preferred," != *",$src,"* ]]; then
+    ((quiet)) || warn "注意: 本次 install.sh 来自 $src，它报告的版本不是最新的（可能命中 CDN 缓存）。"
   fi
   ((quiet)) || info "安装器来源: ${src:-$UPDATE_BASE}"
 

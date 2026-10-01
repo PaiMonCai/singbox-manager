@@ -194,6 +194,7 @@ SOURCE_REQUIRED=(
 RANKED_SPECS=()
 RANKED_LABELS=()
 RANKED_SPEEDS=()
+RANKED_VERS=()
 FILES_RANKED=()
 FILES_STICKY=0
 ARCHIVE_DIR=""
@@ -264,18 +265,64 @@ source_candidates() {
   return 0
 }
 
-# 单个候选源的测速：files 取 SOURCE_PROBE_FILE，archive 取整包。
-# 只测量吞吐（允许超时截断），不负责内容完整性——完整性由正式抓取阶段保证。
+# 给 HTTP(S) 地址加缓存破坏参数（raw CDN 对单文件有几分钟缓存，发版后立刻跑安装器
+# 可能拿到旧内容）；file:// 等其它协议原样返回。
+source_bust_url() {
+  case "$1" in
+    http://*|https://*) printf '%s?sbx=%s\n' "$1" "$(date +%s)" ;;
+    *) printf '%s\n' "$1" ;;
+  esac
+}
+
+# 版本号比较，只比较数字部分（install.sh 必须自包含）：
+#   第一个更旧 → 0；数字部分相同 → 1；第一个更新 → 2；无法解析 → 3
+# 这里刻意忽略 -rc1 / 后缀差异：它只用来判断“某个源报告的版本是不是明显更旧
+# （命中了 CDN 的分支缓存）”，不是用来决定要不要更新的。
+source_version_cmp() {
+  local left_v="$1" right_v="$2" l r n i ln rn
+  local -a lparts=() rparts=()
+  l="${left_v#v}"; l="${l#V}"; l="${l%%[^0-9.]*}"
+  r="${right_v#v}"; r="${r#V}"; r="${r%%[^0-9.]*}"
+  [[ "$l" =~ ^[0-9]+(\.[0-9]+)*$ ]] || return 3
+  [[ "$r" =~ ^[0-9]+(\.[0-9]+)*$ ]] || return 3
+  IFS='.' read -r -a lparts <<<"$l"
+  IFS='.' read -r -a rparts <<<"$r"
+  n=${#lparts[@]}
+  (( ${#rparts[@]} > n )) && n=${#rparts[@]}
+  for ((i=0;i<n;i++)); do
+    ln="${lparts[i]:-0}"; rn="${rparts[i]:-0}"
+    if (( 10#$ln < 10#$rn )); then return 0; fi
+    if (( 10#$ln > 10#$rn )); then return 2; fi
+  done
+  return 1
+}
+
+# 单个候选源的探测：探测文件（测吞吐）+ 该源的 VERSION（判断内容是否过期，仅 files 源）。
+# 只测量吞吐，不负责内容完整性——完整性由正式抓取阶段保证。
 source_probe_one() {
   local spec="$1" payload="$2" result="$3" kind url label rc=0 metrics code speed size
+  local version="" vtmp=""
   IFS='|' read -r kind url label <<<"$spec"
-  if [[ "$kind" == "files" ]]; then
-    url="${url%/}/${SOURCE_PROBE_FILE}"
+  if [[ "$kind" != "files" ]]; then
+    metrics="$(curl -sSL -A "$SOURCE_UA" --connect-timeout 5 --max-time "$SOURCE_PROBE_TIMEOUT" \
+      -w '%{http_code} %{speed_download} %{size_download}' -o "$payload" "$url" 2>/dev/null)" || rc=$?
+  else
+    vtmp="${payload}.version"
+    # 探测文件与 VERSION 并发取，避免把单源探测耗时翻倍
+    (
+      curl -fsSL -A "$SOURCE_UA" --connect-timeout 5 --max-time "$SOURCE_PROBE_TIMEOUT" \
+        "$(source_bust_url "${url%/}/VERSION")" -o "$vtmp" 2>/dev/null
+    ) >/dev/null 2>&1 &
+    local vpid=$!
+    metrics="$(curl -sSL -A "$SOURCE_UA" --connect-timeout 5 --max-time "$SOURCE_PROBE_TIMEOUT" \
+      -w '%{http_code} %{speed_download} %{size_download}' -o "$payload" \
+      "$(source_bust_url "${url%/}/${SOURCE_PROBE_FILE}")" 2>/dev/null)" || rc=$?
+    wait "$vpid" 2>/dev/null || true
+    if [[ -s "$vtmp" ]]; then version="$(tr -d '[:space:]' < "$vtmp")"; fi
+    rm -f "$vtmp"
   fi
-  metrics="$(curl -sSL -A "$SOURCE_UA" --connect-timeout 5 --max-time "$SOURCE_PROBE_TIMEOUT" \
-    -w '%{http_code} %{speed_download} %{size_download}' -o "$payload" "$url" 2>/dev/null)" || rc=$?
   read -r code speed size <<<"${metrics:-0 0 0}"
-  printf '%s\t%s\t%s\t%s\n' "$rc" "${code:-0}" "${speed:-0}" "${size:-0}" >"$result"
+  printf '%s\t%s\t%s\t%s\t%s\n' "$rc" "${code:-0}" "${speed:-0}" "${size:-0}" "$version" >"$result"
   return 0
 }
 
@@ -290,13 +337,13 @@ source_tree_complete() {
 # 并发测速 → 填充 RANKED_SPECS / RANKED_LABELS / RANKED_SPEEDS / FILES_RANKED
 race_sources() {
   local spec i n=0 idx kind url label rc=0 code=0 speed=0 size=0 size_int=0 speed_int=0 a b best tmp order_str=""
-  local raced=0
+  local raced=0 max_version="" stale_str=""
   local dir="$TMP_DIR/race"
-  local -a pids=() spd_of=()
-  local -a r_specs=() r_labels=() r_spds=() r_files=()
+  local -a pids=() spd_of=() ver_of=()
+  local -a r_specs=() r_labels=() r_spds=() r_vers=() r_files=()
   local uniq=""
 
-  RANKED_SPECS=(); RANKED_LABELS=(); RANKED_SPEEDS=(); FILES_RANKED=(); FILES_STICKY=0
+  RANKED_SPECS=(); RANKED_LABELS=(); RANKED_SPEEDS=(); RANKED_VERS=(); FILES_RANKED=(); FILES_STICKY=0
 
   while IFS= read -r spec; do
     [[ -n "$spec" ]] || continue
@@ -328,9 +375,11 @@ race_sources() {
     # 有响应的按实测吞吐降序排在最前，其余保持默认顺序作为后备
     local -a ok_idx=() ok_spd=()
     for ((i=0;i<n;i++)); do
-      rc=1; code=0; speed=0; size=0
+      rc=1; code=0; speed=0; size=0; ver_of[i]=""
+      local ver_field=""
       if [[ -f "$dir/result.$i" ]]; then
-        IFS=$'\t' read -r rc code speed size <"$dir/result.$i" || true
+        IFS=$'\t' read -r rc code speed size ver_field <"$dir/result.$i" || true
+        ver_of[i]="$ver_field"
       fi
       size_int="${size%%.*}"; speed_int="${speed%%.*}"
       [[ "$size_int" =~ ^[0-9]+$ ]] || size_int=0
@@ -351,7 +400,52 @@ race_sources() {
         tmp="${ok_idx[a]}"; ok_idx[a]="${ok_idx[best]}"; ok_idx[best]="$tmp"
       fi
     done
-    for ((a=0;a<${#ok_idx[@]};a++)); do order_str+=" ${ok_idx[a]}"; done
+
+    # 过期源降级：CDN 对分支路径有缓存（jsDelivr 可长达 12 小时），它往往又快又旧。
+    # 取探测到的最大版本作为“当前版本”，报告更旧版本的源排到最后，
+    # 避免“装了快但过期的源码/旧版本”。只在默认派生候选集合上启用，
+    # 显式指定 SBX_SOURCE_BASE_URL 时保持原语义（用户自己钉的来源优先）。
+    if (( SOURCE_EXTRAS )); then
+      local cmp_rc=0
+      for ((i=0;i<n;i++)); do
+        [[ -n "${ver_of[$i]}" ]] || continue
+        if [[ -z "$max_version" ]]; then
+          max_version="${ver_of[$i]}"
+          continue
+        fi
+        if source_version_cmp "$max_version" "${ver_of[$i]}"; then
+          cmp_rc=0
+        else
+          cmp_rc=$?
+        fi
+        if (( cmp_rc == 0 )); then
+          max_version="${ver_of[$i]}"
+        fi
+      done
+      if [[ -n "$max_version" ]]; then
+        for ((a=0;a<${#ok_idx[@]};a++)); do
+          i="${ok_idx[a]}"
+          cmp_rc=1
+          if [[ -n "${ver_of[$i]}" ]]; then
+            if source_version_cmp "$max_version" "${ver_of[$i]}"; then
+              cmp_rc=0
+            else
+              cmp_rc=$?
+            fi
+          fi
+          # 只有“明确比最新版本更旧”才降级；未知版本、相同版本、无法解析都保持原序
+          if (( cmp_rc == 2 )); then
+            stale_str+=" $i"
+          else
+            order_str+=" $i"
+          fi
+        done
+      fi
+    fi
+    if [[ -z "$order_str" ]]; then
+      for ((a=0;a<${#ok_idx[@]};a++)); do order_str+=" ${ok_idx[a]}"; done
+    fi
+    order_str+="$stale_str"
     for ((i=0;i<n;i++)); do
       case " $order_str " in *" $i "*) continue ;; esac
       order_str+=" $i"
@@ -365,6 +459,7 @@ race_sources() {
     r_specs+=("$spec")
     r_labels+=("$label")
     r_spds+=("$(source_speed_text "${spd_of[$i]:-0}")")
+    r_vers+=("${ver_of[$i]:-}")
     if [[ "$kind" == "files" ]]; then r_files+=("$spec"); fi
     if (( idx == 0 )); then FIRST_LABEL="$label"; fi
     idx=$((idx+1))
@@ -373,12 +468,21 @@ race_sources() {
   RANKED_SPECS=("${r_specs[@]}")
   RANKED_LABELS=("${r_labels[@]}")
   RANKED_SPEEDS=("${r_spds[@]}")
+  RANKED_VERS=("${r_vers[@]}")
   if (( ${#r_files[@]} )); then FILES_RANKED=("${r_files[@]}"); fi
 
   if (( raced )); then
-    local summary="" sep=""
+    local summary="" sep="" mark=""
     for ((a=0;a<${#RANKED_LABELS[@]};a++)); do
-      summary+="${sep}${RANKED_LABELS[$a]} ${RANKED_SPEEDS[$a]}"
+      mark=""
+      if [[ -n "${RANKED_VERS[$a]:-}" ]]; then
+        if [[ "${RANKED_VERS[$a]}" == "$max_version" ]]; then
+          mark="v${RANKED_VERS[$a]}"
+        else
+          mark="v${RANKED_VERS[$a]}(过期)"
+        fi
+      fi
+      summary+="${sep}${RANKED_LABELS[$a]} ${mark:+$mark }${RANKED_SPEEDS[$a]}"
       sep=" | "
     done
     info "测速结果: $summary → 首选 ${FIRST_LABEL}"
@@ -390,7 +494,7 @@ fetch_source_file() { # base path dest
   local base="$1" path="$2" dest="$3" part="$3.part"
   mkdir -p "$(dirname "$dest")"
   if curl -fL -A "$SOURCE_UA" --retry 1 --retry-delay 1 --connect-timeout 8 \
-    --max-time "$SOURCE_FILE_TIMEOUT" "${base%/}/$path" -o "$part"; then
+    --max-time "$SOURCE_FILE_TIMEOUT" "$(source_bust_url "${base%/}/$path")" -o "$part"; then
     if [[ -s "$part" ]]; then
       mv -f "$part" "$dest"
       return 0

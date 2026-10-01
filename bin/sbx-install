@@ -70,6 +70,114 @@ installer_candidates(){
   return 0
 }
 
+# 数字部分比较（只判断"明显更旧"，忽略 -rc1 之类后缀差异）：
+#   左边更旧 → 0；数字部分相同 → 1；左边更新 → 2；无法解析 → 3
+ver_cmp(){
+  local l="${1#v}" r="${2#v}" i ln rn n
+  local -a lp=() rp=()
+  l="${l#V}"; l="${l%%[^0-9.]*}"
+  r="${r#V}"; r="${r%%[^0-9.]*}"
+  [[ "$l" =~ ^[0-9]+(\.[0-9]+)*$ ]] || return 3
+  [[ "$r" =~ ^[0-9]+(\.[0-9]+)*$ ]] || return 3
+  IFS='.' read -r -a lp <<<"$l"
+  IFS='.' read -r -a rp <<<"$r"
+  n=${#lp[@]}
+  (( ${#rp[@]} > n )) && n=${#rp[@]}
+  for ((i=0;i<n;i++)); do
+    ln="${lp[i]:-0}"; rn="${rp[i]:-0}"
+    if (( 10#$ln < 10#$rn )); then return 0; fi
+    if (( 10#$ln > 10#$rn )); then return 2; fi
+  done
+  return 1
+}
+
+bust_url(){
+  case "$1" in
+    http://*|https://*) printf '%s?sbx=%s\n' "$1" "$(date +%s)" ;;
+    *) printf '%s\n' "$1" ;;
+  esac
+}
+
+# 读入候选 install.sh 地址，按"该源报告的版本是否最新"重排：
+# 命中 CDN 分支缓存（jsDelivr 可长达 12 小时）的来源往往最快但内容是旧的，
+# 必须排到最后，否则会装上旧版安装器。未知版本的来源保持原顺序。
+order_candidates_by_version(){
+  local -a urls=() pids=() outs=()
+  local i n dir line url base best="" cmp=1
+  while IFS= read -r line; do
+    [[ -n "$line" ]] || continue
+    urls+=("$line")
+  done
+  n=${#urls[@]}
+  (( n > 1 )) || { printf '%s\n' ${urls[@]+"${urls[@]}"}; return 0; }
+
+  dir="$(mktemp -d "${TMPDIR:-/tmp}/sbx-install-ver.XXXXXX")"
+  for ((i=0;i<n;i++)); do
+    url="${urls[$i]}"
+    base="${url%/install.sh}"
+    outs[i]=""
+    [[ "$url" == "$base" ]] && continue          # 不是 <base>/install.sh 形式就不探测
+    outs[i]="$dir/$i"
+    (
+      curl -fsSL ${RACE_CURL_EXTRA[@]+"${RACE_CURL_EXTRA[@]}"} --connect-timeout 8 --max-time 15 \
+        "$(bust_url "${base%/}/VERSION")" -o "${outs[$i]}"
+    ) >/dev/null 2>&1 &
+    pids[i]=$!
+  done
+  for ((i=0;i<n;i++)); do
+    [[ -n "${pids[i]:-}" ]] || continue
+    wait "${pids[i]}" 2>/dev/null || true
+  done
+
+  # 先收集各源报告的版本，取最大值，再按“是否明显更旧”分组
+  local -a vers=()
+  for ((i=0;i<n;i++)); do
+    vers[i]=""
+    if [[ -n "${outs[$i]:-}" && -s "${outs[$i]}" ]]; then
+      vers[i]="$(tr -d '[:space:]' < "${outs[$i]}")"
+    fi
+    [[ -n "${vers[i]}" ]] || continue
+    if [[ -z "$best" ]]; then
+      best="${vers[i]}"
+      continue
+    fi
+    if ver_cmp "$best" "${vers[i]}"; then
+      cmp=0
+    else
+      cmp=$?
+    fi
+    (( cmp == 0 )) && best="${vers[i]}"
+  done
+
+  local -a fresh=() stale=() unknown=()
+  for ((i=0;i<n;i++)); do
+    if [[ -z "${vers[i]}" ]]; then
+      unknown+=("${urls[$i]}")                  # 探测不到：不降级
+      continue
+    fi
+    cmp=1
+    if [[ -n "$best" ]]; then
+      if ver_cmp "$best" "${vers[i]}"; then
+        cmp=0
+      else
+        cmp=$?
+      fi
+    fi
+    if (( cmp == 2 )); then
+      stale+=("${urls[$i]}")
+    else
+      fresh+=("${urls[$i]}")
+    fi
+  done
+  rm -rf "$dir"
+
+  printf '%s\n' ${fresh[@]+"${fresh[@]}"}
+  printf '%s\n' ${unknown[@]+"${unknown[@]}"}
+  printf '%s\n' '--stale--'
+  printf '%s\n' ${stale[@]+"${stale[@]}"}
+  return 0
+}
+
 # 并发抢速：同时向所有候选地址请求同一个文件，最先完整落地者胜出。
 # 每个候选先写 .part 再原子改名，因此"文件存在"只可能来自一次完整下载。
 race_fetch(){
@@ -82,7 +190,7 @@ race_fetch(){
     outs[i]="$dir/$i"
     (
       curl -fsL ${RACE_CURL_EXTRA[@]+"${RACE_CURL_EXTRA[@]}"} --connect-timeout 8 --max-time "$RACE_TIMEOUT" \
-        "${urls[$i]}" -o "${outs[$i]}.part" && mv -f "${outs[$i]}.part" "${outs[$i]}"
+        "$(bust_url "${urls[$i]}")" -o "${outs[$i]}.part" && mv -f "${outs[$i]}.part" "${outs[$i]}"
     ) >/dev/null 2>&1 &
     pids[i]=$!
   done
@@ -111,29 +219,42 @@ race_fetch(){
 }
 
 fetch_installer(){
-  local -a cands=() proxy_url=""
-  local winner=""
+  local -a fresh=() all=()
+  local winner="" line in_stale=0 proxy_url="" 
   while IFS= read -r line; do
     [[ -n "$line" ]] || continue
-    cands+=("$line")
-  done < <(installer_candidates)
+    if [[ "$line" == "--stale--" ]]; then in_stale=1; continue; fi
+    all+=("$line")
+    (( in_stale )) || fresh+=("$line")
+  done < <(installer_candidates | order_candidates_by_version)
 
   printf '[INFO] 获取最新 singbox-manager 安装器...\n'
-  if (( ${#cands[@]} > 1 )); then
-    printf '[INFO] 同时尝试 %d 个下载源，取最先完成者。\n' "${#cands[@]}"
+  if (( ${#all[@]} > 1 )); then
+    printf '[INFO] 同时尝试 %d 个下载源，取最先完成者（版本过期的源不参与，除非全部失败）。\n' "${#all[@]}"
   fi
 
   RACE_CURL_EXTRA=()
-  if winner="$(race_fetch "$tmp" ${cands[@]+"${cands[@]}"})"; then
+  if (( ${#fresh[@]} )) && winner="$(race_fetch "$tmp" ${fresh[@]+"${fresh[@]}"})"; then
     printf '[INFO] 安装器来源: %s\n' "$winner"
     return 0
+  fi
+  if (( ${#fresh[@]} < ${#all[@]} )); then
+    printf '[WARN] 报告最新版本的来源都没取到，改用其余候选源重试。\n' >&2
+    if winner="$(race_fetch "$tmp" ${all[@]+"${all[@]}"})"; then
+      printf '[INFO] 安装器来源: %s（可能命中 CDN 缓存）\n' "$winner"
+      return 0
+    fi
   fi
 
   proxy_url="$(detect_proxy || true)"
   if [[ -n "$proxy_url" ]]; then
     printf '[WARN] 直连更新源失败，尝试本机 sing-box: %s\n' "$proxy_url" >&2
     RACE_CURL_EXTRA=(--proxy "$proxy_url")
-    if winner="$(race_fetch "$tmp" ${cands[@]+"${cands[@]}"})"; then
+    if (( ${#fresh[@]} )) && winner="$(race_fetch "$tmp" ${fresh[@]+"${fresh[@]}"})"; then
+      printf '[INFO] 安装器来源: %s（经本机代理）\n' "$winner"
+      return 0
+    fi
+    if (( ${#fresh[@]} < ${#all[@]} )) && winner="$(race_fetch "$tmp" ${all[@]+"${all[@]}"})"; then
       printf '[INFO] 安装器来源: %s（经本机代理）\n' "$winner"
       return 0
     fi
