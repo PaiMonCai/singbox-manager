@@ -2,7 +2,7 @@ name: singbox-manager
 
 services:
   sing-box:
-    image: ghcr.io/sagernet/sing-box:${SING_BOX_VERSION:-v1.14.1}
+    image: ghcr.io/sagernet/sing-box:${SING_BOX_VERSION:-v1.14.2}
     container_name: ${SING_BOX_CONTAINER_NAME:-sing-box}
     restart: unless-stopped
     volumes:

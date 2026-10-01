@@ -1,6 +1,9 @@
 .env
 config/config.json
+nodes/nodes.json
 data/*
 backup/*
 *.tar.gz
 .DS_Store
+__pycache__/
+*.pyc

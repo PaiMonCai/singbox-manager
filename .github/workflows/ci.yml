@@ -18,12 +18,99 @@ jobs:
           bash -n install.sh
           bash -n bin/sbx
 
-      - name: Validate JSON
+      - name: Python syntax
+        run: python -m py_compile lib/sbx_nodes.py
+
+      - name: Validate example JSON
         run: python -m json.tool config/config.example.json >/dev/null
 
       - name: Validate Compose
         run: |
           cp .env.example .env
-          mkdir -p data backup
+          mkdir -p data backup nodes
           cp config/config.example.json config/config.json
           docker compose -f compose.yml config >/dev/null
+
+      - name: Generate managed config for all supported node types
+        env:
+          SBX_HOME: ${{ github.workspace }}/.ci-home
+        run: |
+          mkdir -p "$SBX_HOME/nodes" "$SBX_HOME/config"
+          cat > "$SBX_HOME/nodes/nodes.json" <<'JSON'
+          {
+            "version": 1,
+            "default": "11111111",
+            "nodes": [
+              {
+                "id": "11111111",
+                "name": "ss-test",
+                "type": "shadowsocks",
+                "server": "127.0.0.1",
+                "server_port": 8388,
+                "method": "aes-256-gcm",
+                "password": "test-password"
+              },
+              {
+                "id": "22222222",
+                "name": "vless-test",
+                "type": "vless",
+                "server": "example.com",
+                "server_port": 443,
+                "uuid": "bf000d23-0752-40b4-affe-68f7707a9661",
+                "tls": {
+                  "enabled": true,
+                  "server_name": "example.com",
+                  "insecure": false
+                }
+              },
+              {
+                "id": "33333333",
+                "name": "trojan-test",
+                "type": "trojan",
+                "server": "example.com",
+                "server_port": 443,
+                "password": "test-password",
+                "tls": {
+                  "enabled": true,
+                  "server_name": "example.com",
+                  "insecure": false
+                }
+              },
+              {
+                "id": "44444444",
+                "name": "hy2-test",
+                "type": "hysteria2",
+                "server": "example.com",
+                "server_port": 443,
+                "password": "test-password",
+                "tls": {
+                  "enabled": true,
+                  "server_name": "example.com",
+                  "insecure": false
+                }
+              },
+              {
+                "id": "55555555",
+                "name": "socks-test",
+                "type": "socks",
+                "server": "127.0.0.1",
+                "server_port": 1080,
+                "version": "5",
+                "username": "user",
+                "password": "pass"
+              }
+            ]
+          }
+          JSON
+          python lib/sbx_nodes.py validate
+          python lib/sbx_nodes.py render
+          python -m json.tool "$SBX_HOME/config/config.json" >/dev/null
+
+      - name: Validate generated config with sing-box
+        env:
+          SBX_HOME: ${{ github.workspace }}/.ci-home
+        run: |
+          docker run --rm \
+            -v "$SBX_HOME/config:/etc/sing-box:ro" \
+            ghcr.io/sagernet/sing-box:v1.14.2 \
+            check -c /etc/sing-box/config.json -D /tmp/sing-box
