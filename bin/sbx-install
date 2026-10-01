@@ -3,9 +3,12 @@ set -Eeuo pipefail
 
 REPO="${SBX_REPO:-PaiMonCai/singbox-manager}"
 BRANCH="${SBX_INSTALL_BRANCH:-main}"
-URL="${SBX_INSTALL_URL:-https://raw.githubusercontent.com/${REPO}/${BRANCH}/install.sh}"
+URL="${SBX_INSTALL_URL:-}"
 HOME_DIR="${SBX_HOME:-/opt/singbox-manager}"
 ENV_FILE="${SBX_ENV_FILE:-$HOME_DIR/.env}"
+SOURCE_MIRRORS="${SBX_SOURCE_MIRRORS:-}"
+MIRROR_PRESET="${SBX_MIRROR_PRESET:-0}"
+RACE_TIMEOUT="${SBX_INSTALL_RACE_TIMEOUT:-25}"
 
 if [[ ${EUID:-$(id -u)} -ne 0 ]]; then
   if command -v sudo >/dev/null 2>&1; then
@@ -38,17 +41,100 @@ detect_proxy(){
   return 1
 }
 
+# 候选安装器地址：显式 SBX_INSTALL_URL 时只用它；否则官方 raw + jsDelivr(+可选加速站/自建镜像)。
+installer_candidates(){
+  local -a extras=() preset=()
+  local raw_base="https://raw.githubusercontent.com/${REPO}/${BRANCH}" m
+  if [[ -n "$URL" ]]; then
+    printf '%s\n' "$URL"
+  fi
+  IFS=' ,' read -r -a extras <<<"$SOURCE_MIRRORS"
+  for m in ${extras[@]+"${extras[@]}"}; do
+    [[ -n "$m" ]] || continue
+    printf '%s/install.sh\n' "${m%/}"
+  done
+  [[ -n "$URL" ]] && return 0
+  printf '%s/install.sh\n' "$raw_base"
+  printf 'https://cdn.jsdelivr.net/gh/%s@%s/install.sh\n' "$REPO" "$BRANCH"
+  if [[ "$MIRROR_PRESET" == "1" ]]; then
+    preset=(
+      "https://gh-proxy.com/${raw_base}"
+      "https://ghproxy.net/${raw_base}"
+      "https://ghfast.top/${raw_base}"
+      "https://raw.gitmirror.com/${REPO}/${BRANCH}"
+    )
+    for m in "${preset[@]}"; do
+      printf '%s/install.sh\n' "$m"
+    done
+  fi
+  return 0
+}
+
+# 并发抢速：同时向所有候选地址请求同一个文件，最先完整落地者胜出。
+# 每个候选先写 .part 再原子改名，因此"文件存在"只可能来自一次完整下载。
+race_fetch(){
+  local dest="$1"; shift
+  local -a urls=("$@") outs=() pids=()
+  local n=${#urls[@]} i won=-1 alive=0 deadline dir
+  (( n )) || return 1
+  dir="$(mktemp -d "${TMPDIR:-/tmp}/sbx-install-race.XXXXXX")"
+  for ((i=0;i<n;i++)); do
+    outs[i]="$dir/$i"
+    (
+      curl -fsL ${RACE_CURL_EXTRA[@]+"${RACE_CURL_EXTRA[@]}"} --connect-timeout 8 --max-time "$RACE_TIMEOUT" \
+        "${urls[$i]}" -o "${outs[$i]}.part" && mv -f "${outs[$i]}.part" "${outs[$i]}"
+    ) >/dev/null 2>&1 &
+    pids[i]=$!
+  done
+  deadline=$(( SECONDS + RACE_TIMEOUT + 10 ))
+  while (( SECONDS < deadline )); do
+    for ((i=0;i<n;i++)); do
+      if [[ -s "${outs[$i]}" ]]; then won=$i; break 2; fi
+    done
+    alive=0
+    for ((i=0;i<n;i++)); do
+      if kill -0 "${pids[i]}" 2>/dev/null; then alive=1; break; fi
+    done
+    if (( alive == 0 )); then break; fi
+    sleep 0.2
+  done
+  for ((i=0;i<n;i++)); do kill "${pids[i]}" 2>/dev/null || true; done
+  wait >/dev/null 2>&1 || true
+  if (( won >= 0 )); then
+    cp -f "${outs[$won]}" "$dest"
+    printf '%s\n' "${urls[$won]}"
+    rm -rf "$dir"
+    return 0
+  fi
+  rm -rf "$dir"
+  return 1
+}
+
 fetch_installer(){
+  local -a cands=() proxy_url=""
+  local winner=""
+  while IFS= read -r line; do
+    [[ -n "$line" ]] || continue
+    cands+=("$line")
+  done < <(installer_candidates)
+
   printf '[INFO] 获取最新 singbox-manager 安装器...\n'
-  if curl -fL --retry 1 --connect-timeout 8 --max-time 25 "$URL" -o "$tmp"; then
+  if (( ${#cands[@]} > 1 )); then
+    printf '[INFO] 同时尝试 %d 个下载源，取最先完成者。\n' "${#cands[@]}"
+  fi
+
+  RACE_CURL_EXTRA=()
+  if winner="$(race_fetch "$tmp" ${cands[@]+"${cands[@]}"})"; then
+    printf '[INFO] 安装器来源: %s\n' "$winner"
     return 0
   fi
 
-  local proxy=""
-  proxy="$(detect_proxy || true)"
-  if [[ -n "$proxy" ]]; then
-    printf '[WARN] 直连更新源失败，尝试本机 sing-box: %s\n' "$proxy" >&2
-    if curl -fL --proxy "$proxy" --retry 2 --connect-timeout 8 --max-time 35 "$URL" -o "$tmp"; then
+  proxy_url="$(detect_proxy || true)"
+  if [[ -n "$proxy_url" ]]; then
+    printf '[WARN] 直连更新源失败，尝试本机 sing-box: %s\n' "$proxy_url" >&2
+    RACE_CURL_EXTRA=(--proxy "$proxy_url")
+    if winner="$(race_fetch "$tmp" ${cands[@]+"${cands[@]}"})"; then
+      printf '[INFO] 安装器来源: %s（经本机代理）\n' "$winner"
       return 0
     fi
   fi
@@ -56,6 +142,7 @@ fetch_installer(){
   printf '[ERROR] 无法获取 install.sh。\n' >&2
   printf '        可手工指定代理：SBX_INSTALL_PROXY=http://127.0.0.1:7890 sbx-install\n' >&2
   printf '        或指定镜像地址：SBX_INSTALL_URL=https://你的镜像/install.sh sbx-install\n' >&2
+  printf '        或加入候选源：SBX_SOURCE_MIRRORS=https://你的镜像/仓库/分支 sbx-install\n' >&2
   return 1
 }
 

@@ -65,6 +65,189 @@ jobs:
           awk '/get_source\(\)/,/read_env_value\(\)/' install.sh | grep -F 'SOURCE_BASE_URL'
           awk '/get_source\(\)/,/read_env_value\(\)/' install.sh | grep -F 'ARCHIVE_URL'
 
+      - name: Verify concurrent source racing is wired in
+        run: |
+          grep -F 'SBX_SOURCE_MIRRORS' install.sh
+          grep -F 'SBX_MIRROR_PRESET' install.sh
+          grep -F 'SBX_SOURCE_NO_RACE' install.sh
+          grep -F 'SBX_SOURCE_CONCURRENCY' install.sh
+          grep -F 'fetch_one_file_ranked' install.sh
+          grep -F '并发测速' install.sh
+          grep -F 'cdn.jsdelivr.net' install.sh
+          grep -F 'codeload.github.com' install.sh
+          grep -F 'race_sources' install.sh
+          grep -F 'fetch_files_missing' install.sh
+          grep -F 'source_probe_one' install.sh
+          # 入口与自更新同样参与抢速
+          grep -F 'race_fetch' bin/sbx-install
+          grep -F 'SBX_MIRROR_PRESET' bin/sbx-install
+          grep -F 'manager_race_fetch' lib/sbx_update.sh
+          grep -F 'manager_candidate_bases' lib/sbx_update.sh
+
+      - name: Exercise installer source race (fastest wins, failover)
+        run: |
+          set -e
+          RACE=/tmp/sbx-race
+          rm -rf "$RACE"
+          mkdir -p "$RACE/fake-bin" "$RACE/fixtures" "$RACE/work"
+
+          # 假 curl：把 URL 映射到 fixture，用延迟模拟不同源的速率（缺失文件 → 404）
+          cat > "$RACE/fake-bin/curl" <<'SH'
+          #!/usr/bin/env bash
+          set -uo pipefail
+          out=""; wfmt=""; url=""; proxy=""
+          while [ "$#" -gt 0 ]; do
+            case "$1" in
+              -o) out="$2"; shift 2 ;;
+              -w) wfmt="$2"; shift 2 ;;
+              --proxy) proxy="$2"; shift 2 ;;
+              -A|--connect-timeout|--max-time|--retry|--retry-delay) shift 2 ;;
+              -*) shift ;;
+              *) url="$1"; shift ;;
+            esac
+          done
+          [ -n "$url" ] || exit 2
+          if [ -n "${SBX_TEST_REQUIRE_PROXY:-}" ] && [ -z "$proxy" ]; then exit 28; fi
+          delay=""; template=""
+          while IFS=$'\t' read -r prefix delay template; do
+            [ -n "$prefix" ] || continue
+            case "$url" in
+              "$prefix"*) rel="${url#"$prefix"}"; rel="${rel#/}"; break ;;
+            esac
+            delay=""; template=""
+          done < "$SBX_TEST_MAP"
+          if [ -z "$template" ]; then
+            printf 'curl: (22) The requested URL returned error: 404\n' >&2
+            exit 22
+          fi
+          file="$SBX_TEST_FIXTURES/${template//\{rel\}/$rel}"
+          if [ ! -f "$file" ]; then
+            printf 'curl: (22) The requested URL returned error: 404\n' >&2
+            exit 22
+          fi
+          size="$(wc -c < "$file" | tr -d ' ')"
+          if [ -n "$delay" ] && [ "$delay" -gt 0 ]; then
+            sleep "$(awk "BEGIN{printf \"%.3f\", $delay/1000}")"
+            speed="$(awk "BEGIN{printf \"%.3f\", $size/(($delay)/1000)}")"
+          else
+            speed="$(( size * 1024 ))"
+          fi
+          if [ -n "$out" ]; then cat "$file" > "$out"; else cat "$file"; fi
+          if [ -n "$wfmt" ]; then
+            result="$wfmt"
+            result="${result//\%\{http_code\}/200}"
+            result="${result//\%\{size_download\}/$size}"
+            result="${result//\%\{speed_download\}/$speed}"
+            printf '%s' "$result"
+          fi
+          exit 0
+          SH
+          chmod +x "$RACE/fake-bin/curl"
+
+          # fixture：快源 / 慢源 / 快源缺 VERSION（直接把抓取清单从 install.sh 里取出来，避免清单漂移）
+          REQUIRED="$(awk '/^SOURCE_REQUIRED=\(/,/^\)/' install.sh | grep -o '"[^"]*"' | tr -d '"')"
+          test "$(printf '%s\n' $REQUIRED | wc -l)" -eq 17
+          for src in fast slow fast-nv; do
+            for f in $REQUIRED; do
+              if [ "$f" = "VERSION" ] && [ "$src" = "fast-nv" ]; then continue; fi
+              mkdir -p "$RACE/fixtures/$src/$(dirname "$f")"
+              cp "$f" "$RACE/fixtures/$src/$f"
+            done
+            # 让两个源的 bin/sbx 内容可区分，用来判断某个文件实际来自哪个源
+            { printf '# source=%s\n' "$src"; cat "$RACE/fixtures/$src/bin/sbx"; } > "$RACE/fixtures/$src/bin/sbx.tmp"
+            mv "$RACE/fixtures/$src/bin/sbx.tmp" "$RACE/fixtures/$src/bin/sbx"
+          done
+          printf '9.9.9-fast\n' > "$RACE/fixtures/fast/VERSION"
+          printf '9.9.9-slow\n' > "$RACE/fixtures/slow/VERSION"
+
+          RAW='https://raw.githubusercontent.com/PaiMonCai/singbox-manager/main'
+          JSD='https://cdn.jsdelivr.net/gh/PaiMonCai/singbox-manager@main'
+          ARCH='https://github.com/PaiMonCai/singbox-manager/archive/refs/heads/main.tar.gz'
+          printf '%s\t1200\tslow/{rel}\n%s\t100\tfast/{rel}\n%s\t100\tmissing.tar.gz\n' "$RAW" "$JSD" "$ARCH" > "$RACE/m1.map"
+          printf '%s\t1200\tslow/{rel}\n%s\t100\tfast-nv/{rel}\n%s\t100\tmissing.tar.gz\n' "$RAW" "$JSD" "$ARCH" > "$RACE/m2.map"
+
+          run_case() { # name map [额外的环境变量...]
+            local name="$1" map="$2"; shift 2
+            local d="$RACE/work/$name"
+            rm -rf "$d"; mkdir -p "$d/only" "$d/install" "$d/binlink"
+            printf 'SING_BOX_IMAGE=ghcr.io/sagernet/sing-box\nSING_BOX_VERSION=v1.14.2\n' > "$d/install/.env"
+            cp install.sh "$d/only/install.sh"
+            (
+              cd "$d/only"
+              sudo env PATH="$RACE/fake-bin:$PATH" \
+                SBX_TEST_MAP="$map" SBX_TEST_FIXTURES="$RACE/fixtures" \
+                SBX_MANAGER_ONLY=1 SBX_NONINTERACTIVE=1 \
+                SBX_INSTALL_DIR="$d/install" \
+                SBX_BIN_LINK="$d/binlink/sbx" \
+                SBX_INSTALLER_LINK="$d/binlink/sbx-install" \
+                SBX_SOURCE_PROBE_TIMEOUT=3 \
+                "$@" \
+                bash install.sh > "$d/run.log" 2>&1
+            )
+          }
+
+          # 1) 最快者胜出
+          run_case fastest "$RACE/m1.map"
+          grep -F '正在并发测速' "$RACE/work/fastest/run.log"
+          grep -F '首选 jsdelivr' "$RACE/work/fastest/run.log"
+          test "$(tr -d '[:space:]' < "$RACE/work/fastest/install/VERSION")" = '9.9.9-fast'
+          grep -q 'source=fast' "$RACE/work/fastest/install/bin/sbx"
+          cmp "$RACE/work/fastest/install/lib/sbx_nodes.py" lib/sbx_nodes.py
+
+          # 2) 最快源缺某个文件 → 只把这个文件换到次优源，其余仍用最快源
+          run_case failover "$RACE/m2.map"
+          grep -F '切换到下一个候选源' "$RACE/work/failover/run.log"
+          test "$(tr -d '[:space:]' < "$RACE/work/failover/install/VERSION")" = '9.9.9-slow'
+          grep -q 'source=fast' "$RACE/work/failover/install/bin/sbx"
+
+          # 3) 并发文件数可调；=1 时必须回到顺序下载且结果一致
+          run_case sequential "$RACE/m1.map" SBX_SOURCE_CONCURRENCY=1
+          grep -F '并发 1' "$RACE/work/sequential/run.log"
+          test "$(tr -d '[:space:]' < "$RACE/work/sequential/install/VERSION")" = '9.9.9-fast'
+          grep -q 'source=fast' "$RACE/work/sequential/install/bin/sbx"
+
+      - name: Exercise launcher and updater source race
+        run: |
+          set -e
+          RACE=/tmp/sbx-race
+          RAW='https://raw.githubusercontent.com/PaiMonCai/singbox-manager/main'
+          JSD='https://cdn.jsdelivr.net/gh/PaiMonCai/singbox-manager@main'
+
+          mkdir -p "$RACE/fixtures/fastdir" "$RACE/fixtures/slowdir"
+          printf '#!/usr/bin/env bash\necho WINNER=fast\n' > "$RACE/fixtures/fastdir/install.sh"
+          printf '#!/usr/bin/env bash\necho WINNER=slow\n' > "$RACE/fixtures/slowdir/install.sh"
+          printf '9.9.9-fast\n' > "$RACE/fixtures/fast.version"
+          printf '0.11.1\n' > "$RACE/fixtures/slow.version"
+          # 慢源放在官方 raw、快源放在 jsDelivr，用来验证"快的那个胜出"
+          printf '%s\t1200\tslowdir/{rel}\n%s\t100\tfastdir/{rel}\n' "$RAW" "$JSD" > "$RACE/m3.map"
+          printf '%s\t1200\tslow.version\n%s\t100\tfast.version\n' "$RAW" "$JSD" > "$RACE/m4.map"
+
+          # sbx-install：并发请求多个 install.sh 源，最先完整下载完成的胜出
+          out="$(sudo env PATH="$RACE/fake-bin:$PATH" SBX_TEST_MAP="$RACE/m3.map" \
+            SBX_TEST_FIXTURES="$RACE/fixtures" bash bin/sbx-install)"
+          printf '%s\n' "$out" | grep -F '同时尝试 2 个下载源'
+          printf '%s\n' "$out" | grep -F 'WINNER=fast'
+          printf '%s\n' "$out" | grep -F 'cdn.jsdelivr.net'
+
+          # 显式 SBX_INSTALL_URL 时只用该地址，不做并发
+          out="$(sudo env PATH="$RACE/fake-bin:$PATH" SBX_TEST_MAP="$RACE/m3.map" \
+            SBX_TEST_FIXTURES="$RACE/fixtures" SBX_INSTALL_URL="$RAW/install.sh" bash bin/sbx-install)"
+          printf '%s\n' "$out" | grep -F 'WINNER=slow'
+          if printf '%s\n' "$out" | grep -F '同时尝试'; then
+            echo '显式单源时不应并发' >&2; exit 1
+          fi
+
+          # manager_remote_version：远端版本号也取自最快源
+          ver="$(sudo env PATH="$RACE/fake-bin:$PATH" SBX_TEST_MAP="$RACE/m4.map" \
+            SBX_TEST_FIXTURES="$RACE/fixtures" bash -c '
+              HOME_DIR=/tmp/sbx-race/home
+              info(){ :; }
+              warn(){ :; }
+              die(){ printf "ERROR: %s\n" "$*" >&2; return 1; }
+              source lib/sbx_update.sh
+              manager_remote_version')"
+          test "$ver" = '9.9.9-fast'
+
       - name: Exercise manager-only update mode
         run: |
           EXPECTED_MANAGER_VERSION="$(tr -d '[:space:]' < VERSION)"

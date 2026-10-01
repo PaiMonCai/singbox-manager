@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # singbox-manager v0.7 self-update integration.
 
-VERSION="0.11.2"
+VERSION="0.11.3"
 
 UPDATE_REPO="${SBX_UPDATE_REPO:-PaiMonCai/singbox-manager}"
 UPDATE_BRANCH="${SBX_UPDATE_BRANCH:-main}"
@@ -10,6 +10,13 @@ UPDATE_SERVICE_FILE="${SBX_UPDATE_SERVICE_FILE:-/etc/systemd/system/singbox-mana
 UPDATE_TIMER_FILE="${SBX_UPDATE_TIMER_FILE:-/etc/systemd/system/singbox-manager-update.timer}"
 UPDATE_BIN_LINK="${SBX_BIN_LINK:-/usr/local/bin/sbx}"
 UPDATE_INSTALLER_LINK="${SBX_INSTALLER_LINK:-/usr/local/bin/sbx-install}"
+UPDATE_SOURCE_MIRRORS="${SBX_SOURCE_MIRRORS:-}"
+UPDATE_MIRROR_PRESET="${SBX_MIRROR_PRESET:-0}"
+UPDATE_RACE_TIMEOUT="${SBX_UPDATE_RACE_TIMEOUT:-25}"
+# 显式指定过 SBX_UPDATE_BASE_URL（自建镜像 / 固定 tag / file:// 测试源）时，
+# 只在该地址内抢速，不混入由 UPDATE_REPO 推导出来的官方额外候选。
+UPDATE_BASE_EXPLICIT=0
+[[ -n "${SBX_UPDATE_BASE_URL:-}" ]] && UPDATE_BASE_EXPLICIT=1
 
 manager_proxy_url(){
   local port="7890" host="127.0.0.1"
@@ -23,24 +30,6 @@ manager_proxy_url(){
   printf 'http://%s:%s' "$host" "$port"
 }
 
-manager_fetch_stdout(){
-  local url="$1" proxy
-  curl -fsSL --retry 2 --connect-timeout 8 --max-time 20 "$url" && return 0
-  proxy="$(manager_proxy_url)"
-  warn "直连更新源失败，尝试通过本机 sing-box: $proxy"
-  curl -fsSL --proxy "$proxy" --retry 1 --connect-timeout 5 --max-time 25 "$url"
-}
-
-manager_fetch_file(){
-  local url="$1" output="$2" proxy
-  if curl -fL --retry 2 --connect-timeout 8 --max-time 30 "$url" -o "$output"; then
-    return 0
-  fi
-  proxy="$(manager_proxy_url)"
-  warn "直连更新源失败，尝试通过本机 sing-box: $proxy"
-  curl -fL --proxy "$proxy" --retry 1 --connect-timeout 5 --max-time 30 "$url" -o "$output"
-}
-
 
 manager_local_version(){
   if [[ -f "$HOME_DIR/VERSION" ]]; then
@@ -50,8 +39,106 @@ manager_local_version(){
   fi
 }
 
+# 候选 raw 根地址（不含文件名）：默认官方 raw + jsDelivr，
+# 第三方公共加速站只在 SBX_MIRROR_PRESET=1 时加入（它们能改写安装内容）。
+manager_candidate_bases(){
+  local -a extras=() preset=()
+  local m raw_base="https://raw.githubusercontent.com/${UPDATE_REPO}/${UPDATE_BRANCH}"
+  printf '%s\n' "${UPDATE_BASE%/}"
+  IFS=' ,' read -r -a extras <<<"$UPDATE_SOURCE_MIRRORS"
+  for m in ${extras[@]+"${extras[@]}"}; do
+    [[ -n "$m" ]] || continue
+    printf '%s\n' "${m%/}"
+  done
+  if (( UPDATE_BASE_EXPLICIT == 0 )); then
+    printf '%s\n' "https://cdn.jsdelivr.net/gh/${UPDATE_REPO}@${UPDATE_BRANCH}"
+  fi
+  if [[ "$UPDATE_MIRROR_PRESET" == "1" ]]; then
+    preset=(
+      "https://gh-proxy.com/${raw_base}"
+      "https://ghproxy.net/${raw_base}"
+      "https://ghfast.top/${raw_base}"
+      "https://raw.githubusercontent.com/${UPDATE_REPO}/${UPDATE_BRANCH}"
+      "https://raw.gitmirror.com/${UPDATE_REPO}/${UPDATE_BRANCH}"
+    )
+    for m in "${preset[@]}"; do
+      printf '%s\n' "$m"
+    done
+  fi
+  return 0
+}
+
+# 并发抢速：向所有候选地址同时请求同一个文件，最先完整落地者胜出。
+# mode=file   → 内容写入 dest，并在 stdout 打印胜出的基础地址
+# mode=stdout → 内容打印到 stdout
+manager_race_fetch_once(){
+  local mode="$1" dest="$2" rel="$3"; shift 3
+  local -a bases=() urls=() outs=() pids=()
+  local i n=0 won=-1 alive=0 deadline dir line=""
+  while IFS= read -r line; do
+    [[ -n "$line" ]] || continue
+    bases+=("$line")
+  done < <(manager_candidate_bases)
+  n=${#bases[@]}
+  (( n )) || return 1
+  for ((i=0;i<n;i++)); do urls[i]="${bases[$i]%/}/$rel"; done
+
+  dir="$(mktemp -d "${TMPDIR:-/tmp}/sbx-manager-race.XXXXXX")"
+  for ((i=0;i<n;i++)); do
+    outs[i]="$dir/$i"
+    (
+      curl -fsSL "$@" --connect-timeout 8 --max-time "$UPDATE_RACE_TIMEOUT" \
+        "${urls[$i]}" -o "${outs[$i]}.part" && mv -f "${outs[$i]}.part" "${outs[$i]}"
+    ) >/dev/null 2>&1 &
+    pids[i]=$!
+  done
+  deadline=$(( SECONDS + UPDATE_RACE_TIMEOUT + 10 ))
+  while (( SECONDS < deadline )); do
+    for ((i=0;i<n;i++)); do
+      if [[ -s "${outs[$i]}" ]]; then won=$i; break 2; fi
+    done
+    alive=0
+    for ((i=0;i<n;i++)); do
+      if kill -0 "${pids[i]}" 2>/dev/null; then alive=1; break; fi
+    done
+    if (( alive == 0 )); then break; fi
+    sleep 0.2
+  done
+  for ((i=0;i<n;i++)); do kill "${pids[i]}" 2>/dev/null || true; done
+  wait >/dev/null 2>&1 || true
+
+  if (( won < 0 )); then
+    rm -rf "$dir"
+    return 1
+  fi
+  if [[ "$mode" == "file" ]]; then
+    cp -f "${outs[$won]}" "$dest"
+    printf '%s\n' "${bases[$won]}"
+  else
+    cat "${outs[$won]}"
+  fi
+  rm -rf "$dir"
+  return 0
+}
+
+# 直连抢速失败后，再走本机 sing-box 代理抢一次
+manager_race_fetch(){
+  local mode="$1" dest="$2" rel="$3" out="" proxy=""
+  if out="$(manager_race_fetch_once "$mode" "$dest" "$rel")"; then
+    printf '%s\n' "$out"
+    return 0
+  fi
+  proxy="$(manager_proxy_url)"
+  warn "直连更新源失败，尝试通过本机 sing-box: $proxy"
+  if out="$(manager_race_fetch_once "$mode" "$dest" "$rel" --proxy "$proxy")"; then
+    printf '%s\n' "$out"
+    return 0
+  fi
+  return 1
+}
+
 manager_remote_version(){
-  manager_fetch_stdout "${UPDATE_BASE%/}/VERSION" | tr -d '[:space:]'
+  manager_race_fetch stdout "" VERSION | tr -d '[:space:]'
 }
 
 # 版本号比较（纯 bash，不依赖 GNU sort -V；busybox 环境也不会静默失效）：
@@ -131,12 +218,14 @@ manager_update(){
   tmp="$(mktemp /tmp/sbx-manager-update.XXXXXX.sh)"
   trap 'rm -f "$tmp"' RETURN
 
-  if ! manager_fetch_file "${UPDATE_BASE%/}/install.sh" "$tmp"; then
+  local src=""
+  if ! src="$(manager_race_fetch file "$tmp" install.sh)"; then
     rm -f "$tmp"
     trap - RETURN
-    warn "下载 install.sh 失败，未做任何改动。"
+    warn "下载 install.sh 失败（已并发尝试全部候选更新源），未做任何改动。"
     return 1
   fi
+  ((quiet)) || info "安装器来源: ${src:-$UPDATE_BASE}"
 
   # 可选：用固定校验和钉住更新内容。设置了就必须匹配，否则拒绝执行。
   local want_sha="${SBX_UPDATE_SHA256:-}"
@@ -159,7 +248,21 @@ manager_update(){
   # 调用方可能是 `manager_update || true`（交互菜单），那个上下文会抑制 errexit，
   # 所以必须显式检查退出码，不能依赖 set -e。
   local rc=0
-  SBX_MANAGER_ONLY=1 SBX_NONINTERACTIVE=1 SBX_INSTALL_DIR="$HOME_DIR" SBX_BIN_LINK="$UPDATE_BIN_LINK" SBX_INSTALLER_LINK="$UPDATE_INSTALLER_LINK" SBX_REPO="$UPDATE_REPO" SBX_INSTALL_BRANCH="$UPDATE_BRANCH" SBX_SOURCE_BASE_URL="$UPDATE_BASE" bash "$tmp" || rc=$?
+  local -a envs=(
+    SBX_MANAGER_ONLY=1
+    SBX_NONINTERACTIVE=1
+    "SBX_INSTALL_DIR=$HOME_DIR"
+    "SBX_BIN_LINK=$UPDATE_BIN_LINK"
+    "SBX_INSTALLER_LINK=$UPDATE_INSTALLER_LINK"
+    "SBX_REPO=$UPDATE_REPO"
+    "SBX_INSTALL_BRANCH=$UPDATE_BRANCH"
+  )
+  # 显式指定的更新源（自建镜像 / 固定 tag / file://）必须透传；
+  # 默认源则让安装器自己做并发测速去抢最快的源（SBX_SOURCE_MIRRORS 等随环境继承）。
+  if (( UPDATE_BASE_EXPLICIT )); then
+    envs+=("SBX_SOURCE_BASE_URL=$UPDATE_BASE")
+  fi
+  env "${envs[@]}" bash "$tmp" || rc=$?
 
   rm -f "$tmp"
   trap - RETURN
@@ -315,9 +418,14 @@ sbx manager auto status         查看自动更新状态
 sbx self-update                 sbx manager update 的快捷别名
 sbx-install                     获取最新 install.sh 并执行完整安装/升级
 
-可用的环境变量（用于固定更新源/校验内容）：
+更新与安装都会先并发测速多个来源（官方 raw / jsDelivr / 整包），取最快者。
+
+可用的环境变量（用于固定更新源/校验内容/调整抢速）：
 SBX_UPDATE_REPO / SBX_UPDATE_BRANCH / SBX_UPDATE_BASE_URL   替换更新源（可指向自己的镜像或 tag）
 SBX_UPDATE_SHA256=<sha256>                                  校验 install.sh 后再执行
+SBX_SOURCE_MIRRORS=<base>                                   附加候选源（参与抢速，空格或逗号分隔）
+SBX_MIRROR_PRESET=1                                         额外加入公共 GitHub 加速站参与抢速（默认关闭）
+SBX_SOURCE_NO_RACE=1                                        关闭抢速，恢复按默认顺序逐个试
 EOF
       ;;
     *) die "未知 manager 命令: $op" ;;

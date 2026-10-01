@@ -2,7 +2,7 @@
 
 面向 Linux 服务器的 sing-box Docker 管理层。sing-box 保持官方镜像运行，宿主机通过 `sbx` 完成安装、节点管理、配置生成、校验、测试、备份恢复与升级。
 
-当前版本：**0.11.2**
+当前版本：**0.11.3**
 
 ## 一键交互式安装
 
@@ -251,6 +251,88 @@ sbx route cn-direct-full
 
 
 
+
+## 0.11.3：安装源并发测速，自动选最快
+
+源码获取不再是“先 raw、失败才 archive”的顺序试探，而是**先把所有候选源并发测速，再按实测吞吐排序取最快**：
+
+```text
+并发测速（逐文件源取同一个探测文件，整包源取整包，单源最长 6s）
+        ↓ 按实测吞吐排名（有响应的按速度降序，其余保持原顺序作为后备）
+按排名并发下载源码（默认 3 个文件同时下）—— 某个源取某个文件失败，立刻切到下一名
+        ↓ 全部逐文件源都不行
+archive 整包兜底
+```
+
+文件级切换解决的是最常见的失败形态：raw 源下到一半某个文件超时（例如 `lib/sbx_v3.sh`），旧版本会让整个安装失败或全部重来，现在只有那一个文件换源，其余继续用最快的源。
+
+并发下载解决的是另一个形态：慢链路上 17 个文件逐个串行下载会把 RTT 和限速叠加起来。默认 3 个文件并发（`SBX_SOURCE_CONCURRENCY` 可调，设为 1 即回到顺序下载）。
+
+默认参与测速的候选源都是官方/可信来源：
+
+```text
+raw.githubusercontent.com/<repo>/<branch>      官方 raw，逐文件
+github.com/<repo>/archive/refs/heads/<br>.tar.gz  官方整包
+codeload.github.com/<repo>/tar.gz/refs/heads/<br>  官方整包（省一次跳转）
+cdn.jsdelivr.net/gh/<repo>@<branch>            jsDelivr CDN，逐文件
+```
+
+实际输出示例（国内慢链路机器）：
+
+```text
+[INFO] 正在并发测速 4 个候选源（单源最长 6s）...
+[INFO] 测速结果: codeload 118.2KB/s | jsdelivr 76.5KB/s | github-archive 68.9KB/s | raw 15.0KB/s → 首选 codeload
+[INFO] 源码已通过整包源 codeload 准备完成。
+```
+
+同一机制也用在另外两个入口：
+
+```text
+sbx-install      并发请求多个 install.sh 源，最先完整下载完成的胜出
+sbx self-update  install.sh 同样抢速；远端版本号也取自最快源
+```
+
+### 相关环境变量
+
+```text
+SBX_SOURCE_MIRRORS        自建镜像/加速地址（空格或逗号分隔），参与测速
+SBX_MIRROR_PRESET=1       额外加入公共 GitHub 加速站参与测速（默认关闭）
+SBX_SOURCE_NO_RACE=1      关闭测速，恢复“按默认顺序逐个试”
+SBX_SOURCE_PROBE_TIMEOUT  单源测速上限秒数，默认 6
+SBX_SOURCE_FILE_TIMEOUT   单个文件下载上限秒数，默认 30
+SBX_SOURCE_ARCHIVE_TIMEOUT 整包下载上限秒数，默认 60
+SBX_SOURCE_CONCURRENCY    并发下载的文件数，默认 3（设为 1 即顺序下载）
+SBX_ARCHIVE_URL=          显式置空表示关闭整包兜底，只从逐文件源取源码
+```
+
+例如把自建镜像加入候选：
+
+```bash
+sudo SBX_SOURCE_MIRRORS=https://mirror.example.com/singbox-manager/main \
+  bash /tmp/sbx-install.sh
+```
+
+一旦显式指定 `SBX_SOURCE_BASE_URL`（或 `SBX_ARCHIVE_URL`），就只在指定地址内取源码与兜底，不会再混入由仓库名推导出来的官方额外候选 —— 避免把两个不同来源的文件混装到一起。显式来源只有一个时不做任何额外请求（保持旧行为）。
+
+### 公共加速站默认关闭
+
+设 `SBX_MIRROR_PRESET=1` 会把以下第三方公共加速站加入测速：
+
+```text
+gh-proxy.com  ghproxy.net  ghfast.top  raw.gitmirror.com
+```
+
+```bash
+SBX_MIRROR_PRESET=1 sbx-install
+```
+
+默认关闭的原因：这些站点能改写回给你的文件内容，等于把它们纳入供应链。本仓库不把任何第三方公共镜像站硬编码为默认来源；要用请显式开启，并只使用你信任的站点。
+
+### 已知取舍
+
+- **分支缓存**：jsDelivr 对 `@main` 这类分支路径有约 12 小时的缓存。正常情况下整棵树都取自同一个胜出源，内容自洽；只有在“某个文件在所有源里只有次优源能给”的换源场景下，才可能混入一个稍旧的单个文件。要完全可复现，请把分支固定到 tag（`SBX_INSTALL_BRANCH=v0.11.3`）或用 `SBX_SOURCE_NO_RACE=1` 回到顺序取源。
+- **测速成本**：每个候选源都会产生一次约一个探测文件大小的流量（整包源受 `SBX_SOURCE_PROBE_TIMEOUT` 限制）；候选越多，第一个字节跑得越快，但总量略增。
+- **测速只代表当下**：排名按这次测量的吞吐排序，链路抖动时不一定每次都选同一个源。
 
 ## 0.11.2：更新判定改为版本比较
 
@@ -790,6 +872,8 @@ SBX_UPDATE_REPO        仓库，例如 your-name/singbox-manager
 SBX_UPDATE_BRANCH      分支或 tag，默认 main
 SBX_UPDATE_BASE_URL    直接指定 raw 根地址（镜像 / CDN）
 SBX_UPDATE_SHA256      校验 install.sh 的 sha256，不匹配则拒绝执行
+SBX_SOURCE_MIRRORS     附加候选源（0.11.3 起参与并发抢速，见 0.11.3 一节）
+SBX_MIRROR_PRESET=1    加入公共加速站参与抢速（默认关闭）
 ```
 
 例如把更新源固定到自己的 tag 并校验安装器内容：
@@ -817,7 +901,9 @@ sbx manager update
 sbx-install
 ```
 
-它会先从当前仓库的 raw 地址获取最新 `install.sh`，然后进入完整安装/升级流程。因此不需要再手工输入长 `curl` 命令。
+它会先获取最新 `install.sh`，然后进入完整安装/升级流程。因此不需要再手工输入长 `curl` 命令。
+
+0.11.3 起，`sbx-install` 会**并发**向官方 raw、jsDelivr CDN（以及你通过 `SBX_SOURCE_MIRRORS` / `SBX_MIRROR_PRESET` 指定的候选源）请求 `install.sh`，最先完整下载完成的胜出；直连全部失败时再走本机 sing-box 代理重试同一批候选源。
 
 `sbx-install` 是“完整安装器”，可能询问 sing-box 版本、监听端口、镜像准备和启动等问题；而 `sbx self-update` 是“只更新 manager”的安全快捷方式。
 
@@ -970,6 +1056,8 @@ curl -fsSL https://raw.githubusercontent.com/PaiMonCai/singbox-manager/main/inst
 ```
 
 安装器后续会优先沿用同类 raw 源，不再先依赖 GitHub archive。
+
+> 0.11.3 起这条顺序被“并发测速后取最快”取代（见 [0.11.3：安装源并发测速，自动选最快](#0113安装源并发测速自动选最快)），本节描述的 raw 优先语义只适用于 `SBX_SOURCE_NO_RACE=1`。
 
 如果你有自己的国内 CDN、对象存储或仓库镜像，可以通过环境变量切换源码根地址：
 

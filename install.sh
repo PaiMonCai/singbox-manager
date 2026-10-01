@@ -13,7 +13,24 @@ INSTALLER_LINK="${SBX_INSTALLER_LINK:-/usr/local/bin/sbx-install}"
 [[ "$MANAGER_ONLY" == "1" ]] && NONINTERACTIVE=1
 [[ "${SBX_ASSUME_YES:-0}" == "1" ]] && NONINTERACTIVE=1
 SOURCE_BASE_URL="${SBX_SOURCE_BASE_URL:-https://raw.githubusercontent.com/${REPO}/${BRANCH}}"
-ARCHIVE_URL="${SBX_ARCHIVE_URL:-https://github.com/${REPO}/archive/refs/heads/${BRANCH}.tar.gz}"
+# 显式指定过来源地址时（自己的 CDN / 私有镜像 / 固定 tag），只在该地址内竞速，
+# 不再自动混入由 REPO/BRANCH 推导出来的官方额外候选，避免把不同来源的内容混装。
+SOURCE_BASE_URL_EXPLICIT=0
+[[ -n "${SBX_SOURCE_BASE_URL:-}" ]] && SOURCE_BASE_URL_EXPLICIT=1
+# SBX_ARCHIVE_URL 用"是否设置"而非"是否非空"判断：
+# 显式置空（SBX_ARCHIVE_URL= ）表示关闭整包兜底，只从逐文件源取源码。
+ARCHIVE_URL=""
+ARCHIVE_URL_EXPLICIT=0
+if [[ -n "${SBX_ARCHIVE_URL+x}" ]]; then
+  ARCHIVE_URL="$SBX_ARCHIVE_URL"
+  ARCHIVE_URL_EXPLICIT=1
+else
+  ARCHIVE_URL="https://github.com/${REPO}/archive/refs/heads/${BRANCH}.tar.gz"
+fi
+SOURCE_EXTRAS=0
+if (( SOURCE_BASE_URL_EXPLICIT == 0 && ARCHIVE_URL_EXPLICIT == 0 )); then
+  SOURCE_EXTRAS=1
+fi
 
 TMP_DIR=""
 SOURCE_DIR=""
@@ -137,86 +154,403 @@ ensure_docker() {
   docker compose version >/dev/null 2>&1 || die "Docker 已安装，但未检测到 Compose v2。"
 }
 
-get_source() {
-  local script_dir="" raw_dir="" archive="" candidate="" path=""
-  local required=(
-    "compose.yml"
-    ".env.example"
-    "config/config.example.json"
-    "bin/sbx"
-    "lib/sbx_nodes.py"
-    "lib/sbx_v3.sh"
-    "lib/sbx_proxy.sh"
-    "lib/sbx_bootstrap.sh"
-    "lib/sbx_image.sh"
-    "lib/sbx_inbound.sh"
-    "lib/sbx_docker_network.sh"
-    "lib/sbx_docker_targets.py"
-    "bin/sbx-docker-watch"
-    "lib/sbx_verify.py"
-    "lib/sbx_update.sh"
-    "bin/sbx-install"
-    "VERSION"
-  )
+# ── 源码获取：候选源枚举 + 并发测速 + 按排名抓取 ──────────────────────────────
+# 候选源分两类：
+#   files   <base>/<相对路径> 可逐文件下载（官方 raw、jsDelivr、第三方加速站或自建镜像）
+#   archive 整包 tar.gz（github.com archive、codeload）
+# 流程：对全部候选源并发测速（同一探测文件、短超时）→ 按实测吞吐排名 →
+#       按排名逐文件抓取，某个源取某个文件失败就立刻切到下一名（避免"某个文件超时"
+#       让整个安装失败）→ 全部逐文件源都不行才回退 archive 整包。
+SOURCE_MIRRORS="${SBX_SOURCE_MIRRORS:-}"
+SOURCE_MIRROR_PRESET="${SBX_MIRROR_PRESET:-0}"
+SOURCE_NO_RACE="${SBX_SOURCE_NO_RACE:-0}"
+SOURCE_PROBE_TIMEOUT="${SBX_SOURCE_PROBE_TIMEOUT:-6}"
+SOURCE_PROBE_FILE="${SBX_SOURCE_PROBE_FILE:-bin/sbx}"
+SOURCE_FILE_TIMEOUT="${SBX_SOURCE_FILE_TIMEOUT:-30}"
+SOURCE_ARCHIVE_TIMEOUT="${SBX_SOURCE_ARCHIVE_TIMEOUT:-60}"
+SOURCE_CONCURRENCY="${SBX_SOURCE_CONCURRENCY:-3}"
+SOURCE_UA="singbox-manager-installer"
 
+SOURCE_REQUIRED=(
+  "compose.yml"
+  ".env.example"
+  "config/config.example.json"
+  "bin/sbx"
+  "lib/sbx_nodes.py"
+  "lib/sbx_v3.sh"
+  "lib/sbx_proxy.sh"
+  "lib/sbx_bootstrap.sh"
+  "lib/sbx_image.sh"
+  "lib/sbx_inbound.sh"
+  "lib/sbx_docker_network.sh"
+  "lib/sbx_docker_targets.py"
+  "bin/sbx-docker-watch"
+  "lib/sbx_verify.py"
+  "lib/sbx_update.sh"
+  "bin/sbx-install"
+  "VERSION"
+)
+
+RANKED_SPECS=()
+RANKED_LABELS=()
+RANKED_SPEEDS=()
+FILES_RANKED=()
+FILES_STICKY=0
+ARCHIVE_DIR=""
+FIRST_LABEL=""
+
+source_host_label() {
+  local host="${1#*://}"
+  host="${host%%/*}"
+  case "$host" in
+    raw.githubusercontent.com) printf 'raw' ;;
+    cdn.jsdelivr.net) printf 'jsdelivr' ;;
+    github.com) printf 'github-archive' ;;
+    codeload.github.com) printf 'codeload' ;;
+    "") printf '本地' ;;
+    *) printf '%s' "$host" ;;
+  esac
+}
+
+source_speed_text() {
+  local s="${1:-0}" kb
+  [[ "$s" =~ ^[0-9]+$ ]] || s=0
+  if (( s <= 0 )); then
+    printf '失败'
+    return 0
+  fi
+  kb=$(( s / 1024 ))
+  if (( kb >= 1024 )); then
+    printf '%d.%dMB/s' $(( kb / 1024 )) $(( (kb % 1024) * 10 / 1024 ))
+  else
+    printf '%d.%dKB/s' "$kb" $(( (s % 1024) * 10 / 1024 ))
+  fi
+}
+
+# 输出 kind|url|label 形式的候选源（kind=files|archive）
+source_candidates() {
+  local -a extras=() preset=()
+  local base raw_base m
+  if [[ -n "$SOURCE_BASE_URL" ]]; then
+    printf 'files|%s|%s\n' "${SOURCE_BASE_URL%/}" "$(source_host_label "$SOURCE_BASE_URL")"
+  fi
+  IFS=' ,' read -r -a extras <<<"$SOURCE_MIRRORS"
+  for m in ${extras[@]+"${extras[@]}"}; do
+    [[ -n "$m" ]] || continue
+    printf 'files|%s|%s\n' "${m%/}" "$(source_host_label "$m")"
+  done
+  if (( SOURCE_EXTRAS )); then
+    printf 'files|https://cdn.jsdelivr.net/gh/%s@%s|jsdelivr\n' "$REPO" "$BRANCH"
+  fi
+  # 第三方公共加速站默认关闭：它们能改写安装内容，只在 SBX_MIRROR_PRESET=1 时参与竞速。
+  if [[ "$SOURCE_MIRROR_PRESET" == "1" ]]; then
+    raw_base="https://raw.githubusercontent.com/${REPO}/${BRANCH}"
+    preset=(
+      "https://gh-proxy.com/${raw_base}"
+      "https://ghproxy.net/${raw_base}"
+      "https://ghfast.top/${raw_base}"
+      "https://raw.gitmirror.com/${REPO}/${BRANCH}"
+    )
+    for m in "${preset[@]}"; do
+      printf 'files|%s|%s\n' "$m" "$(source_host_label "$m")"
+    done
+  fi
+  if [[ -n "$ARCHIVE_URL" ]]; then
+    printf 'archive|%s|%s\n' "$ARCHIVE_URL" "$(source_host_label "$ARCHIVE_URL")"
+  fi
+  if (( SOURCE_EXTRAS )); then
+    printf 'archive|https://codeload.github.com/%s/tar.gz/refs/heads/%s|codeload\n' "$REPO" "$BRANCH"
+  fi
+  return 0
+}
+
+# 单个候选源的测速：files 取 SOURCE_PROBE_FILE，archive 取整包。
+# 只测量吞吐（允许超时截断），不负责内容完整性——完整性由正式抓取阶段保证。
+source_probe_one() {
+  local spec="$1" payload="$2" result="$3" kind url label rc=0 metrics code speed size
+  IFS='|' read -r kind url label <<<"$spec"
+  if [[ "$kind" == "files" ]]; then
+    url="${url%/}/${SOURCE_PROBE_FILE}"
+  fi
+  metrics="$(curl -sSL -A "$SOURCE_UA" --connect-timeout 5 --max-time "$SOURCE_PROBE_TIMEOUT" \
+    -w '%{http_code} %{speed_download} %{size_download}' -o "$payload" "$url" 2>/dev/null)" || rc=$?
+  read -r code speed size <<<"${metrics:-0 0 0}"
+  printf '%s\t%s\t%s\t%s\n' "$rc" "${code:-0}" "${speed:-0}" "${size:-0}" >"$result"
+  return 0
+}
+
+source_tree_complete() {
+  local dir="$1" path
+  for path in "${SOURCE_REQUIRED[@]}"; do
+    [[ -f "$dir/$path" ]] || return 1
+  done
+  return 0
+}
+
+# 并发测速 → 填充 RANKED_SPECS / RANKED_LABELS / RANKED_SPEEDS / FILES_RANKED
+race_sources() {
+  local spec i n=0 idx kind url label rc=0 code=0 speed=0 size=0 size_int=0 speed_int=0 a b best tmp order_str=""
+  local raced=0
+  local dir="$TMP_DIR/race"
+  local -a pids=() spd_of=()
+  local -a r_specs=() r_labels=() r_spds=() r_files=()
+  local uniq=""
+
+  RANKED_SPECS=(); RANKED_LABELS=(); RANKED_SPEEDS=(); FILES_RANKED=(); FILES_STICKY=0
+
+  while IFS= read -r spec; do
+    [[ -n "$spec" ]] || continue
+    case $'\n'"$uniq" in *$'\n'"$spec"$'\n'*) continue ;; esac
+    uniq+="$spec"$'\n'
+    RANKED_SPECS+=("$spec")
+  done < <(source_candidates)
+  n=${#RANKED_SPECS[@]}
+  (( n )) || return 1
+
+  for ((i=0;i<n;i++)); do spd_of[i]=0; done
+
+  if [[ "$SOURCE_NO_RACE" == "1" ]]; then
+    info "已禁用并发测速（SBX_SOURCE_NO_RACE=1），按默认顺序取源。"
+    for ((i=0;i<n;i++)); do order_str+=" $i"; done
+  elif (( n == 1 )); then
+    # 只有一个来源（例如显式指定了自己的镜像）时不做任何额外请求，保持旧行为。
+    order_str=" 0"
+  else
+    raced=1
+    info "正在并发测速 ${n} 个候选源（单源最长 ${SOURCE_PROBE_TIMEOUT}s）..."
+    mkdir -p "$dir"
+    for ((i=0;i<n;i++)); do
+      ( source_probe_one "${RANKED_SPECS[$i]}" "$dir/payload.$i" "$dir/result.$i" ) &
+      pids[i]=$!
+    done
+    wait ${pids[@]+"${pids[@]}"} >/dev/null 2>&1 || true
+
+    # 有响应的按实测吞吐降序排在最前，其余保持默认顺序作为后备
+    local -a ok_idx=() ok_spd=()
+    for ((i=0;i<n;i++)); do
+      rc=1; code=0; speed=0; size=0
+      if [[ -f "$dir/result.$i" ]]; then
+        IFS=$'\t' read -r rc code speed size <"$dir/result.$i" || true
+      fi
+      size_int="${size%%.*}"; speed_int="${speed%%.*}"
+      [[ "$size_int" =~ ^[0-9]+$ ]] || size_int=0
+      [[ "$speed_int" =~ ^[0-9]+$ ]] || speed_int=0
+      spd_of[i]="$speed_int"
+      if (( size_int > 0 )); then
+        ok_idx+=("$i"); ok_spd+=("$speed_int")
+      fi
+    done
+    # 选择排序（候选通常只有几个，避免依赖 sort 的实现差异）
+    for ((a=0;a<${#ok_idx[@]};a++)); do
+      best=$a
+      for ((b=a+1;b<${#ok_idx[@]};b++)); do
+        if (( ok_spd[b] > ok_spd[best] )); then best=$b; fi
+      done
+      if (( best != a )); then
+        tmp="${ok_spd[a]}"; ok_spd[a]="${ok_spd[best]}"; ok_spd[best]="$tmp"
+        tmp="${ok_idx[a]}"; ok_idx[a]="${ok_idx[best]}"; ok_idx[best]="$tmp"
+      fi
+    done
+    for ((a=0;a<${#ok_idx[@]};a++)); do order_str+=" ${ok_idx[a]}"; done
+    for ((i=0;i<n;i++)); do
+      case " $order_str " in *" $i "*) continue ;; esac
+      order_str+=" $i"
+    done
+  fi
+
+  idx=0
+  for i in $order_str; do
+    spec="${RANKED_SPECS[$i]}"
+    IFS='|' read -r kind url label <<<"$spec"
+    r_specs+=("$spec")
+    r_labels+=("$label")
+    r_spds+=("$(source_speed_text "${spd_of[$i]:-0}")")
+    if [[ "$kind" == "files" ]]; then r_files+=("$spec"); fi
+    if (( idx == 0 )); then FIRST_LABEL="$label"; fi
+    idx=$((idx+1))
+  done
+
+  RANKED_SPECS=("${r_specs[@]}")
+  RANKED_LABELS=("${r_labels[@]}")
+  RANKED_SPEEDS=("${r_spds[@]}")
+  if (( ${#r_files[@]} )); then FILES_RANKED=("${r_files[@]}"); fi
+
+  if (( raced )); then
+    local summary="" sep=""
+    for ((a=0;a<${#RANKED_LABELS[@]};a++)); do
+      summary+="${sep}${RANKED_LABELS[$a]} ${RANKED_SPEEDS[$a]}"
+      sep=" | "
+    done
+    info "测速结果: $summary → 首选 ${FIRST_LABEL}"
+  fi
+  return 0
+}
+
+fetch_source_file() { # base path dest
+  local base="$1" path="$2" dest="$3" part="$3.part"
+  mkdir -p "$(dirname "$dest")"
+  if curl -fL -A "$SOURCE_UA" --retry 1 --retry-delay 1 --connect-timeout 8 \
+    --max-time "$SOURCE_FILE_TIMEOUT" "${base%/}/$path" -o "$part"; then
+    if [[ -s "$part" ]]; then
+      mv -f "$part" "$dest"
+      return 0
+    fi
+  fi
+  rm -f "$part"
+  return 1
+}
+
+# 单个文件：按排名逐个候选源试，成功时把用到的候选序号写进结果目录
+# （子进程不能改父 shell 的 FILES_STICKY，所以由父进程汇总后再更新）
+fetch_one_file_ranked() { # raw_dir path results_dir
+  local raw_dir="$1" path="$2" results="$3" spec base label i n idx
+  n=${#FILES_RANKED[@]}
+  for ((i=0;i<n;i++)); do
+    idx=$(( (FILES_STICKY + i) % n ))
+    spec="${FILES_RANKED[$idx]}"
+    IFS='|' read -r _ base label <<<"$spec"
+    if fetch_source_file "$base" "$path" "$raw_dir/$path"; then
+      printf '%s\n' "$idx" > "$results/${path//\//_}.idx"
+      return 0
+    fi
+    warn "源 $label 下载 $path 失败，切换到下一个候选源..."
+  done
+  return 1
+}
+
+# 逐文件抓取；某个源失败立刻切到排名下一名，并记住可用的源（FILES_STICKY）。
+# 多个文件在有界并发下同时下载（慢链路上收益明显；SBX_SOURCE_CONCURRENCY=1 可回到顺序下载）。
+fetch_files_missing() { # raw_dir
+  local raw_dir="$1" results="$TMP_DIR/fetch-results" path i n conc launched=0
+  local best=-1 bestcount=0 count
+  local -a queue=() pids=()
+  n=${#FILES_RANKED[@]}
+  (( n )) || return 1
+  for path in "${SOURCE_REQUIRED[@]}"; do
+    [[ -s "$raw_dir/$path" ]] && continue
+    queue+=("$path")
+  done
+  (( ${#queue[@]} )) || return 0
+
+  conc="$SOURCE_CONCURRENCY"
+  [[ "$conc" =~ ^[0-9]+$ ]] || conc=3
+  (( conc >= 1 )) || conc=1
+  (( conc > ${#queue[@]} )) && conc=${#queue[@]}
+  info "并发下载源码：${#queue[@]} 个文件，并发 $conc，单文件失败自动换源..."
+
+  rm -rf "$results"
+  mkdir -p "$results"
+  for path in "${queue[@]}"; do
+    ( fetch_one_file_ranked "$raw_dir" "$path" "$results" ) &
+    pids+=("$!")
+    launched=$((launched+1))
+    # 滑动窗口：跑满 conc 个就先等最老的那个收工
+    if (( launched >= conc )); then
+      wait "${pids[$((launched-conc))]}" 2>/dev/null || true
+    fi
+  done
+  wait || true
+
+  for path in "${queue[@]}"; do
+    if [[ ! -s "$raw_dir/$path" ]]; then
+      warn "所有逐文件候选源都取不到 $path。"
+      rm -rf "$results"
+      return 1
+    fi
+  done
+
+  # 把这一轮最常成功的候选源记成 sticky，下次从它开始试
+  for ((i=0;i<n;i++)); do
+    count=0
+    for path in "${queue[@]}"; do
+      if [[ -f "$results/${path//\//_}.idx" ]] && [[ "$(cat "$results/${path//\//_}.idx")" == "$i" ]]; then
+        count=$((count+1))
+      fi
+    done
+    if (( count > bestcount )); then bestcount=$count; best=$i; fi
+  done
+  (( best >= 0 )) && FILES_STICKY=$best
+
+  rm -rf "$results"
+  return 0
+}
+
+fetch_archive_source() { # url → 成功时设置 ARCHIVE_DIR
+  local url="$1" archive="$TMP_DIR/archive.tar.gz" dir
+  rm -rf "$TMP_DIR/archive"
+  mkdir -p "$TMP_DIR/archive"
+  if ! curl -fL -A "$SOURCE_UA" --retry 2 --connect-timeout 10 \
+    --max-time "$SOURCE_ARCHIVE_TIMEOUT" "$url" -o "$archive"; then
+    rm -f "$archive"
+    return 1
+  fi
+  if ! tar -xzf "$archive" -C "$TMP_DIR/archive"; then
+    rm -f "$archive"
+    return 1
+  fi
+  for dir in "$TMP_DIR/archive"/*/; do
+    [[ -d "$dir" ]] || continue
+    if source_tree_complete "${dir%/}"; then
+      ARCHIVE_DIR="${dir%/}"
+      return 0
+    fi
+  done
+  return 1
+}
+
+get_source() {
+  local script_dir="" raw_dir="" spec kind url label
+  local fetched=0
+
+  # 1) 已经在本仓库里运行（源码完整）→ 直接用本地源码，不联网
   if [[ -n "${BASH_SOURCE[0]:-}" && "${BASH_SOURCE[0]}" != "bash" ]]; then
     script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd || true)"
   fi
-
-  if [[ -n "$script_dir" ]]; then
-    local complete=1
-    for path in "${required[@]}"; do
-      [[ -f "$script_dir/$path" ]] || { complete=0; break; }
-    done
-    if (( complete )); then
-      SOURCE_DIR="$script_dir"
-      return
-    fi
+  if [[ -n "$script_dir" ]] && source_tree_complete "$script_dir"; then
+    SOURCE_DIR="$script_dir"
+    return 0
   fi
 
+  # 2) 并发测速候选源（SOURCE_BASE_URL / ARCHIVE_URL + SBX_SOURCE_MIRRORS / SBX_MIRROR_PRESET）
   TMP_DIR="$(mktemp -d)"
   raw_dir="$TMP_DIR/raw"
   mkdir -p "$raw_dir/config" "$raw_dir/bin" "$raw_dir/lib"
+  race_sources || die "没有可用的源码候选地址。"
 
-  info "正在通过 raw 源下载 singbox-manager ($BRANCH)..."
-  local raw_ok=1
-  for path in "${required[@]}"; do
-    mkdir -p "$raw_dir/$(dirname "$path")"
-    if ! curl -fL --retry 2 --connect-timeout 8 --max-time 30 \
-      "${SOURCE_BASE_URL%/}/$path" \
-      -o "$raw_dir/$path"; then
-      warn "raw 源下载失败: $path"
-      raw_ok=0
-      break
+  # 3) 按测速排名抓取：逐文件源失败自动换源，最后才用整包源
+  for spec in "${RANKED_SPECS[@]}"; do
+    IFS='|' read -r kind url label <<<"$spec"
+    if [[ "$kind" == "files" ]]; then
+      if fetch_files_missing "$raw_dir" && source_tree_complete "$raw_dir"; then
+        SOURCE_DIR="$raw_dir"
+        fetched=1
+        info "源码已通过 $label 准备完成。"
+        break
+      fi
+      warn "源 $label 未能取齐全部文件，尝试下一个候选源..."
+    else
+      if fetch_archive_source "$url"; then
+        SOURCE_DIR="$ARCHIVE_DIR"
+        fetched=1
+        info "源码已通过整包源 $label 准备完成。"
+        break
+      fi
+      warn "整包源 $label 下载失败，尝试下一个候选源..."
     fi
   done
 
-  if (( raw_ok )); then
-    SOURCE_DIR="$raw_dir"
-    info "源码已通过 raw 源准备完成。"
-    return
+  if (( fetched )); then
+    return 0
   fi
 
+  # 4) 全部候选源失败：保留 archive 兜底语义与提示
   warn "raw 源不可用，回退 GitHub archive..."
-  archive="$TMP_DIR/source.tar.gz"
-  if ! curl -fL --retry 2 --connect-timeout 10 --max-time 60 "$ARCHIVE_URL" -o "$archive"; then
-    die "无法下载 singbox-manager 源码。可设置 SBX_SOURCE_BASE_URL 指向你自己的 raw/CDN 镜像。"
+  if [[ -n "$ARCHIVE_URL" ]] && fetch_archive_source "$ARCHIVE_URL"; then
+    SOURCE_DIR="$ARCHIVE_DIR"
+    return 0
   fi
 
-  tar -xzf "$archive" -C "$TMP_DIR"
-  for candidate in "$TMP_DIR"/*/; do
-    [[ "$candidate" == "$raw_dir/" ]] && continue
-    local complete=1
-    for path in "${required[@]}"; do
-      [[ -f "${candidate}$path" ]] || { complete=0; break; }
-    done
-    if (( complete )); then
-      SOURCE_DIR="${candidate%/}"
-      break
-    fi
-  done
-
-  [[ -n "$SOURCE_DIR" ]] || die "无法识别下载的源码目录。"
+  die "无法下载 singbox-manager 源码（候选源均失败）。可设置 SBX_SOURCE_BASE_URL 指向你自己的 raw/CDN 镜像，或设置 SBX_ARCHIVE_URL 指向整包地址。"
 }
 
 read_env_value() {
