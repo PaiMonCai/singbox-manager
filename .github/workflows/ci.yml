@@ -27,6 +27,22 @@ jobs:
           bash -n lib/sbx_update.sh
           bash -n bin/sbx-install
 
+      - name: ShellCheck (errors gate)
+        run: |
+          shellcheck --version
+          shellcheck -S error \
+            install.sh bin/sbx bin/sbx-install bin/sbx-docker-watch \
+            lib/sbx_bootstrap.sh lib/sbx_docker_network.sh lib/sbx_image.sh \
+            lib/sbx_inbound.sh lib/sbx_proxy.sh lib/sbx_update.sh lib/sbx_v3.sh
+
+      - name: ShellCheck (warnings, advisory)
+        continue-on-error: true
+        run: |
+          shellcheck -S warning \
+            install.sh bin/sbx bin/sbx-install bin/sbx-docker-watch \
+            lib/sbx_bootstrap.sh lib/sbx_docker_network.sh lib/sbx_image.sh \
+            lib/sbx_inbound.sh lib/sbx_proxy.sh lib/sbx_update.sh lib/sbx_v3.sh
+
       - name: Python syntax
         run: |
           python -m py_compile lib/sbx_nodes.py
@@ -83,6 +99,26 @@ jobs:
           test -x /tmp/sbx-manager-only/lib/sbx_docker_targets.py
           test -x /tmp/sbx-manager-only/lib/sbx_verify.py
           test -x /tmp/sbx-manager-only/bin/sbx-docker-watch
+
+      - name: Exercise installed CLI
+        run: |
+          test -x /tmp/sbx-ci-bin/sbx
+          sudo env SBX_HOME=/tmp/sbx-manager-only /tmp/sbx-ci-bin/sbx help >/dev/null
+          sudo env SBX_HOME=/tmp/sbx-manager-only /tmp/sbx-ci-bin/sbx image ref
+          sudo env SBX_HOME=/tmp/sbx-manager-only /tmp/sbx-ci-bin/sbx proxy status
+          sudo env SBX_HOME=/tmp/sbx-manager-only /tmp/sbx-ci-bin/sbx manager auto status
+          # 上面的 HOME 里 nodes.json 是“不得改动”的哨兵文件，换成合法空库后再跑涉及节点库的命令
+          sudo rm -f /tmp/sbx-manager-only/nodes/nodes.json
+          sudo env SBX_HOME=/tmp/sbx-manager-only python3 /tmp/sbx-manager-only/lib/sbx_nodes.py init >/dev/null
+          sudo env SBX_HOME=/tmp/sbx-manager-only /tmp/sbx-ci-bin/sbx node list
+          sudo env SBX_HOME=/tmp/sbx-manager-only /tmp/sbx-ci-bin/sbx version
+          # 安装不完整时必须给出可读报错，而不是 "main: command not found"
+          rm -rf /tmp/sbx-broken && mkdir -p /tmp/sbx-broken
+          if sudo env SBX_HOME=/tmp/sbx-broken /tmp/sbx-ci-bin/sbx status 2>/tmp/sbx-broken.err; then
+            echo "缺 lib 时不应成功" >&2
+            exit 1
+          fi
+          grep -F '安装不完整' /tmp/sbx-broken.err
 
       - name: Exercise auto-update timer generation
         run: |

@@ -15,6 +15,7 @@ ARCHIVE_URL="${SBX_ARCHIVE_URL:-https://github.com/${REPO}/archive/refs/heads/${
 
 TMP_DIR=""
 SOURCE_DIR=""
+env_backup=""
 
 info() { printf '\033[32m[INFO]\033[0m %s\n' "$*"; }
 warn() { printf '\033[33m[WARN]\033[0m %s\n' "$*" >&2; }
@@ -23,6 +24,9 @@ die() { printf '\033[31m[ERROR]\033[0m %s\n' "$*" >&2; exit 1; }
 cleanup() {
   if [[ -n "$TMP_DIR" && -d "$TMP_DIR" ]]; then
     rm -rf "$TMP_DIR"
+  fi
+  if [[ -n "${env_backup:-}" ]]; then
+    rm -f "$env_backup"
   fi
   return 0
 }
@@ -65,6 +69,15 @@ validate_port() {
   [[ "$1" =~ ^[0-9]+$ ]] && (( 1 <= 10#$1 && 10#$1 <= 65535 ))
 }
 
+validate_bind() {
+  [[ -n "$1" ]] || return 1
+  python3 -c 'import ipaddress, sys
+try:
+    ipaddress.ip_address(sys.argv[1].strip())
+except ValueError:
+    raise SystemExit(1)' "$1" 2>/dev/null
+}
+
 pkg_install() {
   local packages=("$@")
   if command -v apt-get >/dev/null 2>&1; then
@@ -103,10 +116,18 @@ ensure_docker() {
   fi
   command -v curl >/dev/null 2>&1 || die "安装 Docker 需要 curl。"
 
-  local installer="/tmp/get-docker-$$.sh"
-  curl -fsSL --retry 3 https://get.docker.com -o "$installer"
-  sh "$installer"
+  local installer rc=0
+  installer="$(mktemp /tmp/get-docker-XXXXXX.sh)"
+  if ! curl -fsSL --retry 3 https://get.docker.com -o "$installer"; then
+    rm -f "$installer"
+    die "下载 Docker 安装脚本失败。请手动安装 Docker Engine + Compose v2 后重试。"
+  fi
+  sh "$installer" || rc=$?
   rm -f "$installer"
+  if ((rc)); then
+    die "Docker 安装脚本执行失败（退出码 $rc）。"
+  fi
+  return 0
 
   if command -v systemctl >/dev/null 2>&1; then
     systemctl enable --now docker >/dev/null 2>&1 || true
@@ -264,6 +285,16 @@ if [[ "$MANAGER_ONLY" != "1" ]]; then
   [[ "$version" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$ ]] || die "版本格式无效: $version"
 
   bind="$(ask '本地代理监听地址' "$old_bind")"
+  while ! validate_bind "$bind"; do
+    if [[ "$NONINTERACTIVE" == "1" ]]; then
+      die "监听地址无效: ${bind:-（空）}。非交互模式无法重新输入，请修正 $INSTALL_DIR/.env 中的 SING_BOX_BIND_ADDR 后重试。"
+    fi
+    warn "监听地址必须是 IPv4/IPv6 地址，例如 127.0.0.1。"
+    bind="$(ask '本地代理监听地址' "$old_bind")"
+  done
+  case "$bind" in
+    0.0.0.0|"::") warn "监听地址 $bind 会把代理端口暴露到所有网卡（可能含公网），请确认这是你的意图。" ;;
+  esac
 
   port="$(ask '本地 mixed HTTP/SOCKS5 端口' "$old_port")"
   # 非交互模式下 ask 永远回显同一个默认值，重试不可能成功，必须直接失败而不是空转。
@@ -313,6 +344,12 @@ if [[ "$MANAGER_ONLY" == "1" ]]; then
   exit 0
 fi
 
+# 后面还有可能失败（节点库校验）。先把现有 .env 留一份，避免失败时已经改掉用户配置。
+if [[ -f "$INSTALL_DIR/.env" ]]; then
+  env_backup="$(mktemp /tmp/sbx-env-XXXXXX)"
+  cp -a "$INSTALL_DIR/.env" "$env_backup"
+fi
+
 write_env "$version" "$bind" "$port" "$old_image" "$old_docker_network" "$old_container_name"
 
 export SBX_HOME="$INSTALL_DIR"
@@ -320,9 +357,16 @@ if [[ ! -f "$INSTALL_DIR/nodes/nodes.json" ]]; then
   python3 "$INSTALL_DIR/lib/sbx_nodes.py" init
   chmod 600 "$INSTALL_DIR/nodes/nodes.json" "$INSTALL_DIR/config/config.json"
 else
-  python3 "$INSTALL_DIR/lib/sbx_nodes.py" validate >/dev/null || die "现有节点库校验失败。"
+  if ! python3 "$INSTALL_DIR/lib/sbx_nodes.py" validate >/dev/null; then
+    if [[ -n "$env_backup" ]]; then
+      install -m600 "$env_backup" "$INSTALL_DIR/.env"
+      rm -f "$env_backup"; env_backup=""
+    fi
+    die "现有节点库校验失败，已回滚 .env。请先修复 $INSTALL_DIR/nodes/nodes.json 后重试。"
+  fi
   python3 "$INSTALL_DIR/lib/sbx_nodes.py" render >/dev/null
 fi
+if [[ -n "$env_backup" ]]; then rm -f "$env_backup"; env_backup=""; fi
 
 source "$INSTALL_DIR/lib/sbx_bootstrap.sh"
 image_ready=0
@@ -336,12 +380,12 @@ elif docker image inspect "$old_image:$version" >/dev/null 2>&1; then
   image_ready=1
 fi
 
-node_count="$(python3 - <<PY
+node_count="$(python3 - "$INSTALL_DIR/nodes/nodes.json" <<'PY'
 import json
+import sys
 from pathlib import Path
-p=Path('$INSTALL_DIR/nodes/nodes.json')
 try:
-    print(len(json.loads(p.read_text(encoding='utf-8')).get('nodes', [])))
+    print(len(json.loads(Path(sys.argv[1]).read_text(encoding='utf-8')).get('nodes', [])))
 except Exception:
     print(0)
 PY
@@ -349,11 +393,11 @@ PY
 
 if [[ "$node_count" == "0" ]] && confirm "当前没有代理节点，是否现在交互式添加第一个节点？" yes; then
   "$BIN_LINK" node add || warn "节点添加未完成，你之后可以运行: sbx node add"
-  node_count="$(python3 - <<PY
+  node_count="$(python3 - "$INSTALL_DIR/nodes/nodes.json" <<'PY'
 import json
+import sys
 from pathlib import Path
-p=Path('$INSTALL_DIR/nodes/nodes.json')
-try: print(len(json.loads(p.read_text(encoding='utf-8')).get('nodes', [])))
+try: print(len(json.loads(Path(sys.argv[1]).read_text(encoding='utf-8')).get('nodes', [])))
 except Exception: print(0)
 PY
 )"

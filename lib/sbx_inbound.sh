@@ -2,8 +2,6 @@
 # singbox-manager v0.6 multi-inbound routing integration.
 # Sourced after the node/proxy/bootstrap/image layers.
 
-VERSION="0.10.0"
-
 inbound_tx(){
   local op="$1" ref="${2:-}" rollback rc=0
   shift 2 || true
@@ -43,8 +41,9 @@ inbound_test(){
   [[ -n "$ref" ]] || die "入口不能为空。"
 
   json="$(python3 "$HELPER" inbound-show "$ref")" || return 1
-  listen="$(printf '%s' "$json" | python3 -c 'import json,sys; print(json.load(sys.stdin)["listen"])')"
-  port="$(printf '%s' "$json" | python3 -c 'import json,sys; print(json.load(sys.stdin)["port"])')"
+  listen="$(printf '%s' "$json" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("listen",""))' 2>/dev/null)" || true
+  port="$(printf '%s' "$json" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("port",""))' 2>/dev/null)" || true
+  [[ -n "$listen" && -n "$port" ]] || die "入口条目缺少 listen/port 字段，请先重新编辑该入口: $ref"
 
   case "$listen" in
     0.0.0.0) host="127.0.0.1" ;;

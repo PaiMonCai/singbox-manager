@@ -1,9 +1,14 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-VERSION="0.2.0"
 HOME_DIR="${SBX_HOME:-/opt/singbox-manager}"
 export SBX_HOME="$HOME_DIR"
+# 版本号以安装目录的 VERSION 文件为唯一来源，避免多处硬编码互相矛盾。
+VERSION=""
+if [[ -f "$HOME_DIR/VERSION" ]]; then
+  VERSION="$(tr -d '[:space:]' < "$HOME_DIR/VERSION" 2>/dev/null || true)"
+fi
+[[ -n "$VERSION" ]] || VERSION="unknown"
 COMPOSE="$HOME_DIR/compose.yml"
 ENV="$HOME_DIR/.env"
 CONFIG="$HOME_DIR/config/config.json"
@@ -117,6 +122,11 @@ edit(){ local e="${SBX_EDITOR:-${EDITOR:-vi}}"; command -v "$e" >/dev/null || di
 
 pause(){ read -r -p '按 Enter 返回...' _ || true; }
 node_menu(){ local x r; while true; do clear; printf '%b节点管理%b\n' "$C" "$N"; printf '1 查看     2 添加     3 编辑     4 删除\n5 默认     6 详情     7 测试     8 重建配置\n\n0 返回\n'; read -r -p '请选择: ' x || return; case "$x" in 1) node list;;2) node_tx add;;3) read -r -p 'ID/名称(留空后选择): ' r; node_tx edit "$r"||true;;4) read -r -p 'ID/名称(留空后选择): ' r; node_tx delete "$r"||true;;5) read -r -p 'ID/名称(留空后选择): ' r; node_tx default "$r"||true;;6) read -r -p 'ID/名称(留空后选择): ' r; python3 "$HELPER" show ${r:+"$r"}||true;;7) read -r -p 'ID/名称(留空后选择): ' r; test_node "$r"||true;;8) node render;;0) return;;*) warn "无效选项";; esac; [[ "$x" != 0 ]] && pause; done; }
+# 缺任何一个 lib 都要给可读的报错。否则后面只会在 case 分发处报
+# "main: command not found"，或者更糟：静默少掉某个子命令。
+for _lib in sbx_v3.sh sbx_proxy.sh sbx_bootstrap.sh sbx_image.sh sbx_inbound.sh sbx_docker_network.sh sbx_update.sh; do
+  [[ -f "$HOME_DIR/lib/$_lib" ]] || die "缺少 $HOME_DIR/lib/$_lib，安装不完整。请重新运行 sbx-install（或把 SBX_HOME 指向正确的安装目录）。"
+done
 [[ -f "$HOME_DIR/lib/sbx_v3.sh" ]] && source "$HOME_DIR/lib/sbx_v3.sh"
 [[ -f "$HOME_DIR/lib/sbx_proxy.sh" ]] && source "$HOME_DIR/lib/sbx_proxy.sh"
 [[ -f "$HOME_DIR/lib/sbx_bootstrap.sh" ]] && source "$HOME_DIR/lib/sbx_bootstrap.sh"

@@ -17,6 +17,10 @@ MANAGED_FILE = HOME / "docker-managed.json"
 SBX_BIN = os.environ.get("SBX_VERIFY_SBX", "/usr/local/bin/sbx")
 NETWORK_DEFAULT = "singbox-proxy"
 
+# managed_rows() 查询失败时会把原因记在这里，
+# 避免把「查不到」当成「没有托管目标」而返回健康状态。
+MANAGED_ROWS_ERROR: Optional[str] = None
+
 
 class Result:
     def __init__(self) -> None:
@@ -112,7 +116,10 @@ def resolve_endpoint(ref: str) -> Optional[Dict[str, Any]]:
 
 
 def managed_rows() -> List[Dict[str, Any]]:
+    global MANAGED_ROWS_ERROR
+    MANAGED_ROWS_ERROR = None
     if not TARGET_HELPER.exists():
+        MANAGED_ROWS_ERROR = f"缺少 Docker 托管 helper: {TARGET_HELPER}"
         return []
     env = os.environ.copy()
     env["SBX_DOCKER_MANAGED_FILE"] = str(MANAGED_FILE)
@@ -121,15 +128,22 @@ def managed_rows() -> List[Dict[str, Any]]:
             ["python3", str(TARGET_HELPER), "list", "--network", network_name(), "--json"],
             text=True, capture_output=True, timeout=15, env=env
         )
-    except Exception:
+    except Exception as exc:
+        MANAGED_ROWS_ERROR = f"查询托管目标失败: {exc}"
         return []
     if cp.returncode:
+        detail = (cp.stderr or cp.stdout or "").strip().replace("\n", " ")[:200]
+        MANAGED_ROWS_ERROR = f"查询托管目标失败（helper 退出码 {cp.returncode}）: {detail}"
         return []
     try:
         rows = json.loads(cp.stdout)
-        return rows if isinstance(rows, list) else []
     except Exception:
+        MANAGED_ROWS_ERROR = "托管清单返回了无法解析的内容"
         return []
+    if not isinstance(rows, list):
+        MANAGED_ROWS_ERROR = "托管清单格式无效"
+        return []
+    return rows
 
 
 def managed_inbound_for(name: str) -> Optional[str]:
@@ -303,6 +317,11 @@ def verify_all(quick: bool = True) -> int:
             if name not in names:
                 names.append(name)
     if not names:
+        if MANAGED_ROWS_ERROR:
+            print("FAIL  无法确认托管状态")
+            print(f"      {MANAGED_ROWS_ERROR}")
+            print("      这不等于“没有托管目标”，请先修复上述问题再据此判断健康。")
+            return 1
         print("没有正在运行的托管容器。")
         return 0
     rc = 0
@@ -352,6 +371,16 @@ def doctor() -> int:
                 print("      " + cp.stderr.strip().replace("\n", "\n      "))
     else:
         result.fail(f"缺少 helper: {NODE_HELPER}")
+
+    # 托管链路是独立的一条：缺 helper 时不能只报「没有托管目标」
+    if TARGET_HELPER.exists():
+        result.ok(f"Docker 托管 helper 存在: {TARGET_HELPER.name}")
+    else:
+        result.fail(f"缺少 Docker 托管 helper: {TARGET_HELPER}")
+    if MANAGED_FILE.exists():
+        result.ok(f"托管清单存在: {MANAGED_FILE.name}")
+    else:
+        result.warn(f"尚未创建托管清单: {MANAGED_FILE}")
 
     if Path(SBX_BIN).exists():
         cp = run([SBX_BIN, "check"], 40)
@@ -412,6 +441,8 @@ def doctor() -> int:
             result.fail("托管容器未接入共享网络: " + ", ".join(missing))
         else:
             result.ok(f"托管容器网络状态正常: {len(rows)} targets")
+    elif MANAGED_ROWS_ERROR:
+        result.fail(f"无法确认托管状态: {MANAGED_ROWS_ERROR}")
     else:
         result.warn("当前没有 Docker 托管目标")
 
@@ -437,7 +468,8 @@ def main() -> int:
     d.add_argument("--quick", action="store_true")
 
     da = sub.add_parser("docker-all")
-    da.add_argument("--active", action="store_true")
+    da.add_argument("--quick", action="store_true", help="只做结构检查，跳过真实出口探测")
+    da.add_argument("--active", action="store_true", help="兼容保留：真实出口探测本来就是默认行为")
 
     sub.add_parser("doctor")
 
@@ -445,7 +477,8 @@ def main() -> int:
     if args.cmd == "docker":
         return verify_container(args.container, args.inbound, args.quick)
     if args.cmd == "docker-all":
-        return verify_all(quick=not args.active)
+        # 与 `docker <容器>` 保持一致：默认做真实探测，--quick 才是快路径
+        return verify_all(quick=args.quick and not args.active)
     return doctor()
 
 

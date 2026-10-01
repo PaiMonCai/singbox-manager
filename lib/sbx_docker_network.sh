@@ -7,6 +7,8 @@ DOCKER_NETWORK_ALIAS="${SBX_DOCKER_NETWORK_ALIAS:-sing-box}"
 DOCKER_TARGET_HELPER="${SBX_DOCKER_TARGET_HELPER:-$HOME_DIR/lib/sbx_docker_targets.py}"
 DOCKER_MANAGED_FILE="${SBX_DOCKER_MANAGED_FILE:-$HOME_DIR/docker-managed.json}"
 DOCKER_WATCH_SERVICE="${SBX_DOCKER_WATCH_SERVICE:-/etc/systemd/system/singbox-manager-docker-watch.service}"
+# systemctl 必须操作与写入路径对应的单元名，否则用 SBX_DOCKER_WATCH_SERVICE 覆盖时会各写一边
+DOCKER_WATCH_UNIT="$(basename "$DOCKER_WATCH_SERVICE")"
 DOCKER_WATCH_SBX="${SBX_BIN_LINK:-/usr/local/bin/sbx}"
 DOCKER_WATCH_BIN="${SBX_DOCKER_WATCH_BIN:-$HOME_DIR/bin/sbx-docker-watch}"
 
@@ -281,20 +283,23 @@ docker_network_resolve_inbound(){
 }
 
 docker_network_inbound_id(){
-  local ref="${1:-default}"
-  docker_network_resolve_inbound "$ref" | python3 -c 'import json,sys; print(json.load(sys.stdin)["id"])'
+  local ref="${1:-default}" json
+  json="$(docker_network_resolve_inbound "$ref")" || return 1
+  printf '%s\n' "$json" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("id",""))' 2>/dev/null || return 1
 }
 
 docker_network_inbound_port(){
   # 返回容器内/共享网络内可达的端口；默认入口在容器内固定 7890，
   # 与宿主机发布端口（SING_BOX_MIXED_PORT）可能不同，不能混用。
-  local ref="${1:-default}"
-  docker_network_resolve_inbound "$ref" | python3 -c 'import json,sys; d=json.load(sys.stdin); print(d.get("container_port", d["port"]))'
+  local ref="${1:-default}" json
+  json="$(docker_network_resolve_inbound "$ref")" || return 1
+  printf '%s\n' "$json" | python3 -c 'import json,sys; d=json.load(sys.stdin); print(d.get("container_port", d.get("port","")))' 2>/dev/null || return 1
 }
 
 docker_network_inbound_name(){
-  local ref="${1:-default}"
-  docker_network_resolve_inbound "$ref" | python3 -c 'import json,sys; print(json.load(sys.stdin)["name"])'
+  local ref="${1:-default}" json
+  json="$(docker_network_resolve_inbound "$ref")" || return 1
+  printf '%s\n' "$json" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("name",""))' 2>/dev/null || return 1
 }
 
 docker_network_choose_inbound(){
@@ -399,13 +404,13 @@ EOF
     return 0
   fi
   systemctl daemon-reload
-  systemctl enable --now singbox-manager-docker-watch.service >/dev/null
+  systemctl enable --now "$DOCKER_WATCH_UNIT" >/dev/null
   info "Docker watcher 已开启。"
 }
 
 docker_network_watch_off(){
   if command -v systemctl >/dev/null 2>&1 && [[ "${SBX_DOCKER_WATCH_NO_APPLY:-0}" != "1" ]]; then
-    systemctl disable --now singbox-manager-docker-watch.service >/dev/null 2>&1 || true
+    systemctl disable --now "$DOCKER_WATCH_UNIT" >/dev/null 2>&1 || true
   fi
   rm -f "$DOCKER_WATCH_SERVICE"
   if command -v systemctl >/dev/null 2>&1 && [[ "${SBX_DOCKER_WATCH_NO_APPLY:-0}" != "1" ]]; then
@@ -418,8 +423,8 @@ docker_network_watch_status(){
   if [[ -f "$DOCKER_WATCH_SERVICE" ]]; then
     printf 'Watcher: CONFIGURED\n'
     if command -v systemctl >/dev/null 2>&1; then
-      systemctl is-enabled singbox-manager-docker-watch.service 2>/dev/null | sed 's/^/Enabled: /' || true
-      systemctl is-active singbox-manager-docker-watch.service 2>/dev/null | sed 's/^/Active:  /' || true
+      systemctl is-enabled "$DOCKER_WATCH_UNIT" 2>/dev/null | sed 's/^/Enabled: /' || true
+      systemctl is-active "$DOCKER_WATCH_UNIT" 2>/dev/null | sed 's/^/Active:  /' || true
     fi
   else
     printf 'Watcher: OFF\n'
@@ -468,6 +473,12 @@ for r in rows:
     name=(ep or {}).get("name","MISSING")
     port=str((ep or {}).get("port","-"))
     print(f"{r['key'][:40]:<42} {iid[:10]:<12} {name[:16]:<18} {port:<7} {','.join(r.get('running',[]))[:16]:<18} {','.join(r.get('connected',[]))}")
+missing=sorted(m for m in {str(r.get("inbound_id") or "") for r in rows} if m and m not in by_id)
+if missing:
+    print()
+    print(f"注意: {len(missing)} 个托管目标引用的入口已不存在（上面显示为 MISSING）:")
+    print("      " + ", ".join(m[:10] for m in missing))
+    print("      这些容器里配置的代理地址已失效；请用 `sbx docker-network unmanage <KEY>` 清理，或重新显式绑定入口。")
 PY
 }
 
@@ -569,19 +580,19 @@ docker_network_menu(){
     printf '\n  0 返回\n'
     read -r -p '请选择: ' x || return
     case "$x" in
-      1) docker_network_scan_manage ;;
-      2) docker_network_managed_list ;;
-      3) docker_network_sync ;;
-      4) read -r -p '容器名称或托管 KEY: ' c; docker_network_unmanage "$c" ;;
-      5) read -r -p '容器名称/ID: ' c; docker_network_connect "$c" ;;
-      6) read -r -p '容器名称/ID: ' c; docker_network_disconnect "$c" ;;
+      1) docker_network_scan_manage || true ;;
+      2) docker_network_managed_list || true ;;
+      3) docker_network_sync || true ;;
+      4) read -r -p '容器名称或托管 KEY: ' c || true; docker_network_unmanage "$c" || true ;;
+      5) read -r -p '容器名称/ID: ' c || true; docker_network_connect "$c" || true ;;
+      6) read -r -p '容器名称/ID: ' c || true; docker_network_disconnect "$c" || true ;;
       7) docker_network_members || true ;;
-      8) docker_network_urls ;;
-      9) docker_network_snippet ;;
-      10) docker_network_watch_on ;;
-      11) docker_network_watch_off ;;
-      12) docker_network_on ;;
-      13) docker_network_off ;;
+      8) docker_network_urls || true ;;
+      9) docker_network_snippet || true ;;
+      10) docker_network_watch_on || true ;;
+      11) docker_network_watch_off || true ;;
+      12) docker_network_on || true ;;
+      13) docker_network_off || true ;;
       14) read -r -p '容器名称/ID: ' c; python3 "$HOME_DIR/lib/sbx_verify.py" docker "$c" || true ;;
       15) python3 "$HOME_DIR/lib/sbx_verify.py" docker-all || true ;;
       0) return ;;
@@ -633,7 +644,7 @@ sbx docker-network unmanage <container|KEY>
 sbx docker-network managed            查看托管目标
 sbx docker-network sync [--quiet]     立即按托管清单补接网络
 sbx docker-network verify <container> [入口ID]
-sbx docker-network verify-all          快速验证全部托管容器
+sbx docker-network verify-all          验证全部托管容器（默认真实出口探测，--quick 只做结构检查）
 sbx docker-network watch on|off|status
 sbx docker-network connect <container>    临时接入当前容器实例
 sbx docker-network disconnect <container> 临时移除当前容器实例

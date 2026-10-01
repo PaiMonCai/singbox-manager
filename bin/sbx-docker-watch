@@ -10,10 +10,19 @@ while true; do
     continue
   fi
 
+  # 路径写错时不能静默空转：否则 unit 一直 active 却永远不生效
+  if [[ ! -x "$SBX_WATCH_SBX" ]]; then
+    printf 'sbx 不可执行: %s（%s 秒后重试）\n' "$SBX_WATCH_SBX" "$SBX_WATCH_RETRY" >&2
+    sleep "$SBX_WATCH_RETRY"
+    continue
+  fi
+
+  # docker events 在 daemon 重启时会非零退出；不能让它用 errexit 结束整个 watcher
+  # （只靠 systemd 的 Restart=always 兜底不够，手工运行时就是静默死掉）。
   docker events     --filter type=container     --filter event=create     --filter event=start     --format '{{.ID}}' 2>/dev/null |
   while IFS= read -r _container_id; do
     "$SBX_WATCH_SBX" docker-network sync --quiet >/dev/null 2>&1 || true
-  done
+  done || true
 
   sleep "$SBX_WATCH_RETRY"
 done

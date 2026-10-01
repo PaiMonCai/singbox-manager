@@ -1,7 +1,6 @@
 #!/usr/bin/env bash
 # singbox-manager v0.4 host application proxy integration.
 # Sourced after v0.3; overrides VERSION/menu/help/main and adds `sbx proxy`.
-VERSION="0.5.3"
 
 PROXY_STATE_DIR="${SBX_PROXY_STATE_DIR:-$HOME_DIR/proxy-state}"
 DOCKER_DROPIN_DIR="${SBX_DOCKER_DROPIN_DIR:-/etc/systemd/system/docker.service.d}"
@@ -41,8 +40,7 @@ proxy_is_rootless_docker(){
 }
 
 proxy_wait_docker(){
-  local i
-  for i in $(seq 1 20); do
+  for _ in $(seq 1 20); do
     docker info >/dev/null 2>&1 && return 0
     sleep 1
   done

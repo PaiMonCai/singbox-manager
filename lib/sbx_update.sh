@@ -100,6 +100,24 @@ manager_update(){
     return 1
   fi
 
+  # 可选：用固定校验和钉住更新内容。设置了就必须匹配，否则拒绝执行。
+  local want_sha="${SBX_UPDATE_SHA256:-}"
+  if [[ -n "$want_sha" ]]; then
+    if ! command -v sha256sum >/dev/null 2>&1; then
+      rm -f "$tmp"; trap - RETURN
+      warn "设置了 SBX_UPDATE_SHA256 但系统没有 sha256sum，已中止。"
+      return 1
+    fi
+    local got_sha
+    got_sha="$(sha256sum "$tmp" | cut -d' ' -f1)"
+    if [[ "$got_sha" != "$want_sha" ]]; then
+      rm -f "$tmp"; trap - RETURN
+      warn "install.sh 校验和不匹配（期望 $want_sha，实际 ${got_sha:-空}），已中止更新。"
+      return 1
+    fi
+    ((quiet)) || info "install.sh 校验和匹配。"
+  fi
+
   # 调用方可能是 `manager_update || true`（交互菜单），那个上下文会抑制 errexit，
   # 所以必须显式检查退出码，不能依赖 set -e。
   local rc=0
@@ -258,6 +276,10 @@ sbx manager auto off            关闭自动更新
 sbx manager auto status         查看自动更新状态
 sbx self-update                 sbx manager update 的快捷别名
 sbx-install                     获取最新 install.sh 并执行完整安装/升级
+
+可用的环境变量（用于固定更新源/校验内容）：
+SBX_UPDATE_REPO / SBX_UPDATE_BRANCH / SBX_UPDATE_BASE_URL   替换更新源（可指向自己的镜像或 tag）
+SBX_UPDATE_SHA256=<sha256>                                  校验 install.sh 后再执行
 EOF
       ;;
     *) die "未知 manager 命令: $op" ;;
@@ -370,7 +392,7 @@ main(){
     manager|self-update|doctor) lightweight=1 ;;
     proxy)
       case "${1:-menu}:${2:-}" in
-        status:*|env:*|help:*|-h:*|--help:*|*:off|all:off) lightweight=1 ;;
+        status:*|env:*|help:*|-h:*|--help:*|*:off) lightweight=1 ;;
       esac
       ;;
   esac

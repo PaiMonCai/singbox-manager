@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import argparse
 import base64
+import fcntl
 import getpass
 import ipaddress
 import json
@@ -8,6 +9,7 @@ import os
 import re
 import secrets
 import sys
+import time
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 from urllib.parse import parse_qs, unquote, urlsplit
@@ -27,6 +29,38 @@ DEFAULT_SETTINGS = {
         "tolerance": 50,
     },
 }
+
+# 会改写节点库的子命令：整个「读-改-写」周期必须互斥，否则并发操作会互相覆盖。
+MUTATING_COMMANDS = frozenset({
+    "init", "add", "edit", "delete", "default", "render",
+    "import-uri", "import-file",
+    "inbound-add", "inbound-edit", "inbound-delete",
+    "strategy", "route-mode", "urltest",
+    "sub-register", "sub-apply", "sub-delete",
+})
+
+LOCK_FILE = HOME / "nodes" / ".sbx-nodes.lock"
+_LOCK_HANDLE: Optional[Any] = None
+
+
+def acquire_registry_lock(timeout: float = 15.0) -> None:
+    """独占节点库的读-改-写周期。进程退出时 flock 自动释放，无需显式解锁。"""
+    global _LOCK_HANDLE
+    if _LOCK_HANDLE is not None:
+        return
+    LOCK_FILE.parent.mkdir(parents=True, exist_ok=True)
+    handle = LOCK_FILE.open("w")
+    deadline = time.monotonic() + timeout
+    while True:
+        try:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            break
+        except OSError:
+            if time.monotonic() >= deadline:
+                handle.close()
+                raise ValueError("节点库正被其它进程占用，请稍后重试")
+            time.sleep(0.1)
+    _LOCK_HANDLE = handle
 
 
 def eprint(*args: Any) -> None:
@@ -95,13 +129,15 @@ def prompt(text: str, default: Optional[str] = None, required: bool = False) -> 
 
 
 def prompt_secret(text: str, current: Optional[str] = None, required: bool = False) -> str:
-    hint = " [直接回车保持不变]" if current is not None else ""
+    # current 为空串时不能当成“已有值”，否则 required=True 会被直接回车绕过
+    keep = current is not None and current != ""
+    hint = " [直接回车保持不变]" if keep else ""
     while True:
         try:
             value = getpass.getpass(f"{text}{hint}: ").strip()
         except (EOFError, KeyboardInterrupt):
             raise SystemExit("输入已终止")
-        if not value and current is not None:
+        if not value and keep:
             return current
         if value or not required:
             return value
@@ -395,6 +431,9 @@ def build_inbound(data: Dict[str, Any], existing: Optional[Dict[str, Any]] = Non
         name = prompt("入口名称", existing.get("name"), True)
     if not name:
         raise ValueError("入口名称不能为空")
+    name = str(name).strip()
+    if name.lower() == "default":
+        raise ValueError("入口名称不能是 default（内置默认入口的保留名）")
     if any(x.get("name") == name and x.get("id") != inbound_id for x in data.get("inbounds", [])):
         raise ValueError(f"入口名称重复: {name}")
 
@@ -733,6 +772,19 @@ def ensure_unique_name(data: Dict[str, Any], name: str, ignore_ids: Optional[set
     return f"{name}-{i}"
 
 
+def ensure_unique_node_name(data: Dict[str, Any], node: Dict[str, Any], ignore_id: Optional[str] = None) -> None:
+    """交互式新增/编辑时拒绝重名：重名会让所有按名称的操作（edit/delete/show/test）失效。"""
+    name = str(node.get("name") or "").strip()
+    if not name:
+        raise ValueError("节点名称不能为空")
+    skip = ignore_id or node.get("id")
+    for other in data["nodes"]:
+        if other.get("id") == skip:
+            continue
+        if str(other.get("name") or "").strip() == name:
+            raise ValueError(f"节点名称重复: {name}（请换一个名称，或改用节点 ID 操作）")
+
+
 def add_imported_nodes(data: Dict[str, Any], nodes: List[Dict[str, Any]], source: str = "import", replace_ids: Optional[List[str]] = None) -> List[str]:
     replace_set = set(replace_ids or [])
     if replace_set:
@@ -930,11 +982,11 @@ def cmd_init(_: argparse.Namespace) -> int:
     data = load_registry(); render(data); save_registry(data); return 0
 def cmd_list(_: argparse.Namespace) -> int: list_nodes(); return 0
 def cmd_add(_: argparse.Namespace) -> int:
-    data = load_registry(); node = build_node(); node["id"] = new_id(data["nodes"]); data["nodes"].append(node)
+    data = load_registry(); node = build_node(); ensure_unique_node_name(data, node); node["id"] = new_id(data["nodes"]); data["nodes"].append(node)
     if not data.get("default"): data["default"] = node["id"]
     render(data); save_registry(data); print(f"已添加节点：{node['name']} ({node['id']})"); return 0
 def cmd_edit(args: argparse.Namespace) -> int:
-    data = load_registry(); old = resolve_node(data, args.ref); node = build_node(old); node["id"] = old["id"]; data["nodes"][data["nodes"].index(old)] = node; render(data); save_registry(data); print("节点已更新。"); return 0
+    data = load_registry(); old = resolve_node(data, args.ref); node = build_node(old); ensure_unique_node_name(data, node, old.get("id")); node["id"] = old["id"]; data["nodes"][data["nodes"].index(old)] = node; render(data); save_registry(data); print("节点已更新。"); return 0
 def cmd_delete(args: argparse.Namespace) -> int:
     data = load_registry(); node = resolve_node(data, args.ref)
     if not args.yes and prompt(f"确认删除 {node['name']}？输入 DELETE") != "DELETE": print("已取消。"); return 1
@@ -1045,9 +1097,12 @@ def cmd_urltest(args: argparse.Namespace) -> int:
 def cmd_sub_list(_: argparse.Namespace) -> int: list_subscriptions(); return 0
 def cmd_sub_register(args: argparse.Namespace) -> int:
     data = load_registry(); sub_id = args.id or new_id(data.get("subscriptions", [])); existing = next((s for s in data.get("subscriptions", []) if s.get("id") == sub_id), None)
-    meta = {"id": sub_id, "name": args.name or f"subscription-{sub_id[:4]}", "url": args.url, "node_ids": []}
-    if existing: existing.update(meta)
-    else: data["subscriptions"].append(meta)
+    meta = {"id": sub_id, "name": args.name or f"subscription-{sub_id[:4]}", "url": args.url}
+    # 只更新元数据：清空 node_ids 会让这些节点变成永远无人管理的孤儿
+    if existing:
+        existing.update(meta); existing.setdefault("node_ids", [])
+    else:
+        data["subscriptions"].append({**meta, "node_ids": []})
     save_registry(data); print(sub_id); return 0
 def cmd_sub_apply(args: argparse.Namespace) -> int:
     data = load_registry(); sub = resolve_subscription(data, args.ref); text = Path(args.file).read_text(encoding="utf-8", errors="replace"); nodes, errors = parse_subscription(text)
@@ -1115,7 +1170,10 @@ def parser() -> argparse.ArgumentParser:
 
 def main() -> int:
     try:
-        args = parser().parse_args(); return int(args.func(args) or 0)
+        args = parser().parse_args()
+        if getattr(args, "cmd", None) in MUTATING_COMMANDS:
+            acquire_registry_lock()
+        return int(args.func(args) or 0)
     except (ValueError, KeyError, TypeError, json.JSONDecodeError, OSError) as exc:
         eprint(f"错误: {exc}"); return 2
     except KeyboardInterrupt:

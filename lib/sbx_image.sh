@@ -2,8 +2,6 @@
 # Runtime image guard for singbox-manager.
 # Prevents Docker/Compose from implicitly pulling sing-box during check/start/import flows.
 
-VERSION="0.5.3"
-
 image_repo() {
   envval SING_BOX_IMAGE ghcr.io/sagernet/sing-box
 }
@@ -65,8 +63,7 @@ restart() {
   fi
   # --force-recreate 会先删掉旧容器，所以必须确认新容器真的起来了；
   # 否则调用方会把“配置已生效”报成成功，而 sing-box 其实处于停机状态。
-  local i
-  for i in $(seq 1 10); do
+  for _ in $(seq 1 10); do
     running && break
     sleep 0.3
   done
