@@ -28,8 +28,10 @@ inbound_tx(){
     return 1
   fi
 
+  if running; then
+    restart || { warn "入口配置已写入磁盘，但 sing-box 重启失败；请执行 sbx logs 检查。"; return 1; }
+  fi
   info "入口配置已生效。"
-  running && restart || true
 }
 
 inbound_test(){

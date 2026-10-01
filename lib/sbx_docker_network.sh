@@ -10,6 +10,14 @@ DOCKER_WATCH_SERVICE="${SBX_DOCKER_WATCH_SERVICE:-/etc/systemd/system/singbox-ma
 DOCKER_WATCH_SBX="${SBX_BIN_LINK:-/usr/local/bin/sbx}"
 DOCKER_WATCH_BIN="${SBX_DOCKER_WATCH_BIN:-$HOME_DIR/bin/sbx-docker-watch}"
 
+# 统一调用入口：helper 读的是进程环境变量，而 SING_BOX_CONTAINER_NAME 只写在 .env，
+# 不显式传进去的话 is_manager_container() 会一直用默认值，导致 sing-box 自己被当成可托管容器。
+docker_target_helper(){
+  SING_BOX_CONTAINER_NAME="$(envval SING_BOX_CONTAINER_NAME sing-box)" \
+  SBX_DOCKER_MANAGED_FILE="$DOCKER_MANAGED_FILE" \
+    python3 "$DOCKER_TARGET_HELPER" "$@"
+}
+
 docker_network_name(){
   envval SING_BOX_DOCKER_NETWORK "$DOCKER_NETWORK_DEFAULT"
 }
@@ -83,7 +91,7 @@ docker_network_on(){
 
   if [[ -f "$DOCKER_MANAGED_FILE" && -f "$DOCKER_TARGET_HELPER" ]]; then
     local managed_count
-    managed_count="$(SBX_DOCKER_MANAGED_FILE="$DOCKER_MANAGED_FILE" python3 "$DOCKER_TARGET_HELPER" list --json 2>/dev/null | python3 -c 'import json,sys; print(len(json.load(sys.stdin)))' 2>/dev/null || printf '0')"
+    managed_count="$(docker_target_helper list --json 2>/dev/null | python3 -c 'import json,sys; print(len(json.load(sys.stdin)))' 2>/dev/null || printf '0')"
     if [[ "$managed_count" =~ ^[0-9]+$ ]] && ((managed_count > 0)); then
       docker_network_sync || true
       command -v systemctl >/dev/null 2>&1 && docker_network_watch_on || true
@@ -152,8 +160,9 @@ docker_network_connect(){
   fi
 
   printf '\n容器内代理地址：\n'
-  printf '  HTTP/HTTPS: http://%s:%s\n' "$DOCKER_NETWORK_ALIAS" "$(envval SING_BOX_MIXED_PORT 7890)"
-  printf '  SOCKS5:     socks5h://%s:%s\n' "$DOCKER_NETWORK_ALIAS" "$(envval SING_BOX_MIXED_PORT 7890)"
+  local cport; cport="$(docker_network_inbound_port default 2>/dev/null || printf '7890')"
+  printf '  HTTP/HTTPS: http://%s:%s\n' "$DOCKER_NETWORK_ALIAS" "$cport"
+  printf '  SOCKS5:     socks5h://%s:%s\n' "$DOCKER_NETWORK_ALIAS" "$cport"
   warn "network connect 只建立网络连通性，不会修改该容器已有环境变量。"
   warn "如果该容器由 Compose 管理，建议把 external network 写进它自己的 compose 文件以便重建后仍保留。"
 }
@@ -190,9 +199,11 @@ host=sys.argv[1]
 items=json.loads(sys.argv[2])
 for i,item in enumerate(items):
     if i: print()
+    # 容器侧必须用 container_port：默认入口在容器内固定 7890，宿主端口可能被改过
+    port=item.get('container_port', item['port'])
     print(f"[{item['id']}] {item['name']} -> {item.get('resolved_outbound','') or (item.get('target') or {}).get('type','?')}")
-    print(f"  HTTP/HTTPS: http://{host}:{item['port']}")
-    print(f"  SOCKS5:     socks5h://{host}:{item['port']}")
+    print(f"  HTTP/HTTPS: http://{host}:{port}")
+    print(f"  SOCKS5:     socks5h://{host}:{port}")
 PY
 }
 
@@ -275,8 +286,10 @@ docker_network_inbound_id(){
 }
 
 docker_network_inbound_port(){
+  # 返回容器内/共享网络内可达的端口；默认入口在容器内固定 7890，
+  # 与宿主机发布端口（SING_BOX_MIXED_PORT）可能不同，不能混用。
   local ref="${1:-default}"
-  docker_network_resolve_inbound "$ref" | python3 -c 'import json,sys; print(json.load(sys.stdin)["port"])'
+  docker_network_resolve_inbound "$ref" | python3 -c 'import json,sys; d=json.load(sys.stdin); print(d.get("container_port", d["port"]))'
 }
 
 docker_network_inbound_name(){
@@ -302,7 +315,7 @@ import json,sys
 print(len(json.loads(sys.argv[1])))
 PY
 )"
-  read -r -p '请选择代理入口 [1]: ' raw
+  read -r -p '请选择代理入口 [1]: ' raw || true
   raw="${raw:-1}"
   [[ "$raw" =~ ^[0-9]+$ ]] || { warn "请输入入口序号。"; return 1; }
   ((raw >= 1 && raw <= count)) || { warn "入口序号不存在: $raw"; return 1; }
@@ -417,13 +430,19 @@ docker_network_sync(){
   local quiet=0 net
   [[ "${1:-}" == "--quiet" ]] && quiet=1
   net="$(docker_network_name)"
+  if ! docker_network_enabled; then
+    # 共享网络已被 off 关闭（compose.network.yml 不存在，sing-box 也不在该网络内），
+    # 此时把托管容器接上去只会让它们配置的代理地址失效。
+    ((quiet)) || warn "共享代理网络当前未启用，已跳过 sync（先执行 sbx docker-network on）。"
+    return 0
+  fi
   docker_network_create_if_missing "$net"
   [[ -f "$DOCKER_TARGET_HELPER" ]] || die "缺少 Docker 托管 helper: $DOCKER_TARGET_HELPER"
   docker_network_migrate_legacy_targets || true
   if ((quiet)); then
-    SBX_DOCKER_MANAGED_FILE="$DOCKER_MANAGED_FILE" python3 "$DOCKER_TARGET_HELPER" sync --network "$net" --quiet
+    docker_target_helper sync --network "$net" --quiet
   else
-    SBX_DOCKER_MANAGED_FILE="$DOCKER_MANAGED_FILE" python3 "$DOCKER_TARGET_HELPER" sync --network "$net"
+    docker_target_helper sync --network "$net"
   fi
 }
 
@@ -432,7 +451,7 @@ docker_network_managed_list(){
   net="$(docker_network_name)"
   [[ -f "$DOCKER_TARGET_HELPER" ]] || die "缺少 Docker 托管 helper。"
   docker_network_migrate_legacy_targets || true
-  rows="$(SBX_DOCKER_MANAGED_FILE="$DOCKER_MANAGED_FILE" python3 "$DOCKER_TARGET_HELPER" list --network "$net" --json)"
+  rows="$(docker_target_helper list --network "$net" --json)"
   endpoints="$(docker_network_endpoints_json)"
   python3 - "$rows" "$endpoints" <<'PY'
 import json,sys
@@ -465,7 +484,7 @@ docker_network_manage(){
 
   docker_network_enabled || docker_network_on "$net"
   docker_network_migrate_legacy_targets || true
-  SBX_DOCKER_MANAGED_FILE="$DOCKER_MANAGED_FILE" python3 "$DOCKER_TARGET_HELPER" add "$container" --inbound-id "$inbound_id"
+  docker_target_helper add "$container" --inbound-id "$inbound_id"
   docker_network_sync
   if command -v systemctl >/dev/null 2>&1; then
     docker_network_watch_on || true
@@ -478,8 +497,8 @@ docker_network_manage(){
 docker_network_unmanage(){
   local ref="${1:-}" remaining
   [[ -n "$ref" ]] || die "用法: sbx docker-network unmanage <容器|KEY>"
-  SBX_DOCKER_MANAGED_FILE="$DOCKER_MANAGED_FILE" python3 "$DOCKER_TARGET_HELPER" remove "$ref"
-  remaining="$(SBX_DOCKER_MANAGED_FILE="$DOCKER_MANAGED_FILE" python3 "$DOCKER_TARGET_HELPER" list --json 2>/dev/null | python3 -c 'import json,sys; print(len(json.load(sys.stdin)))' 2>/dev/null || printf '0')"
+  docker_target_helper remove "$ref"
+  remaining="$(docker_target_helper list --json 2>/dev/null | python3 -c 'import json,sys; print(len(json.load(sys.stdin)))' 2>/dev/null || printf '0')"
   if [[ "$remaining" == "0" ]]; then
     docker_network_watch_off >/dev/null 2>&1 || true
     info "已无托管目标，Docker watcher 已停止。"
@@ -488,8 +507,8 @@ docker_network_unmanage(){
 
 docker_network_scan_manage(){
   [[ -f "$DOCKER_TARGET_HELPER" ]] || die "缺少 Docker 托管 helper。"
-  local json selection inbound_id token idx name
-  json="$(SBX_DOCKER_MANAGED_FILE="$DOCKER_MANAGED_FILE" python3 "$DOCKER_TARGET_HELPER" scan --json)"
+  local json selection inbound_id token idx name choices
+  json="$(docker_target_helper scan --json)"
   python3 - "$json" <<'PY'
 import json,sys
 rows=json.loads(sys.argv[1])

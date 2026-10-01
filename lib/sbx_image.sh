@@ -59,7 +59,22 @@ start() {
 restart() {
   image_require || die "sing-box 镜像未准备好。"
   check || die "配置检查失败，未替换运行容器。"
-  dc up -d --force-recreate --pull never sing-box
+  if ! dc up -d --force-recreate --pull never sing-box; then
+    warn "sing-box 容器替换失败（旧容器已被移除）。"
+    return 1
+  fi
+  # --force-recreate 会先删掉旧容器，所以必须确认新容器真的起来了；
+  # 否则调用方会把“配置已生效”报成成功，而 sing-box 其实处于停机状态。
+  local i
+  for i in $(seq 1 10); do
+    running && break
+    sleep 0.3
+  done
+  if ! running; then
+    warn "sing-box 未能进入运行状态，请执行 sbx logs 查看原因。"
+    status || true
+    return 1
+  fi
   status
 }
 
@@ -199,6 +214,5 @@ pull() {
   dc up -d --force-recreate --pull never sing-box
 }
 
-version() {
-  printf 'singbox-manager: %s\npinned sing-box: %s\nimage: %s\nstrategy: %s\nroute: %s\n'     "$VERSION" "$(image_version)" "$(image_ref)"     "$(python3 "$HELPER" strategy)" "$(python3 "$HELPER" route-mode)"
-}
+# version() 由 lib/sbx_update.sh 提供（bin/sbx 最后 source 它，因此生效的是那一份）。
+# 这里不再重复定义，避免出现“改了这份却不生效”的遮蔽定义。

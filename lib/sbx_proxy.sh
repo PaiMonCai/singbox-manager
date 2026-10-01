@@ -11,20 +11,7 @@ GIT_PROXY_FILE="${SBX_GIT_PROXY_FILE:-/etc/singbox-manager/git-proxy.conf}"
 NPM_BLOCK_BEGIN="# >>> singbox-manager proxy >>>"
 NPM_BLOCK_END="# <<< singbox-manager proxy <<<"
 
-proxy_host(){
-  local bind
-  bind=$(envval SING_BOX_BIND_ADDR 127.0.0.1)
-  case "$bind" in
-    0.0.0.0|"") printf '127.0.0.1' ;;
-    "::"|"[::]") printf '[::1]' ;;
-    *:*)
-      bind="${bind#[}"
-      bind="${bind%]}"
-      printf '[%s]' "$bind"
-      ;;
-    *) printf '%s' "$bind" ;;
-  esac
-}
+# proxy_host() 定义已上移到 bin/sbx（加载更早，供 sbx_v3.sh / sbx_update.sh 复用）。
 proxy_port(){ envval SING_BOX_MIXED_PORT 7890; }
 proxy_url(){ printf 'http://%s:%s' "$(proxy_host)" "$(proxy_port)"; }
 proxy_socks_url(){ printf 'socks5h://%s:%s' "$(proxy_host)" "$(proxy_port)"; }
@@ -87,7 +74,7 @@ PY
     return 1
   fi
   proxy_wait_docker || die "Docker daemon 重启后未恢复。"
-  dc up -d sing-box >/dev/null 2>&1 || true
+  dc up -d --pull never sing-box >/dev/null 2>&1 || true
   info "Docker daemon 代理已开启。"
 }
 
@@ -106,7 +93,7 @@ proxy_docker_off(){
   systemctl daemon-reload
   systemctl restart docker
   proxy_wait_docker || die "Docker daemon 重启后未恢复。"
-  dc up -d sing-box >/dev/null 2>&1 || true
+  dc up -d --pull never sing-box >/dev/null 2>&1 || true
   info "Docker daemon 代理已关闭。"
 }
 

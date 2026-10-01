@@ -84,14 +84,26 @@ Environment="NO_PROXY=localhost,127.0.0.1,::1"
 EOF
   chmod 600 "$BOOTSTRAP_DOCKER_PROXY_FILE"
 
-  info "正在临时为 Docker daemon 配置启动代理..."
-  systemctl daemon-reload
-  systemctl restart docker
-  sleep 1
+  # 从这里起，任何退出路径（Ctrl-C / errexit / systemctl 失败）都必须撤掉 drop-in，
+  # 否则宿主机 Docker daemon 会永久指向一个临时或已失效的代理。
+  # 需保存并还原上层已有的 EXIT trap（install.sh 用它清理临时目录，不能被顶掉）。
+  local prev_trap rc=0
+  prev_trap="$(trap -p EXIT || true)"
+  trap 'bootstrap_cleanup_temp_proxy' EXIT INT TERM HUP
 
-  local rc=0
-  bootstrap_pull "$image" || rc=$?
+  info "正在临时为 Docker daemon 配置启动代理..."
+  systemctl daemon-reload || true
+  if systemctl restart docker; then
+    sleep 1
+    bootstrap_pull "$image" || rc=$?
+  else
+    warn "Docker 重启失败，正在撤销临时代理配置。"
+    rc=1
+  fi
+
   bootstrap_cleanup_temp_proxy
+  trap - EXIT INT TERM HUP
+  [[ -n "$prev_trap" ]] && eval "$prev_trap"
   return "$rc"
 }
 

@@ -12,12 +12,15 @@ UPDATE_BIN_LINK="${SBX_BIN_LINK:-/usr/local/bin/sbx}"
 UPDATE_INSTALLER_LINK="${SBX_INSTALLER_LINK:-/usr/local/bin/sbx-install}"
 
 manager_proxy_url(){
-  local port="7890"
+  local port="7890" host="127.0.0.1"
   if [[ -f "${ENV:-$HOME_DIR/.env}" ]]; then
     port="$(grep -E '^SING_BOX_MIXED_PORT=' "${ENV:-$HOME_DIR/.env}" 2>/dev/null | tail -n1 | cut -d= -f2- || true)"
     [[ -n "$port" ]] || port="7890"
   fi
-  printf 'http://127.0.0.1:%s' "$port"
+  # bin/sbx 里定义了 proxy_host()（会读 SING_BOX_BIND_ADDR）；
+  # 单独 source 本文件（例如 CI）时退回回环地址。
+  declare -F proxy_host >/dev/null 2>&1 && host="$(proxy_host)"
+  printf 'http://%s:%s' "$host" "$port"
 }
 
 manager_fetch_stdout(){
@@ -90,12 +93,36 @@ manager_update(){
   tmp="$(mktemp /tmp/sbx-manager-update.XXXXXX.sh)"
   trap 'rm -f "$tmp"' RETURN
 
-  manager_fetch_file "${UPDATE_BASE%/}/install.sh" "$tmp"
+  if ! manager_fetch_file "${UPDATE_BASE%/}/install.sh" "$tmp"; then
+    rm -f "$tmp"
+    trap - RETURN
+    warn "下载 install.sh 失败，未做任何改动。"
+    return 1
+  fi
 
-  SBX_MANAGER_ONLY=1 SBX_NONINTERACTIVE=1 SBX_INSTALL_DIR="$HOME_DIR" SBX_BIN_LINK="$UPDATE_BIN_LINK" SBX_INSTALLER_LINK="$UPDATE_INSTALLER_LINK" SBX_REPO="$UPDATE_REPO" SBX_INSTALL_BRANCH="$UPDATE_BRANCH" SBX_SOURCE_BASE_URL="$UPDATE_BASE" bash "$tmp"
+  # 调用方可能是 `manager_update || true`（交互菜单），那个上下文会抑制 errexit，
+  # 所以必须显式检查退出码，不能依赖 set -e。
+  local rc=0
+  SBX_MANAGER_ONLY=1 SBX_NONINTERACTIVE=1 SBX_INSTALL_DIR="$HOME_DIR" SBX_BIN_LINK="$UPDATE_BIN_LINK" SBX_INSTALLER_LINK="$UPDATE_INSTALLER_LINK" SBX_REPO="$UPDATE_REPO" SBX_INSTALL_BRANCH="$UPDATE_BRANCH" SBX_SOURCE_BASE_URL="$UPDATE_BASE" bash "$tmp" || rc=$?
 
   rm -f "$tmp"
   trap - RETURN
+
+  if ((rc)); then
+    warn "管理器安装器执行失败（退出码 $rc）；当前安装目录可能处于半更新状态，请重试或改用 sbx-install。"
+    return 1
+  fi
+
+  # 只比对 VERSION 不足以说明安装完整，必须同时确认代码文件到位
+  # （install.sh 已把 VERSION 放在最后安装，两者互为印证）。
+  local missing="" f
+  for f in bin/sbx lib/sbx_nodes.py lib/sbx_update.sh lib/sbx_verify.py lib/sbx_docker_network.sh VERSION; do
+    [[ -s "$HOME_DIR/$f" ]] || missing+="$f "
+  done
+  if [[ -n "$missing" ]]; then
+    warn "管理器更新不完整，缺少或为空: $missing"
+    return 1
+  fi
 
   local installed
   installed="$(tr -d '[:space:]' < "$HOME_DIR/VERSION" 2>/dev/null || true)"
@@ -112,7 +139,7 @@ manager_auto_on(){
   warn "只有在你信任该仓库与分支时才应开启。"
 
   if [[ "${SBX_UPDATE_NO_APPLY:-0}" != "1" ]]; then
-    read -r -p '输入 AUTO 确认开启自动更新: ' answer
+    read -r -p '输入 AUTO 确认开启自动更新: ' answer || { warn "未收到确认输入（EOF），已取消。"; return 1; }
     [[ "$answer" == "AUTO" ]] || { warn "已取消。"; return 1; }
   fi
 
@@ -283,8 +310,8 @@ EOF
       4) restart ;;
       5) logs || true ;;
       6) node_menu; continue ;;
-      7) import_menu; continue ;;
-      8) subscription_menu; continue ;;
+      7) subscription_menu; continue ;;
+      8) import_menu; continue ;;
       9) strategy_menu; continue ;;
       10) route_menu; continue ;;
       11) proxy_menu; continue ;;

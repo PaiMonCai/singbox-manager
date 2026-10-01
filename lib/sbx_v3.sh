@@ -16,21 +16,25 @@ transaction_v3(){
     restore_raw "$rollback" no
     return 1
   fi
+  if running; then
+    restart || { warn "配置已写入磁盘，但 sing-box 重启失败，配置尚未生效。"; return 1; }
+  fi
   info "配置已生效。"
-  running && restart || true
 }
 
 fetch_url(){
-  local url="$1" out="$2" port
+  local url="$1" out="$2" port phost="127.0.0.1"
   command -v curl >/dev/null 2>&1 || die "订阅功能需要 curl。"
   if curl -fL --retry 2 --connect-timeout 8 --max-time 30 -A "singbox-manager/$VERSION" "$url" -o "$out"; then
     return 0
   fi
   if running; then
     port=$(envval SING_BOX_MIXED_PORT 7890)
+    # proxy_host() 定义在 bin/sbx（会读 SING_BOX_BIND_ADDR）；单独 source 时退回回环地址
+    declare -F proxy_host >/dev/null 2>&1 && phost="$(proxy_host)"
     warn "直接下载失败，尝试通过当前 sing-box 代理下载..."
     curl -fL --retry 2 --connect-timeout 8 --max-time 30 -A "singbox-manager/$VERSION" \
-      --proxy "http://127.0.0.1:$port" "$url" -o "$out"
+      --proxy "http://$phost:$port" "$url" -o "$out"
   else
     return 1
   fi
@@ -81,15 +85,17 @@ sub_add(){
     restore_raw "$rollback" no
     return 1
   fi
+  if running; then
+    restart || { warn "订阅已导入，但 sing-box 重启失败；请执行 sbx logs 检查。"; return 1; }
+  fi
   info "订阅已添加并生效。"
-  running && restart || true
 }
 
 sub_update(){
   local ref="${1:-}" url id tmp rollback rc=0
   if [[ -z "$ref" ]]; then
     python3 "$HELPER" sub-list
-    read -r -p '订阅 ID/名称: ' ref
+    read -r -p '订阅 ID/名称: ' ref || { warn "未收到输入（EOF）。"; return 1; }
   fi
   [[ -n "$ref" ]] || return 1
   url=$(python3 "$HELPER" sub-get "$ref" --field url) || return 1
@@ -109,8 +115,10 @@ sub_update(){
     restore_raw "$rollback" no
     return 1
   fi
+  if running; then
+    restart || { warn "订阅已更新，但 sing-box 重启失败；请执行 sbx logs 检查。"; return 1; }
+  fi
   info "订阅更新完成。"
-  running && restart || true
 }
 
 sub_delete(){

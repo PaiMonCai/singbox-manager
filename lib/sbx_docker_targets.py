@@ -66,6 +66,9 @@ def load_state() -> Dict[str, Any]:
         raise ValueError("托管文件格式无效")
     if not isinstance(data.get("targets"), list):
         data["targets"] = []
+    else:
+        # 脏条目（非对象）会让后续 target.get() 抛 AttributeError
+        data["targets"] = [x for x in data["targets"] if isinstance(x, dict)]
     data["version"] = STATE_VERSION
     return data
 
@@ -90,9 +93,27 @@ def all_containers() -> List[Dict[str, Any]]:
     ids = [x.strip() for x in cp.stdout.splitlines() if x.strip()]
     if not ids:
         return []
-    cp = run(["docker", "inspect", *ids])
-    data = json.loads(cp.stdout)
-    return data if isinstance(data, list) else []
+    # ps -aq 与批量 inspect 之间容器可能已经消失（compose 重建、--rm 短命容器），
+    # 一个失效 ID 不能让整次 scan/list/sync 失败：批量失败就逐个降级重试。
+    cp = run(["docker", "inspect", *ids], check=False)
+    if cp.returncode == 0:
+        try:
+            data = json.loads(cp.stdout)
+        except json.JSONDecodeError:
+            data = []
+        return data if isinstance(data, list) else []
+    objects: List[Dict[str, Any]] = []
+    for cid in ids:
+        one = run(["docker", "inspect", cid], check=False)
+        if one.returncode:
+            continue
+        try:
+            data = json.loads(one.stdout)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(data, list):
+            objects.extend(x for x in data if isinstance(x, dict))
+    return objects
 
 
 def running(obj: Dict[str, Any]) -> bool:
@@ -103,9 +124,32 @@ def connected(obj: Dict[str, Any], network: str) -> bool:
     return network in ((obj.get("NetworkSettings") or {}).get("Networks") or {})
 
 
+def env_file_values() -> Dict[str, str]:
+    """读取 $SBX_HOME/.env：容器名等配置只写在那里，不会出现在进程环境变量中。"""
+    out: Dict[str, str] = {}
+    try:
+        text = (HOME / ".env").read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return out
+    for line in text.splitlines():
+        raw = line.strip()
+        if not raw or raw.startswith("#") or "=" not in raw:
+            continue
+        key, value = raw.split("=", 1)
+        out[key.strip()] = value.strip()
+    return out
+
+
+def sing_box_container_name() -> str:
+    # 显式环境变量优先（sbx 调用时会传），否则回退读 .env，再否则用 compose 默认值。
+    # 只用 os.environ 会让这里恒为 "sing-box"，与 .env 中用户配置不一致。
+    name = os.environ.get("SING_BOX_CONTAINER_NAME") or env_file_values().get("SING_BOX_CONTAINER_NAME")
+    return (name or "sing-box").strip()
+
+
 def is_manager_container(obj: Dict[str, Any]) -> bool:
     name = container_name(obj)
-    return name == os.environ.get("SING_BOX_CONTAINER_NAME", "sing-box") or name.startswith("sbx-node-test-")
+    return name == sing_box_container_name() or name.startswith("sbx-node-test-")
 
 
 def matches(target: Dict[str, Any], obj: Dict[str, Any]) -> bool:

@@ -21,7 +21,7 @@ die(){ printf '%b[ERROR]%b %s\n' "$R" "$N" "$*" >&2; exit 1; }
 
 root(){
   if [[ ${EUID:-$(id -u)} -ne 0 ]]; then
-    command -v sudo >/dev/null 2>&1 && exec sudo -- "$0" "$@"
+    command -v sudo >/dev/null 2>&1 && exec sudo -E -- "$0" "$@"
     die "该命令需要 root 权限。"
   fi
 }
@@ -47,15 +47,32 @@ dc(){
 }
 envval(){ grep -E "^$1=" "$ENV" 2>/dev/null | tail -n1 | cut -d= -f2- || printf '%s' "$2"; }
 setenv(){ local k="$1" v="$2" t; t=$(mktemp); awk -v k="$k" -v v="$v" 'BEGIN{f=0} index($0,k"=")==1{print k"="v;f=1;next}{print} END{if(!f)print k"="v}' "$ENV">"$t"; cat "$t">"$ENV"; rm -f "$t"; chmod 600 "$ENV"; }
+# sing-box 本机可达地址。放在这里（lib 之前）是因为 sbx_proxy.sh / sbx_v3.sh /
+# sbx_update.sh 都要用；安装时 BIND_ADDR 可能是具体网卡地址或 IPv6。
+proxy_host(){
+  local bind
+  bind=$(envval SING_BOX_BIND_ADDR 127.0.0.1)
+  case "$bind" in
+    0.0.0.0|"") printf '127.0.0.1' ;;
+    "::"|"[::]") printf '[::1]' ;;
+    *:*)
+      bind="${bind#[}"
+      bind="${bind%]}"
+      printf '[%s]' "$bind"
+      ;;
+    *) printf '%s' "$bind" ;;
+  esac
+}
 running(){ dc ps --status running --services 2>/dev/null | grep -qx sing-box; }
 status(){ dc ps; }
-start(){ check || die "配置检查失败。"; dc up -d sing-box; status; }
 stop(){ dc stop sing-box; }
 logs(){ dc logs --tail=100 -f sing-box; }
 
 BACKUP_RESULT=""
 backup(){
-  local d f t; d=$(date '+%Y%m%d-%H%M%S'); f="$BACKUPS/sbx-$d.tar.gz"; t=$(mktemp -d); mkdir -p "$t/snapshot"
+  local d f t n=0; d=$(date '+%Y%m%d-%H%M%S'); f="$BACKUPS/sbx-$d.tar.gz"
+  while [[ -e "$f" ]]; do n=$((n+1)); f="$BACKUPS/sbx-$d-$n.tar.gz"; done
+  t=$(mktemp -d); mkdir -p "$t/snapshot"
   [[ -f "$CONFIG" ]] && cp -a "$CONFIG" "$t/snapshot/config.json"
   [[ -f "$NODES" ]] && cp -a "$NODES" "$t/snapshot/nodes.json"
   [[ -f "$INBOUND_COMPOSE" ]] && cp -a "$INBOUND_COMPOSE" "$t/snapshot/compose.inbounds.yml"
@@ -81,7 +98,13 @@ restore(){
   [[ -n "$f" ]] || f=$(ls -1t "$BACKUPS"/sbx-*.tar.gz 2>/dev/null | head -n1 || true)
   [[ "$f" == /* ]] || f="$BACKUPS/$f"; [[ -f "$f" ]] || die "未找到备份。"
   backup; rollback="$BACKUP_RESULT"; restore_raw "$f" yes
-  if python3 "$HELPER" validate >/dev/null && check; then info "恢复完成"; running && restart || true; else warn "恢复无效，正在回滚"; restore_raw "$rollback" yes; die "恢复失败，已回滚"; fi
+  if ! python3 "$HELPER" validate >/dev/null || ! check; then
+    warn "恢复无效，正在回滚"; restore_raw "$rollback" yes; die "恢复失败，已回滚"
+  fi
+  if running; then
+    restart || { warn "配置已恢复，但 sing-box 重启失败；请执行 sbx logs 检查。"; return 1; }
+  fi
+  info "恢复完成"
 }
 
 node_tx(){
@@ -93,7 +116,10 @@ node_tx(){
   esac
   if ((rc)); then restore_raw "$rollback" no; return "$rc"; fi
   if ! python3 "$HELPER" validate >/dev/null || ! check; then warn "新节点配置未通过校验，自动回滚"; restore_raw "$rollback" no; return 1; fi
-  info "节点配置已生效。"; running && restart || true
+  if running; then
+    restart || { warn "节点配置已写入磁盘，但 sing-box 重启失败；请执行 sbx logs 检查。"; return 1; }
+  fi
+  info "节点配置已生效。"
 }
 http_test(){
   local p="$1" code ip

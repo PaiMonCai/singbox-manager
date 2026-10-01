@@ -252,13 +252,16 @@ def verify_container(ref: str, inbound_ref: Optional[str] = None, quick: bool = 
     iid = str(ep.get("id"))
     iname = str(ep.get("name"))
     port = int(ep.get("port"))
+    # 容器内可达端口（默认入口固定 7890），与宿主发布端口可能不同：
+    # 环境变量比对与真实探测都必须用它，否则端口≠7890 时会对正常配置误报失败。
+    cport = int(ep.get("container_port", port))
     if managed_id:
         result.ok(f"托管关系: {name} -> [{iid}] {iname} -> :{port}")
     else:
         result.warn(f"该容器未纳入托管；本次按 [{iid}] {iname} :{port} 检测")
 
     envs = proxy_env(obj)
-    expected = f"sing-box:{port}"
+    expected = f"sing-box:{cport}"
     if not envs:
         result.warn("未检测到 HTTP_PROXY/HTTPS_PROXY/ALL_PROXY 环境变量")
         print("      网络接通 ≠ 应用一定使用代理；应用也可能在自身配置中设置代理。")
@@ -282,7 +285,7 @@ def verify_container(ref: str, inbound_ref: Optional[str] = None, quick: bool = 
         if not addr:
             result.warn("sing-box 在共享网络上没有 IPv4 地址，跳过真实出口测试")
         else:
-            ok, detail = active_proxy_probe(obj, addr, port)
+            ok, detail = active_proxy_probe(obj, addr, cport)
             if ok:
                 result.ok("从目标容器网络命名空间通过代理访问互联网成功")
                 print(f"      代理出口 IP: {detail}")

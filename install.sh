@@ -203,11 +203,11 @@ read_env_value() {
 }
 
 write_env() {
-  local version="$1" bind="$2" port="$3" image="${4:-ghcr.io/sagernet/sing-box}" docker_network="${5:-singbox-proxy}"
+  local version="$1" bind="$2" port="$3" image="${4:-ghcr.io/sagernet/sing-box}" docker_network="${5:-singbox-proxy}" container_name="${6:-sing-box}"
   cat > "$INSTALL_DIR/.env" <<EOF
 SING_BOX_IMAGE=$image
 SING_BOX_VERSION=$version
-SING_BOX_CONTAINER_NAME=sing-box
+SING_BOX_CONTAINER_NAME=$container_name
 SING_BOX_BIND_ADDR=$bind
 SING_BOX_MIXED_PORT=$port
 SING_BOX_DOCKER_NETWORK=$docker_network
@@ -239,35 +239,48 @@ fi
 
 old_version="$DEFAULT_VERSION"
 old_image="ghcr.io/sagernet/sing-box"
+old_container_name="sing-box"
 old_bind="127.0.0.1"
 old_port="7890"
 old_docker_network="singbox-proxy"
 if (( UPGRADE )); then
   old_version="$(read_env_value "$INSTALL_DIR/.env" SING_BOX_VERSION "$DEFAULT_VERSION")"
   old_image="$(read_env_value "$INSTALL_DIR/.env" SING_BOX_IMAGE "ghcr.io/sagernet/sing-box")"
+  old_container_name="$(read_env_value "$INSTALL_DIR/.env" SING_BOX_CONTAINER_NAME "sing-box")"
   old_bind="$(read_env_value "$INSTALL_DIR/.env" SING_BOX_BIND_ADDR "127.0.0.1")"
   old_port="$(read_env_value "$INSTALL_DIR/.env" SING_BOX_MIXED_PORT "7890")"
   old_docker_network="$(read_env_value "$INSTALL_DIR/.env" SING_BOX_DOCKER_NETWORK "singbox-proxy")"
   info "检测到已有安装，将执行就地升级并保留节点数据。"
 fi
 
-version="$(ask 'sing-box 版本' "$old_version")"
-[[ "$version" == v* ]] || version="v$version"
-[[ "$version" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$ ]] || die "版本格式无效: $version"
+version=""
+bind=""
+port=""
+# manager-only 更新不使用这三个值（它在 write_env 之前就退出），
+# 因此 sing-box 的版本/端口不能用来挡住管理器自身的更新路径。
+if [[ "$MANAGER_ONLY" != "1" ]]; then
+  version="$(ask 'sing-box 版本' "$old_version")"
+  [[ "$version" == v* ]] || version="v$version"
+  [[ "$version" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$ ]] || die "版本格式无效: $version"
 
-bind="$(ask '本地代理监听地址' "$old_bind")"
-while true; do
+  bind="$(ask '本地代理监听地址' "$old_bind")"
+
   port="$(ask '本地 mixed HTTP/SOCKS5 端口' "$old_port")"
-  validate_port "$port" && break
-  warn "端口必须是 1-65535 的整数。"
-done
+  # 非交互模式下 ask 永远回显同一个默认值，重试不可能成功，必须直接失败而不是空转。
+  while ! validate_port "$port"; do
+    if [[ "$NONINTERACTIVE" == "1" ]]; then
+      die "端口无效: ${port:-（空）}。非交互模式无法重新输入，请修正 $INSTALL_DIR/.env 中的 SING_BOX_MIXED_PORT 后重试。"
+    fi
+    warn "端口必须是 1-65535 的整数。"
+    port="$(ask '本地 mixed HTTP/SOCKS5 端口' "$old_port")"
+  done
+fi
 
 info "安装目录: $INSTALL_DIR"
 mkdir -p "$INSTALL_DIR/bin" "$INSTALL_DIR/lib" "$INSTALL_DIR/config" "$INSTALL_DIR/nodes" "$INSTALL_DIR/data" "$INSTALL_DIR/backup"
 
 install -m 0644 "$SOURCE_DIR/compose.yml" "$INSTALL_DIR/compose.yml"
 install -m 0644 "$SOURCE_DIR/.env.example" "$INSTALL_DIR/.env.example"
-install -m 0644 "$SOURCE_DIR/VERSION" "$INSTALL_DIR/VERSION"
 install -m 0644 "$SOURCE_DIR/config/config.example.json" "$INSTALL_DIR/config/config.example.json"
 install -m 0755 "$SOURCE_DIR/bin/sbx" "$INSTALL_DIR/bin/sbx"
 install -m 0755 "$SOURCE_DIR/lib/sbx_nodes.py" "$INSTALL_DIR/lib/sbx_nodes.py"
@@ -286,6 +299,9 @@ install -m 0755 "$SOURCE_DIR/bin/sbx-install" "$INSTALLER_LINK"
 chmod 700 "$INSTALL_DIR/config" "$INSTALL_DIR/nodes" "$INSTALL_DIR/data" "$INSTALL_DIR/backup"
 ln -sfn "$INSTALL_DIR/bin/sbx" "$BIN_LINK"
 chmod 0755 "$INSTALLER_LINK"
+# VERSION 最后安装：管理器自更新以它作为“这次安装是否整体成功”的判据，
+# 先写 VERSION 会让“代码没装全”被误判成更新成功。
+install -m 0644 "$SOURCE_DIR/VERSION" "$INSTALL_DIR/VERSION"
 
 if [[ "$MANAGER_ONLY" == "1" ]]; then
   manager_version="$(tr -d '[:space:]' < "$INSTALL_DIR/VERSION" 2>/dev/null || true)"
@@ -297,7 +313,7 @@ if [[ "$MANAGER_ONLY" == "1" ]]; then
   exit 0
 fi
 
-write_env "$version" "$bind" "$port" "$old_image" "$old_docker_network"
+write_env "$version" "$bind" "$port" "$old_image" "$old_docker_network" "$old_container_name"
 
 export SBX_HOME="$INSTALL_DIR"
 if [[ ! -f "$INSTALL_DIR/nodes/nodes.json" ]]; then

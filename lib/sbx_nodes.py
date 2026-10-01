@@ -205,18 +205,23 @@ def default_host_port() -> int:
 
 def inbound_endpoints(data: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
     data = data or load_registry()
+    # port = 宿主机侧端口（compose 发布端口）；container_port = 容器内/共享网络内可达端口。
+    # 默认入口在容器内固定监听 7890（compose.yml 映射 `宿主:7890`），
+    # 只有自定义入口才是 host:port == container:port 一一对应。
     items: List[Dict[str, Any]] = [{
         "id": "default",
         "name": "默认入口",
         "type": "mixed",
         "listen": read_env_file().get("SING_BOX_BIND_ADDR", "127.0.0.1"),
         "port": default_host_port(),
+        "container_port": 7890,
         "target": {"type": "proxy"},
         "builtin": True,
     }]
     for inbound in data.get("inbounds", []):
         item = dict(inbound)
         item["builtin"] = False
+        item["container_port"] = int(inbound.get("port", 0))
         items.append(item)
     return items
 
@@ -420,7 +425,15 @@ def repair_inbound_targets(data: Dict[str, Any], removed_ids: Iterable[str],
     fallback = {"type": "proxy"} if data.get("nodes") else {"type": "direct"}
     for inbound in data.get("inbounds", []):
         target = inbound.get("target")
-        if not isinstance(target, dict) or target.get("type") != "node":
+        if not isinstance(target, dict):
+            continue
+        if target.get("type") in ("proxy", "auto") and not data.get("nodes"):
+            # 节点被清空后 proxy/auto 无法解析（target_tag 会抛错），
+            # 不回退 direct 的话整库会永久通不过校验。
+            inbound["target"] = dict(fallback)
+            changed += 1
+            continue
+        if target.get("type") != "node":
             continue
         old_id = target.get("node_id")
         if old_id not in removed:
@@ -614,15 +627,23 @@ def parse_ss_uri(uri: str) -> Dict[str, Any]:
     method = password = host = ""; port = 0
     if "@" in raw:
         userinfo, endpoint = raw.rsplit("@", 1)
-        if ":" not in unquote(userinfo):
-            userinfo = b64decode_loose(userinfo)
+        # 先做 URL 解码再判断：SIP002 要求 base64 的 "=" 写成 %3D，
+        # 若先解码 base64 会把 padding 留成字面量而解析失败。
         userinfo = unquote(userinfo)
+        if ":" not in userinfo:
+            userinfo = unquote(b64decode_loose(userinfo))
+        if ":" not in userinfo:
+            raise ValueError("Shadowsocks 分享链接缺少 method:password")
         method, password = userinfo.split(":", 1)
         p = urlsplit("x://" + endpoint)
         host, port = p.hostname or "", int(p.port or 0)
     else:
         decoded = b64decode_loose(raw)
+        if "@" not in decoded:
+            raise ValueError("Shadowsocks 分享链接不完整")
         creds, endpoint = decoded.rsplit("@", 1)
+        if ":" not in creds:
+            raise ValueError("Shadowsocks 分享链接缺少 method:password")
         method, password = creds.split(":", 1)
         p = urlsplit("x://" + endpoint)
         host, port = p.hostname or "", int(p.port or 0)
@@ -861,12 +882,30 @@ def redact(value: Any, key: str = "") -> Any:
 
 
 def validate(data: Optional[Dict[str, Any]] = None) -> None:
-    data = data or load_registry(); ids = [n.get("id") for n in data["nodes"]]
+    if data is None and not REGISTRY.exists():
+        raise ValueError(f"节点库不存在: {REGISTRY}")
+    data = data or load_registry()
+    if not all(isinstance(n, dict) for n in data["nodes"]):
+        raise ValueError("节点库包含格式无效的条目（应为对象）")
+    ids = [n.get("id") for n in data["nodes"]]
     if len(ids) != len(set(ids)): raise ValueError("节点 ID 重复")
     for n in data["nodes"]:
         if n.get("type") not in SUPPORTED: raise ValueError(f"不支持的节点协议: {n.get('type')}")
         if not n.get("id") or not n.get("name") or not n.get("server"): raise ValueError("节点缺少必要字段")
-        if not 1 <= int(n.get("server_port", 0)) <= 65535: raise ValueError(f"节点端口无效: {n.get('name')}")
+        try:
+            node_port = int(n.get("server_port", 0))
+        except (TypeError, ValueError):
+            raise ValueError(f"节点端口无效: {n.get('name')}") from None
+        if not 1 <= node_port <= 65535: raise ValueError(f"节点端口无效: {n.get('name')}")
+        # 空口令/空 uuid 会生成运行期不可用的 config，必须在这里拦住
+        secret_field = {"shadowsocks": "password", "trojan": "password", "hysteria2": "password", "vless": "uuid"}.get(n.get("type"))
+        if secret_field and not str(n.get(secret_field) or "").strip():
+            raise ValueError(f"节点缺少 {secret_field}: {n.get('name')}")
+        if n.get("type") == "socks" and n.get("username") and not str(n.get("password") or "").strip():
+            raise ValueError(f"节点缺少 password: {n.get('name')}")
+        for key in ("tls", "transport", "obfs"):
+            if n.get(key) is not None and not isinstance(n[key], dict):
+                raise ValueError(f"节点 {key} 字段格式无效: {n.get('name')}")
         outbound_from_node(n)
     if data.get("default") is not None and data.get("default") not in ids: raise ValueError("默认节点不存在")
     if data["settings"]["strategy"] not in ("manual", "auto"): raise ValueError("strategy 无效")
@@ -888,14 +927,14 @@ def validate(data: Optional[Dict[str, Any]] = None) -> None:
 
 
 def cmd_init(_: argparse.Namespace) -> int:
-    data = load_registry(); save_registry(data); render(data); return 0
+    data = load_registry(); render(data); save_registry(data); return 0
 def cmd_list(_: argparse.Namespace) -> int: list_nodes(); return 0
 def cmd_add(_: argparse.Namespace) -> int:
     data = load_registry(); node = build_node(); node["id"] = new_id(data["nodes"]); data["nodes"].append(node)
     if not data.get("default"): data["default"] = node["id"]
-    save_registry(data); render(data); print(f"已添加节点：{node['name']} ({node['id']})"); return 0
+    render(data); save_registry(data); print(f"已添加节点：{node['name']} ({node['id']})"); return 0
 def cmd_edit(args: argparse.Namespace) -> int:
-    data = load_registry(); old = resolve_node(data, args.ref); node = build_node(old); node["id"] = old["id"]; data["nodes"][data["nodes"].index(old)] = node; save_registry(data); render(data); print("节点已更新。"); return 0
+    data = load_registry(); old = resolve_node(data, args.ref); node = build_node(old); node["id"] = old["id"]; data["nodes"][data["nodes"].index(old)] = node; render(data); save_registry(data); print("节点已更新。"); return 0
 def cmd_delete(args: argparse.Namespace) -> int:
     data = load_registry(); node = resolve_node(data, args.ref)
     if not args.yes and prompt(f"确认删除 {node['name']}？输入 DELETE") != "DELETE": print("已取消。"); return 1
@@ -903,9 +942,9 @@ def cmd_delete(args: argparse.Namespace) -> int:
     for s in data.get("subscriptions", []): s["node_ids"] = [x for x in s.get("node_ids", []) if x != node["id"]]
     if data.get("default") == node["id"]: data["default"] = data["nodes"][0]["id"] if data["nodes"] else None
     repaired = repair_inbound_targets(data, [node["id"]])
-    save_registry(data); render(data); print("节点已删除。" + (f" {repaired} 个入口已回退到 proxy/direct。" if repaired else "")); return 0
+    render(data); save_registry(data); print("节点已删除。" + (f" {repaired} 个入口已回退到 proxy/direct。" if repaired else "")); return 0
 def cmd_default(args: argparse.Namespace) -> int:
-    data = load_registry(); node = resolve_node(data, args.ref); data["default"] = node["id"]; data["settings"]["strategy"] = "manual"; save_registry(data); render(data); print(f"默认出口：{node['name']}；策略已切到 manual。"); return 0
+    data = load_registry(); node = resolve_node(data, args.ref); data["default"] = node["id"]; data["settings"]["strategy"] = "manual"; render(data); save_registry(data); print(f"默认出口：{node['name']}；策略已切到 manual。"); return 0
 def cmd_show(args: argparse.Namespace) -> int:
     data = load_registry(); print(json.dumps(redact(resolve_node(data, args.ref)), ensure_ascii=False, indent=2)); return 0
 def cmd_render(args: argparse.Namespace) -> int: render(port=args.port); print(str(CONFIG)); return 0
@@ -913,11 +952,11 @@ def cmd_test_config(args: argparse.Namespace) -> int:
     data = load_registry(); atomic_json(Path(args.output), make_config(data, args.port, resolve_node(data, args.ref)), 0o600); return 0
 def cmd_validate(_: argparse.Namespace) -> int: validate(); print("OK"); return 0
 def cmd_import_uri(args: argparse.Namespace) -> int:
-    uri = args.uri or prompt_secret("粘贴分享链接", required=True); data = load_registry(); node = parse_uri(uri); ids = add_imported_nodes(data, [node], "import-uri"); save_registry(data); render(data); print(f"导入成功: {data['nodes'][-1]['name']} ({ids[0]})"); return 0
+    uri = args.uri or prompt_secret("粘贴分享链接", required=True); data = load_registry(); node = parse_uri(uri); ids = add_imported_nodes(data, [node], "import-uri"); render(data); save_registry(data); print(f"导入成功: {data['nodes'][-1]['name']} ({ids[0]})"); return 0
 def cmd_import_file(args: argparse.Namespace) -> int:
     text = Path(args.file).read_text(encoding="utf-8", errors="replace"); nodes, errors = parse_subscription(text)
     if not nodes: raise ValueError("没有解析到支持的节点" + (("；" + errors[0]) if errors else ""))
-    data = load_registry(); ids = add_imported_nodes(data, nodes, args.source or "import-file"); save_registry(data); render(data)
+    data = load_registry(); ids = add_imported_nodes(data, nodes, args.source or "import-file"); render(data); save_registry(data)
     print(f"导入 {len(ids)} 个节点。")
     for err in errors[:10]: eprint("跳过:", err)
     if len(errors) > 10: eprint(f"另有 {len(errors)-10} 条错误未显示。")
@@ -955,7 +994,7 @@ def cmd_inbound_add(args: argparse.Namespace) -> int:
     inbound = build_inbound(data, name=args.name, listen=args.listen, port=args.port, target_ref=args.target)
     inbound["id"] = new_id(data.get("inbounds", []))
     data.setdefault("inbounds", []).append(inbound)
-    validate(data); save_registry(data); render(data)
+    validate(data); render(data); save_registry(data)
     print(f"已添加入口：{inbound['name']} ({inbound['id']}) -> {target_label(data, inbound['target'])}")
     return 0
 
@@ -965,7 +1004,7 @@ def cmd_inbound_edit(args: argparse.Namespace) -> int:
     inbound = build_inbound(data, old, name=args.name, listen=args.listen, port=args.port, target_ref=args.target)
     inbound["id"] = old["id"]
     data["inbounds"][data["inbounds"].index(old)] = inbound
-    validate(data); save_registry(data); render(data)
+    validate(data); render(data); save_registry(data)
     print(f"入口已更新：{inbound['name']} -> {target_label(data, inbound['target'])}")
     return 0
 
@@ -975,7 +1014,7 @@ def cmd_inbound_delete(args: argparse.Namespace) -> int:
     if not args.yes and prompt(f"确认删除入口 {inbound['name']}？输入 DELETE") != "DELETE":
         print("已取消。"); return 1
     data["inbounds"] = [x for x in data.get("inbounds", []) if x.get("id") != inbound["id"]]
-    save_registry(data); render(data); print("入口已删除。"); return 0
+    render(data); save_registry(data); print("入口已删除。"); return 0
 
 
 def cmd_inbound_show(args: argparse.Namespace) -> int:
@@ -991,18 +1030,18 @@ def cmd_strategy(args: argparse.Namespace) -> int:
     if not args.value: print(data["settings"]["strategy"]); return 0
     if args.value not in ("manual", "auto"): raise ValueError("策略只能是 manual 或 auto")
     if args.value == "auto" and not data["nodes"]: raise ValueError("没有节点，无法启用自动测速")
-    data["settings"]["strategy"] = args.value; save_registry(data); render(data); print(f"strategy={args.value}"); return 0
+    data["settings"]["strategy"] = args.value; render(data); save_registry(data); print(f"strategy={args.value}"); return 0
 def cmd_route(args: argparse.Namespace) -> int:
     data = load_registry()
     if not args.value: print(data["settings"]["route_mode"]); return 0
     if args.value not in ("global", "cn-direct-lite", "cn-direct-full"): raise ValueError("路由模式只能是 global / cn-direct-lite / cn-direct-full")
-    data["settings"]["route_mode"] = args.value; save_registry(data); render(data); print(f"route_mode={args.value}"); return 0
+    data["settings"]["route_mode"] = args.value; render(data); save_registry(data); print(f"route_mode={args.value}"); return 0
 def cmd_urltest(args: argparse.Namespace) -> int:
     data = load_registry(); ut = data["settings"]["urltest"]
     if args.url: ut["url"] = args.url
     if args.interval: ut["interval"] = args.interval
     if args.tolerance is not None: ut["tolerance"] = args.tolerance
-    save_registry(data); render(data); print(json.dumps(ut, ensure_ascii=False, indent=2)); return 0
+    render(data); save_registry(data); print(json.dumps(ut, ensure_ascii=False, indent=2)); return 0
 def cmd_sub_list(_: argparse.Namespace) -> int: list_subscriptions(); return 0
 def cmd_sub_register(args: argparse.Namespace) -> int:
     data = load_registry(); sub_id = args.id or new_id(data.get("subscriptions", [])); existing = next((s for s in data.get("subscriptions", []) if s.get("id") == sub_id), None)
@@ -1014,19 +1053,24 @@ def cmd_sub_apply(args: argparse.Namespace) -> int:
     data = load_registry(); sub = resolve_subscription(data, args.ref); text = Path(args.file).read_text(encoding="utf-8", errors="replace"); nodes, errors = parse_subscription(text)
     if not nodes: raise ValueError("订阅未解析到支持的节点" + (("；" + errors[0]) if errors else ""))
     old_ids = list(sub.get("node_ids", []))
+    old_default = data.get("default")
     old_names = {n.get("id"): n.get("name") for n in data["nodes"] if n.get("id") in set(old_ids)}
     ids = add_imported_nodes(data, nodes, f"sub:{sub['id']}", old_ids)
     new_by_name = {n.get("name"): n.get("id") for n in data["nodes"] if n.get("id") in set(ids)}
     replacements = {old_id: new_by_name[name] for old_id, name in old_names.items() if name in new_by_name}
+    # 默认出口也要按名字跟着迁移，否则订阅里第一个节点会静默顶替用户选的默认节点
+    migrated_default = new_by_name.get(old_names.get(old_default))
+    if migrated_default:
+        data["default"] = migrated_default
     repaired = repair_inbound_targets(data, old_ids, replacements)
-    sub["node_ids"] = ids; save_registry(data); render(data); print(f"订阅 {sub['name']} 已导入 {len(ids)} 个节点。" + (f" 已迁移/回退 {repaired} 个入口绑定。" if repaired else ""))
+    sub["node_ids"] = ids; render(data); save_registry(data); print(f"订阅 {sub['name']} 已导入 {len(ids)} 个节点。" + (f" 已迁移/回退 {repaired} 个入口绑定。" if repaired else ""))
     for err in errors[:10]: eprint("跳过:", err)
     return 0
 def cmd_sub_delete(args: argparse.Namespace) -> int:
     data = load_registry(); sub = resolve_subscription(data, args.ref); ids = set(sub.get("node_ids", [])); data["nodes"] = [n for n in data["nodes"] if n.get("id") not in ids]; data["subscriptions"] = [s for s in data["subscriptions"] if s.get("id") != sub["id"]]
     if data.get("default") in ids: data["default"] = data["nodes"][0]["id"] if data["nodes"] else None
     repaired = repair_inbound_targets(data, ids)
-    save_registry(data); render(data); print(f"订阅及其 {len(ids)} 个节点已删除。" + (f" {repaired} 个入口已回退到 proxy/direct。" if repaired else "")); return 0
+    render(data); save_registry(data); print(f"订阅及其 {len(ids)} 个节点已删除。" + (f" {repaired} 个入口已回退到 proxy/direct。" if repaired else "")); return 0
 def cmd_sub_get(args: argparse.Namespace) -> int:
     data = load_registry(); sub = resolve_subscription(data, args.ref)
     if args.field:
@@ -1072,7 +1116,7 @@ def parser() -> argparse.ArgumentParser:
 def main() -> int:
     try:
         args = parser().parse_args(); return int(args.func(args) or 0)
-    except (ValueError, KeyError, json.JSONDecodeError, OSError) as exc:
+    except (ValueError, KeyError, TypeError, json.JSONDecodeError, OSError) as exc:
         eprint(f"错误: {exc}"); return 2
     except KeyboardInterrupt:
         eprint("\n已取消。"); return 130
