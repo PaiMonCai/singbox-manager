@@ -2,7 +2,7 @@
 
 面向 Linux 服务器的 sing-box Docker 管理层。sing-box 保持官方镜像运行，宿主机通过 `sbx` 完成安装、节点管理、配置生成、校验、测试、备份恢复与升级。
 
-当前版本：**0.11.5**
+当前版本：**0.11.6**
 
 ## 一键交互式安装
 
@@ -268,6 +268,49 @@ sbx route cn-direct-full
 
 
 
+
+## 0.11.6：curl 也接入宿主机应用代理
+
+0.4 起 `sbx proxy` 能一键把 Docker / Git / APT / npm 接到本机 sing-box，但 **curl 一直不在里面**——而本管理器的安装、`sbx-install`、`sbx self-update` 全都是 curl。
+
+现在多一项：
+
+```bash
+sbx proxy curl on     # 写 ~/.curlrc
+sbx proxy curl off    # 只删本管理器写入的块
+sbx proxy all on      # 包含 curl
+sbx proxy status      # 多一行 curl 状态与文件路径
+```
+
+写入内容（只动自己的块，用户原有的 `~/.curlrc` 配置原样保留）：
+
+```text
+# >>> singbox-manager proxy >>>
+proxy = http://127.0.0.1:7890
+noproxy = localhost,127.0.0.1,::1
+# <<< singbox-manager proxy <<<
+```
+
+几点说明：
+
+- curl 只读**用户级**配置（没有 `/etc/curlrc` 这种系统级文件），所以写的是 `${CURL_HOME:-$HOME}/.curlrc`；路径可用 `SBX_CURLRC_FILE` 覆盖，`sbx proxy status` 会打印实际使用的文件。
+- 生效范围比 Shell 环境变量更广：`cron`、`systemd` 服务、`sudo` 里跑的 curl（只要 `HOME` 对得上）都会走代理。
+- `noproxy` 保证访问 `127.0.0.1` 这类本地地址不会绕进代理。
+- 关掉 sing-box 后这些 curl 会连不上代理——所以安装器都加了兜底（见下）。
+
+### 代理配了但不可用时的兜底
+
+`install.sh`、`sbx-install`、`sbx self-update` 现在都会在“直连 + 本机 sing-box 代理”都失败后，再用 `curl -q`（**忽略 `~/.curlrc`**）重试一轮：
+
+```text
+直连（会用 ~/.curlrc 里的代理）
+   ↓ 失败
+--proxy http://127.0.0.1:7890
+   ↓ 失败
+-q 真直连（忽略 curl 配置）
+```
+
+因此即使你的 `~/.curlrc` 指向一个已经停掉的代理，也不会出现“连修复用的安装器都下不来”。`install.sh` 在这轮还会用 `-q` 重新测速排序，避免第一轮探测全失败导致候选退化成默认顺序。
 
 ## 0.11.5：修复“CDN 缓存让更新看起来不存在”
 
@@ -1334,6 +1377,9 @@ sbx proxy apt off
 sbx proxy npm on
 sbx proxy npm off
 
+sbx proxy curl on
+sbx proxy curl off
+
 sbx proxy all on
 sbx proxy all off
 ```
@@ -1480,7 +1526,7 @@ export HTTPS_PROXY=http://127.0.0.1:7890
 - `sbx node show` 默认对敏感字段做脱敏显示。
 - 升级 sing-box 前会先备份并用目标版本检查现有配置，失败时回滚版本设置。
 - 管理器自更新默认从可变的 `main` 分支拉取并以 root 执行；无人值守场景请用 `SBX_UPDATE_BRANCH` 固定到 tag，并设置 `SBX_UPDATE_SHA256` 校验。
-- Docker daemon 代理、Git/APT/npm 系统代理都会写入宿主机全局配置；关闭时请使用对应的 `sbx proxy ... off`，不要只手工删文件（会留下引用已删除配置的残留）。
+- Docker daemon 代理、Git/APT/npm 系统代理以及 curl 的 `~/.curlrc` 都会写入宿主机配置；关闭时请使用对应的 `sbx proxy ... off`，不要只手工删文件（会留下引用已删除配置的残留，以及指向已停代理的 curl 配置）。
 
 ## Roadmap
 

@@ -7,8 +7,13 @@ DOCKER_DROPIN_DIR="${SBX_DOCKER_DROPIN_DIR:-/etc/systemd/system/docker.service.d
 DOCKER_PROXY_FILE="${SBX_DOCKER_PROXY_FILE:-$DOCKER_DROPIN_DIR/99-singbox-manager-proxy.conf}"
 APT_PROXY_FILE="${SBX_APT_PROXY_FILE:-/etc/apt/apt.conf.d/99singbox-manager-proxy}"
 GIT_PROXY_FILE="${SBX_GIT_PROXY_FILE:-/etc/singbox-manager/git-proxy.conf}"
-NPM_BLOCK_BEGIN="# >>> singbox-manager proxy >>>"
-NPM_BLOCK_END="# <<< singbox-manager proxy <<<"
+# curl 只读用户级配置（没有 /etc/curlrc 这种系统级文件），
+# 默认写当前 HOME 下的 ~/.curlrc；CURL_HOME 与 SBX_CURLRC_FILE 都可覆盖。
+CURLRC_FILE="${SBX_CURLRC_FILE:-${CURL_HOME:-$HOME}/.curlrc}"
+PROXY_BLOCK_BEGIN="# >>> singbox-manager proxy >>>"
+PROXY_BLOCK_END="# <<< singbox-manager proxy <<<"
+NPM_BLOCK_BEGIN="$PROXY_BLOCK_BEGIN"
+NPM_BLOCK_END="$PROXY_BLOCK_END"
 
 # 定义留在本文件：sbx_proxy.sh 会被单独 source（CI 与手工调试都是这样），
 # 依赖 bin/sbx 里先定义会让本文件单独加载时不可用。
@@ -158,6 +163,62 @@ proxy_apt_off(){
   info "APT 代理已关闭。"
 }
 
+# 只删掉本管理器写入的块，保留用户在同一个文件里的其它配置
+proxy_strip_block(){ # file begin end
+  local file="$1" begin="$2" end="$3" tmp
+  [[ -f "$file" ]] || return 0
+  tmp=$(mktemp)
+  awk -v begin="$begin" -v end="$end" '
+    $0 == begin {skip=1; next}
+    $0 == end {skip=0; next}
+    !skip {print}
+  ' "$file" > "$tmp"
+  cat "$tmp" > "$file"
+  rm -f "$tmp"
+}
+
+# curl 走 ~/.curlrc（对所有使用该 HOME 的 curl 调用生效，包括本管理器自己的
+# sbx-install / 更新流程，以及不继承 shell 环境变量的 cron/systemd 任务）。
+proxy_curl_on(){
+  local url no_proxy file="$CURLRC_FILE" existed=0
+  proxy_require_running
+  command -v curl >/dev/null 2>&1 || die "未安装 curl。"
+  url=$(proxy_url); no_proxy=$(proxy_no_proxy)
+  mkdir -p "$(dirname "$file")"
+  [[ -e "$file" ]] && existed=1
+  touch "$file"
+  proxy_strip_block "$file" "$PROXY_BLOCK_BEGIN" "$PROXY_BLOCK_END"
+  cat >> "$file" <<EOF
+$PROXY_BLOCK_BEGIN
+proxy = $url
+noproxy = $no_proxy
+$PROXY_BLOCK_END
+EOF
+  chmod 644 "$file"
+  printf '%s\n' "$file" > "$PROXY_STATE_DIR/curlrc"
+  if (( existed == 0 )); then printf '1\n' > "$PROXY_STATE_DIR/curlrc-created"; fi
+  info "curl 代理已开启: $file"
+}
+
+proxy_curl_off(){
+  local file="" rest=""
+  if [[ -f "$PROXY_STATE_DIR/curlrc" ]]; then
+    file=$(cat "$PROXY_STATE_DIR/curlrc")
+  else
+    file="$CURLRC_FILE"
+  fi
+  if [[ -n "$file" && -f "$file" ]]; then
+    proxy_strip_block "$file" "$PROXY_BLOCK_BEGIN" "$PROXY_BLOCK_END"
+    # 这个文件是本管理器为了让 curl 走代理而创建的，且去掉块后已经空了 → 一并删掉
+    if [[ -f "$PROXY_STATE_DIR/curlrc-created" ]]; then
+      rest=$(tr -d '[:space:]' < "$file" || true)
+      [[ -n "$rest" ]] || rm -f "$file"
+    fi
+  fi
+  rm -f "$PROXY_STATE_DIR/curlrc" "$PROXY_STATE_DIR/curlrc-created"
+  info "curl 代理已关闭。"
+}
+
 npm_global_file(){
   local f
   command -v npm >/dev/null 2>&1 || return 1
@@ -167,16 +228,7 @@ npm_global_file(){
 }
 
 npm_strip_block(){
-  local file="$1" tmp
-  [[ -f "$file" ]] || return 0
-  tmp=$(mktemp)
-  awk -v begin="$NPM_BLOCK_BEGIN" -v end="$NPM_BLOCK_END" '
-    $0 == begin {skip=1; next}
-    $0 == end {skip=0; next}
-    !skip {print}
-  ' "$file" > "$tmp"
-  cat "$tmp" > "$file"
-  rm -f "$tmp"
+  proxy_strip_block "$1" "$NPM_BLOCK_BEGIN" "$NPM_BLOCK_END"
 }
 
 proxy_npm_on(){
@@ -219,18 +271,22 @@ proxy_state_word(){
   [[ "$1" == "1" ]] && printf 'ON' || printf 'OFF'
 }
 proxy_status(){
-  local url docker_on=0 git_on=0 apt_on=0 npm_on=0 npmfile=""
+  local url docker_on=0 git_on=0 apt_on=0 npm_on=0 curl_on=0 npmfile="" curlfile=""
   url=$(proxy_url)
   [[ -f "$DOCKER_PROXY_FILE" ]] && grep -Fq "HTTP_PROXY=$url" "$DOCKER_PROXY_FILE" && docker_on=1
   [[ -f "$GIT_PROXY_FILE" ]] && grep -Fq "proxy = $url" "$GIT_PROXY_FILE" && git_on=1
   [[ -f "$APT_PROXY_FILE" ]] && grep -Fq "$url" "$APT_PROXY_FILE" && apt_on=1
   if [[ -f "$PROXY_STATE_DIR/npm-globalconfig" ]]; then npmfile=$(cat "$PROXY_STATE_DIR/npm-globalconfig"); fi
   [[ -n "$npmfile" && -f "$npmfile" ]] && grep -Fq "$NPM_BLOCK_BEGIN" "$npmfile" && npm_on=1
+  curlfile="$CURLRC_FILE"
+  if [[ -f "$PROXY_STATE_DIR/curlrc" ]]; then curlfile=$(cat "$PROXY_STATE_DIR/curlrc"); fi
+  [[ -n "$curlfile" && -f "$curlfile" ]] && grep -Fq "$PROXY_BLOCK_BEGIN" "$curlfile" && grep -Fq "proxy = $url" "$curlfile" && curl_on=1
   printf 'sing-box proxy: %s\n' "$url"
   printf '%-8s %s\n' "Docker" "$(proxy_state_word "$docker_on")"
   printf '%-8s %s\n' "Git" "$(proxy_state_word "$git_on")"
   printf '%-8s %s\n' "APT" "$(proxy_state_word "$apt_on")"
   printf '%-8s %s\n' "npm" "$(proxy_state_word "$npm_on")"
+  printf '%-8s %s\n' "curl" "$(proxy_state_word "$curl_on")$([[ -n "$curlfile" ]] && printf '  (%s)' "$curlfile")"
 }
 
 proxy_env(){
@@ -266,7 +322,9 @@ proxy_one(){
     apt:off) proxy_apt_off ;;
     npm:on) proxy_npm_on ;;
     npm:off) proxy_npm_off ;;
-    *) die "用法: sbx proxy docker|git|apt|npm on|off" ;;
+    curl:on) proxy_curl_on ;;
+    curl:off) proxy_curl_off ;;
+    *) die "用法: sbx proxy docker|git|apt|npm|curl on|off" ;;
   esac
 }
 
@@ -278,11 +336,13 @@ proxy_all(){
       command -v git >/dev/null 2>&1 && proxy_git_on || warn "Git 未安装，跳过。"
       command -v apt-get >/dev/null 2>&1 && proxy_apt_on || warn "APT 不可用，跳过。"
       command -v npm >/dev/null 2>&1 && proxy_npm_on || warn "npm 未安装，跳过。"
+      command -v curl >/dev/null 2>&1 && proxy_curl_on || warn "curl 未安装，跳过。"
       proxy_docker_on || failed=1
       ;;
     off)
       proxy_docker_off || failed=1
       command -v npm >/dev/null 2>&1 && proxy_npm_off || true
+      command -v curl >/dev/null 2>&1 && proxy_curl_off || true
       command -v apt-get >/dev/null 2>&1 && proxy_apt_off || true
       command -v git >/dev/null 2>&1 && proxy_git_off || true
       ;;
@@ -297,11 +357,11 @@ proxy_menu(){
     clear
     printf '%b宿主机应用代理%b\n' "$C" "$N"
     proxy_status
-    printf '\n1 Docker          2 Git\n3 APT             4 npm\n5 全部开启        6 全部关闭\n7 Shell 环境变量  8 测试 sing-box\n\n0 返回\n'
+    printf '\n1 Docker          2 Git\n3 APT             4 npm\n5 全部开启        6 全部关闭\n7 Shell 环境变量  8 测试 sing-box\n9 curl (~/.curlrc)\n\n0 返回\n'
     read -r -p '请选择: ' x || return
     case "$x" in
-      1|2|3|4)
-        case "$x" in 1) target=docker;;2) target=git;;3) target=apt;;4) target=npm;; esac
+      1|2|3|4|9)
+        case "$x" in 1) target=docker;;2) target=git;;3) target=apt;;4) target=npm;;9) target=curl;; esac
         read -r -p "$target: 1 开启 / 2 关闭: " action
         case "$action" in 1) proxy_one "$target" on || true;;2) proxy_one "$target" off || true;;*) warn "无效选项";; esac
         ;;
@@ -326,15 +386,16 @@ proxy_cmd(){
     status) proxy_status ;;
     env) proxy_env "${action:-on}" ;;
     all) proxy_all "$action" ;;
-    docker|git|apt|npm) proxy_one "$target" "$action" ;;
+    docker|git|apt|npm|curl) proxy_one "$target" "$action" ;;
     help|-h|--help)
       cat <<'EOF'
 sbx proxy                         交互式应用代理菜单
-sbx proxy status                  查看 Docker/Git/APT/npm 接入状态
+sbx proxy status                  查看 Docker/Git/APT/npm/curl 接入状态
 sbx proxy docker on|off           Docker daemon 拉取镜像走 sing-box
 sbx proxy git on|off              Git 系统 HTTP/HTTPS 代理
 sbx proxy apt on|off              APT 系统代理
 sbx proxy npm on|off              npm 全局代理
+sbx proxy curl on|off             curl 走 ~/.curlrc（对 cron/systemd 等不继承环境变量的 curl 也生效）
 sbx proxy all on|off              一键开启/关闭全部可用集成
 sbx proxy env [off]\nsbx image status|bootstrap|pull|load               输出当前 Shell 的 export/unset 命令
 EOF

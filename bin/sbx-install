@@ -189,7 +189,7 @@ race_fetch(){
   for ((i=0;i<n;i++)); do
     outs[i]="$dir/$i"
     (
-      curl -fsL ${RACE_CURL_EXTRA[@]+"${RACE_CURL_EXTRA[@]}"} --connect-timeout 8 --max-time "$RACE_TIMEOUT" \
+      curl ${RACE_CURL_EXTRA[@]+"${RACE_CURL_EXTRA[@]}"} -fsL --connect-timeout 8 --max-time "$RACE_TIMEOUT" \
         "$(bust_url "${urls[$i]}")" -o "${outs[$i]}.part" && mv -f "${outs[$i]}.part" "${outs[$i]}"
     ) >/dev/null 2>&1 &
     pids[i]=$!
@@ -245,6 +245,14 @@ fetch_installer(){
       return 0
     fi
   fi
+  # 直连都失败：可能是 ~/.curlrc 里配了代理而 sing-box 没在运行，用 -q 忽略配置再试
+  printf '[WARN] 直连不可用，忽略 curl 配置（-q）重试一轮...\n' >&2
+  RACE_CURL_EXTRA=(-q)
+  if winner="$(race_fetch "$tmp" ${all[@]+"${all[@]}"})"; then
+    printf '[INFO] 安装器来源: %s（忽略 curl 配置）\n' "$winner"
+    return 0
+  fi
+  RACE_CURL_EXTRA=()
 
   proxy_url="$(detect_proxy || true)"
   if [[ -n "$proxy_url" ]]; then

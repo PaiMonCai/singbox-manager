@@ -170,6 +170,9 @@ SOURCE_FILE_TIMEOUT="${SBX_SOURCE_FILE_TIMEOUT:-30}"
 SOURCE_ARCHIVE_TIMEOUT="${SBX_SOURCE_ARCHIVE_TIMEOUT:-60}"
 SOURCE_CONCURRENCY="${SBX_SOURCE_CONCURRENCY:-3}"
 SOURCE_UA="singbox-manager-installer"
+# 传给 curl 的额外参数；最后兜底直连时会放入 -q（忽略 ~/.curlrc 里的代理配置）。
+# curl 要求 -q 出现在第一个参数位置，所以这里必须紧跟 curl 命令。
+SOURCE_CURL_EXTRA=()
 
 SOURCE_REQUIRED=(
   "compose.yml"
@@ -304,17 +307,20 @@ source_probe_one() {
   local version="" vtmp=""
   IFS='|' read -r kind url label <<<"$spec"
   if [[ "$kind" != "files" ]]; then
-    metrics="$(curl -sSL -A "$SOURCE_UA" --connect-timeout 5 --max-time "$SOURCE_PROBE_TIMEOUT" \
+    metrics="$(curl ${SOURCE_CURL_EXTRA[@]+"${SOURCE_CURL_EXTRA[@]}"} -sSL -A "$SOURCE_UA" \
+      --connect-timeout 5 --max-time "$SOURCE_PROBE_TIMEOUT" \
       -w '%{http_code} %{speed_download} %{size_download}' -o "$payload" "$url" 2>/dev/null)" || rc=$?
   else
     vtmp="${payload}.version"
     # 探测文件与 VERSION 并发取，避免把单源探测耗时翻倍
     (
-      curl -fsSL -A "$SOURCE_UA" --connect-timeout 5 --max-time "$SOURCE_PROBE_TIMEOUT" \
+      curl ${SOURCE_CURL_EXTRA[@]+"${SOURCE_CURL_EXTRA[@]}"} -fsSL -A "$SOURCE_UA" \
+        --connect-timeout 5 --max-time "$SOURCE_PROBE_TIMEOUT" \
         "$(source_bust_url "${url%/}/VERSION")" -o "$vtmp" 2>/dev/null
     ) >/dev/null 2>&1 &
     local vpid=$!
-    metrics="$(curl -sSL -A "$SOURCE_UA" --connect-timeout 5 --max-time "$SOURCE_PROBE_TIMEOUT" \
+    metrics="$(curl ${SOURCE_CURL_EXTRA[@]+"${SOURCE_CURL_EXTRA[@]}"} -sSL -A "$SOURCE_UA" \
+      --connect-timeout 5 --max-time "$SOURCE_PROBE_TIMEOUT" \
       -w '%{http_code} %{speed_download} %{size_download}' -o "$payload" \
       "$(source_bust_url "${url%/}/${SOURCE_PROBE_FILE}")" 2>/dev/null)" || rc=$?
     wait "$vpid" 2>/dev/null || true
@@ -493,8 +499,8 @@ race_sources() {
 fetch_source_file() { # base path dest
   local base="$1" path="$2" dest="$3" part="$3.part"
   mkdir -p "$(dirname "$dest")"
-  if curl -fL -A "$SOURCE_UA" --retry 1 --retry-delay 1 --connect-timeout 8 \
-    --max-time "$SOURCE_FILE_TIMEOUT" "$(source_bust_url "${base%/}/$path")" -o "$part"; then
+  if curl ${SOURCE_CURL_EXTRA[@]+"${SOURCE_CURL_EXTRA[@]}"} -fL -A "$SOURCE_UA" --retry 1 --retry-delay 1 \
+    --connect-timeout 8 --max-time "$SOURCE_FILE_TIMEOUT" "$(source_bust_url "${base%/}/$path")" -o "$part"; then
     if [[ -s "$part" ]]; then
       mv -f "$part" "$dest"
       return 0
@@ -583,7 +589,7 @@ fetch_archive_source() { # url → 成功时设置 ARCHIVE_DIR
   local url="$1" archive="$TMP_DIR/archive.tar.gz" dir
   rm -rf "$TMP_DIR/archive"
   mkdir -p "$TMP_DIR/archive"
-  if ! curl -fL -A "$SOURCE_UA" --retry 2 --connect-timeout 10 \
+  if ! curl ${SOURCE_CURL_EXTRA[@]+"${SOURCE_CURL_EXTRA[@]}"} -fL -A "$SOURCE_UA" --retry 2 --connect-timeout 10 \
     --max-time "$SOURCE_ARCHIVE_TIMEOUT" "$url" -o "$archive"; then
     rm -f "$archive"
     return 1
@@ -621,27 +627,41 @@ get_source() {
   mkdir -p "$raw_dir/config" "$raw_dir/bin" "$raw_dir/lib"
   race_sources || die "没有可用的源码候选地址。"
 
-  # 3) 按测速排名抓取：逐文件源失败自动换源，最后才用整包源
-  for spec in "${RANKED_SPECS[@]}"; do
-    IFS='|' read -r kind url label <<<"$spec"
-    if [[ "$kind" == "files" ]]; then
-      if fetch_files_missing "$raw_dir" && source_tree_complete "$raw_dir"; then
-        SOURCE_DIR="$raw_dir"
-        fetched=1
-        info "源码已通过 $label 准备完成。"
-        break
-      fi
-      warn "源 $label 未能取齐全部文件，尝试下一个候选源..."
-    else
-      if fetch_archive_source "$url"; then
-        SOURCE_DIR="$ARCHIVE_DIR"
-        fetched=1
-        info "源码已通过整包源 $label 准备完成。"
-        break
-      fi
-      warn "整包源 $label 下载失败，尝试下一个候选源..."
+  # 3) 按测速排名抓取：逐文件源失败自动换源，最后才用整包源。
+  #    第二轮用 -q 忽略 ~/.curlrc（若用户按 sbx proxy curl on 配了代理而 sing-box 没运行，
+  #    不忽略配置会让安装器完全下不动，连修复的入口都没有）。
+  local pass=0
+  for pass in 0 1; do
+    if (( pass == 1 )); then
+      warn "候选源均不可用，改用忽略 curl 配置（-q）直连重试一轮..."
+      SOURCE_CURL_EXTRA=(-q)
+      # 用 -q 重新探测/排序，否则第一轮的探测全失败会让候选退化成默认顺序
+      race_sources >/dev/null 2>&1 || true
+      if [[ -n "${FIRST_LABEL:-}" ]]; then info "忽略 curl 配置后首选: ${FIRST_LABEL}"; fi
     fi
+    for spec in "${RANKED_SPECS[@]}"; do
+      IFS='|' read -r kind url label <<<"$spec"
+      if [[ "$kind" == "files" ]]; then
+        if fetch_files_missing "$raw_dir" && source_tree_complete "$raw_dir"; then
+          SOURCE_DIR="$raw_dir"
+          fetched=1
+          info "源码已通过 $label 准备完成。"
+          break
+        fi
+        warn "源 $label 未能取齐全部文件，尝试下一个候选源..."
+      else
+        if fetch_archive_source "$url"; then
+          SOURCE_DIR="$ARCHIVE_DIR"
+          fetched=1
+          info "源码已通过整包源 $label 准备完成。"
+          break
+        fi
+        warn "整包源 $label 下载失败，尝试下一个候选源..."
+      fi
+    done
+    if (( fetched )); then break; fi
   done
+  SOURCE_CURL_EXTRA=()
 
   if (( fetched )); then
     return 0

@@ -99,9 +99,10 @@ jobs:
           cat > "$RACE/fake-bin/curl" <<'SH'
           #!/usr/bin/env bash
           set -uo pipefail
-          out=""; wfmt=""; url=""; proxy=""
+          out=""; wfmt=""; url=""; proxy=""; qflag=0
           while [ "$#" -gt 0 ]; do
             case "$1" in
+              -q) qflag=1; shift ;;
               -o) out="$2"; shift 2 ;;
               -w) wfmt="$2"; shift 2 ;;
               --proxy) proxy="$2"; shift 2 ;;
@@ -113,6 +114,8 @@ jobs:
           [ -n "$url" ] || exit 2
           url="${url%%\?*}"   # 忽略缓存破坏参数
           if [ -n "${SBX_TEST_REQUIRE_PROXY:-}" ] && [ -z "$proxy" ]; then exit 28; fi
+          # 模拟“~/.curlrc 里配了不可用代理”：没有 -q 一律失败
+          if [ -n "${SBX_TEST_FAIL_WITHOUT_Q:-}" ] && [ "$qflag" -eq 0 ]; then exit 28; fi
           delay=""; template=""
           while IFS=$'\t' read -r prefix delay template; do
             [ -n "$prefix" ] || continue
@@ -223,6 +226,11 @@ jobs:
           grep -q 'source=slow' "$RACE/work/stale/install/bin/sbx"
           grep -F '过期' "$RACE/work/stale/run.log"
 
+          # 5) ~/.curlrc 里配了不可用代理（没有 -q 就失败）时，安装器必须能自己兜底直连
+          run_case curlrc-dead "$RACE/m1.map" SBX_TEST_FAIL_WITHOUT_Q=1
+          grep -F '忽略 curl 配置' "$RACE/work/curlrc-dead/run.log"
+          test "$(tr -d '[:space:]' < "$RACE/work/curlrc-dead/install/VERSION")" = '9.9.9-fast'
+
       - name: Exercise launcher and updater source race
         run: |
           set -e
@@ -276,6 +284,12 @@ jobs:
           out="$(sudo env PATH="$RACE/fake-bin:$PATH" SBX_TEST_MAP="$RACE/m5.map" \
             SBX_TEST_FIXTURES="$RACE/fixtures" bash bin/sbx-install)"
           printf '%s\n' "$out" | grep -F 'WINNER=fresh'
+
+          # 代理配了但不可用：用 -q 忽略配置兜底
+          out="$(sudo env PATH="$RACE/fake-bin:$PATH" SBX_TEST_MAP="$RACE/m3.map" \
+            SBX_TEST_FIXTURES="$RACE/fixtures" SBX_TEST_FAIL_WITHOUT_Q=1 bash bin/sbx-install)"
+          printf '%s\n' "$out" | grep -F '忽略 curl 配置'
+          printf '%s\n' "$out" | grep -F 'WINNER=fast'
 
           # 版本号同样取最大：过期源(0.11.2)更快，但远端版本必须读成 0.11.4
           ver="$(sudo env PATH="$RACE/fake-bin:$PATH" SBX_TEST_MAP="$RACE/m5.map" \
@@ -999,6 +1013,7 @@ jobs:
           export SBX_DOCKER_PROXY_FILE="$SBX_DOCKER_DROPIN_DIR/99-singbox-manager-proxy.conf"
           export SBX_APT_PROXY_FILE="${{ github.workspace }}/.ci-apt/99singbox-manager-proxy"
           export SBX_GIT_PROXY_FILE="${{ github.workspace }}/.ci-git/git-proxy.conf"
+          export SBX_CURLRC_FILE="${{ github.workspace }}/.ci-home/.curlrc"
           export SBX_PROXY_NO_APPLY=1
           mkdir -p "$HOME_DIR" "$SBX_PROXY_STATE_DIR"
           cp .env.example "$ENV"
@@ -1014,6 +1029,31 @@ jobs:
           grep -F 'Acquire::https::Proxy "http://127.0.0.1:7890";' "$SBX_APT_PROXY_FILE"
           grep -F 'Environment="HTTPS_PROXY=http://127.0.0.1:7890"' "$SBX_DOCKER_PROXY_FILE"
           proxy_env | grep -F "export HTTPS_PROXY='http://127.0.0.1:7890'"
+
+          # curl：写 ~/.curlrc，且不能破坏用户自己的配置
+          printf 'user-agent = "keep-me"\n' > "$SBX_CURLRC_FILE"
+          proxy_curl_on
+          grep -F 'proxy = http://127.0.0.1:7890' "$SBX_CURLRC_FILE"
+          grep -F 'noproxy = localhost,127.0.0.1,::1' "$SBX_CURLRC_FILE"
+          grep -F 'user-agent = "keep-me"' "$SBX_CURLRC_FILE"
+          proxy_curl_on   # 幂等：重复开启不能堆叠
+          test "$(grep -c 'singbox-manager proxy' "$SBX_CURLRC_FILE")" -eq 2
+          proxy_status | grep -F 'curl'
+          # curl 真的会读这份配置：把代理指到一个必定连不上的本地端口（1），
+          # 报错里出现它才说明配置被读取（不依赖外网，结果确定）
+          cp "$SBX_CURLRC_FILE" /tmp/sbx-curlrc-backup
+          printf 'proxy = "http://127.0.0.1:1"\n' > "$SBX_CURLRC_FILE"
+          out="$(env HOME="$(dirname "$SBX_CURLRC_FILE")" curl -fsS --max-time 5 -o /dev/null https://example.com 2>&1 || true)"
+          case "$out" in
+            *"127.0.0.1 port 1"*|*"127.0.0.1:1"*) : ;;
+            *) echo "curl 没有读取 ~/.curlrc: $out" >&2; exit 1 ;;
+          esac
+          cp /tmp/sbx-curlrc-backup "$SBX_CURLRC_FILE"
+          proxy_curl_off
+          if grep -F 'singbox-manager proxy' "$SBX_CURLRC_FILE"; then
+            echo 'curl 关闭后仍残留 singbox-manager 配置块' >&2; exit 1
+          fi
+          grep -F 'user-agent = "keep-me"' "$SBX_CURLRC_FILE"
 
       - name: Validate generated config with sing-box
         env:

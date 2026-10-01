@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # singbox-manager v0.7 self-update integration.
 
-VERSION="0.11.5"
+VERSION="0.11.6"
 
 UPDATE_REPO="${SBX_UPDATE_REPO:-PaiMonCai/singbox-manager}"
 UPDATE_BRANCH="${SBX_UPDATE_BRANCH:-main}"
@@ -92,7 +92,7 @@ manager_collect_versions(){
   for ((i=0;i<n;i++)); do
     outs[i]="$dir/$i"
     (
-      curl -fsSL "$@" --connect-timeout 8 --max-time 20 \
+      curl "$@" -fsSL --connect-timeout 8 --max-time 20 \
         "$(manager_bust_url "${bases[$i]%/}/VERSION")" -o "${outs[$i]}"
     ) >/dev/null 2>&1 &
     pids[i]=$!
@@ -188,7 +188,7 @@ manager_race_fetch_once(){
   for ((i=0;i<n;i++)); do
     outs[i]="$dir/$i"
     (
-      curl -fsSL "$@" --connect-timeout 8 --max-time "$UPDATE_RACE_TIMEOUT" \
+      curl "$@" -fsSL --connect-timeout 8 --max-time "$UPDATE_RACE_TIMEOUT" \
         "${urls[$i]}" -o "${outs[$i]}.part" && mv -f "${outs[$i]}.part" "${outs[$i]}"
     ) >/dev/null 2>&1 &
     pids[i]=$!
@@ -222,7 +222,9 @@ manager_race_fetch_once(){
   return 0
 }
 
-# 直连抢速失败后，再走本机 sing-box 代理抢一次
+# 直连抢速失败后，再走本机 sing-box 代理抢一次；
+# 还不行就 -q 忽略 ~/.curlrc（用户按 sbx proxy curl on 配了代理但 sing-box 没运行时，
+# 不忽略配置会让更新完全走不动）。
 manager_race_fetch(){
   local mode="$1" dest="$2" rel="$3" out="" proxy=""
   if out="$(manager_race_fetch_once "$mode" "$dest" "$rel")"; then
@@ -232,6 +234,11 @@ manager_race_fetch(){
   proxy="$(manager_proxy_url)"
   warn "直连更新源失败，尝试通过本机 sing-box: $proxy"
   if out="$(manager_race_fetch_once "$mode" "$dest" "$rel" --proxy "$proxy")"; then
+    printf '%s\n' "$out"
+    return 0
+  fi
+  warn "仍失败，忽略 curl 配置（-q）再试一轮..."
+  if out="$(manager_race_fetch_once "$mode" "$dest" "$rel" -q)"; then
     printf '%s\n' "$out"
     return 0
   fi
