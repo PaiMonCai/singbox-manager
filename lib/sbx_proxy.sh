@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # singbox-manager v0.4 host application proxy integration.
 # Sourced after v0.3; overrides VERSION/menu/help/main and adds `sbx proxy`.
-VERSION="0.5.1"
+VERSION="0.5.2"
 
 PROXY_STATE_DIR="${SBX_PROXY_STATE_DIR:-$HOME_DIR/proxy-state}"
 DOCKER_DROPIN_DIR="${SBX_DOCKER_DROPIN_DIR:-/etc/systemd/system/docker.service.d}"
@@ -356,7 +356,7 @@ menu(){
     printf '%b' "$C"
     cat <<'EOF'
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-        singbox-manager 0.5.1
+        singbox-manager 0.5.2
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
  1 状态      2 启动      3 停止      4 重启
  5 日志      6 节点管理  7 导入      8 订阅管理

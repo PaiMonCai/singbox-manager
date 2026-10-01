@@ -35,6 +35,15 @@ jobs:
           cp config/config.example.json config/config.json
           docker compose -f compose.yml config >/dev/null
 
+      - name: Verify runtime loads only config.json
+        run: |
+          grep -F '      - -c' compose.yml
+          grep -F '      - /etc/sing-box/config.json' compose.yml
+          if grep -F '      - -C' compose.yml; then
+            echo "compose must not load the entire config directory" >&2
+            exit 1
+          fi
+
       - name: Generate managed config for all supported node types
         env:
           SBX_HOME: ${{ github.workspace }}/.ci-home

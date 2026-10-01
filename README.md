@@ -2,7 +2,7 @@
 
 面向 Linux 服务器的 sing-box Docker 管理层。sing-box 保持官方镜像运行，宿主机通过 `sbx` 完成安装、节点管理、配置生成、校验、测试、备份恢复与升级。
 
-当前版本：**0.5.1**
+当前版本：**0.5.2**
 
 ## 一键交互式安装
 
@@ -196,6 +196,30 @@ sbx route cn-direct-full
 
 
 
+
+
+## 0.5.2：修复重复 inbound tag
+
+修复运行容器使用 `-C /etc/sing-box/` 加载整个配置目录的问题。旧行为会同时读取：
+
+```text
+config.json
+config.example.json
+```
+
+两个文件都包含 `mixed-in`，因此会出现：
+
+```text
+FATAL unmarshal merged config: duplicate inbound tag: mixed-in
+```
+
+现在 Compose 明确只加载：
+
+```text
+-c /etc/sing-box/config.json
+```
+
+因此示例配置即使保留在目录中，也不会参与运行。
 
 ## 0.5.1：禁止运行期隐式拉镜像
 
