@@ -19,7 +19,16 @@ INBOUND_COMPOSE="$HOME_DIR/compose.inbounds.yml"
 NETWORK_COMPOSE="$HOME_DIR/compose.network.yml"
 DOCKER_MANAGED="$HOME_DIR/docker-managed.json"
 
-G='\033[32m'; Y='\033[33m'; R='\033[31m'; C='\033[36m'; N='\033[0m'; D='\033[2m'
+# 终端配色：按“黑色背景上也看得清”选色
+#   C 主色（菜单标题/区块标题）—— 原来是暗青 36，黑底偏暗，现在默认明绿 92
+#   G [INFO] 明绿 / Y [WARN] 明黄 / R [ERROR] 明红 / D 次要文字浅灰（原来纯 dim 偏暗）
+# SBX_COLOR_ACCENT 可换主色（例如 96 明青、1;36 加粗青）；NO_COLOR=1 或 SBX_NO_COLOR=1 关闭全部颜色
+if [[ -n "${NO_COLOR:-}" || "${SBX_NO_COLOR:-0}" == "1" ]]; then
+  G=''; Y=''; R=''; C=''; N=''; D=''
+else
+  G='\033[92m'; Y='\033[93m'; R='\033[91m'; D='\033[37m'; N='\033[0m'
+  C="\033[${SBX_COLOR_ACCENT:-92}m"
+fi
 info(){ printf '%b[INFO]%b %s\n' "$G" "$N" "$*"; }
 warn(){ printf '%b[WARN]%b %s\n' "$Y" "$N" "$*" >&2; }
 die(){ printf '%b[ERROR]%b %s\n' "$R" "$N" "$*" >&2; exit 1; }

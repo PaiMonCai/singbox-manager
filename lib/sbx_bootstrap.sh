@@ -134,7 +134,8 @@ bootstrap_load_tar() {
 
 bootstrap_menu() {
   # 颜色变量来自 bin/sbx；install.sh 直接 source 本文件时需要兜底。
-  local Y="${Y:-\033[33m}" C="${C:-\033[36m}" D="${D:-\033[2m}" N="${N:-\033[0m}"
+  # 兜底色与 bin/sbx 的主题一致：明绿主色 + 浅灰次要文字（黑底可读）
+  local Y="${Y:-\033[93m}" C="${C:-\033[92m}" D="${D:-\033[37m}" N="${N:-\033[0m}"
   local version="$1" env_file="$2" target choice proxy mirror tarfile
   target="$(bootstrap_target_image "$version" "$env_file")"
 

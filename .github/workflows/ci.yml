@@ -431,6 +431,55 @@ jobs:
           sudo chmod 644 /tmp/sbx-node-list2.txt
           grep -qE '^\* +2 +shadowsocks' /tmp/sbx-node-list2.txt
 
+      - name: Verify menu theme colors
+        run: |
+          set -e
+          # 黑底可读：主色明绿（原来暗青 36），信息/警告/错误的明色，且支持 NO_COLOR 关闭
+          grep -F 'SBX_COLOR_ACCENT' bin/sbx
+          if grep -F '\033[36m' bin/sbx; then echo '仍存在暗青 36 主色' >&2; exit 1; fi
+          grep -F "G='\033[92m'" bin/sbx
+          grep -F "Y='\033[93m'" bin/sbx
+          grep -F "R='\033[91m'" bin/sbx
+          grep -F "D='\033[37m'" bin/sbx
+          grep -F "C_INFO='\033[92m'" install.sh
+          grep -F 'NO_COLOR' install.sh
+
+          # 真跑一遍菜单：假 clear 避免 clear 自身的转义干扰断言
+          THEME_BIN=/tmp/sbx-theme-bin
+          mkdir -p "$THEME_BIN"
+          printf '#!/usr/bin/env bash\nexit 0\n' > "$THEME_BIN/clear"
+          chmod +x "$THEME_BIN/clear"
+
+          colored="$(printf '0\n' | sudo env -u NO_COLOR PATH="$THEME_BIN:$PATH" TERM=xterm \
+            SBX_HOME=/tmp/sbx-manager-only bash bin/sbx 2>&1 || true)"
+          printf '%s' "$colored" | grep -qF $'\033[92m'
+          if printf '%s' "$colored" | grep -qF $'\033[36m'; then
+            echo '菜单里仍有暗青 36' >&2; exit 1
+          fi
+
+          plain="$(printf '0\n' | sudo env NO_COLOR=1 PATH="$THEME_BIN:$PATH" TERM=xterm \
+            SBX_HOME=/tmp/sbx-manager-only bash bin/sbx 2>&1 || true)"
+          if printf '%s' "$plain" | grep -q $'\033\['; then
+            echo 'NO_COLOR=1 时仍有 ANSI 颜色' >&2; exit 1
+          fi
+          printf '%s' "$plain" | grep -F 'singbox-manager'
+
+          # 安装器同样：默认明绿，NO_COLOR 关闭
+          cp install.sh /tmp/sbx-theme-install.sh
+          theme_inst() {
+            env -u NO_COLOR PATH="$THEME_BIN:$PATH" TERM=xterm "$@" \
+              SBX_MANAGER_ONLY=1 SBX_NONINTERACTIVE=1 \
+              SBX_INSTALL_DIR=/tmp/sbx-manager-only \
+              SBX_BIN_LINK=/tmp/sbx-ci-bin/sbx SBX_INSTALLER_LINK=/tmp/sbx-ci-bin/sbx-install \
+              bash /tmp/sbx-theme-install.sh
+          }
+          theme_inst > /tmp/sbx-theme-install.log 2>&1
+          grep -qF $'\033[92m' /tmp/sbx-theme-install.log
+          theme_inst NO_COLOR=1 > /tmp/sbx-theme-install-plain.log 2>&1
+          if grep -q $'\033\[' /tmp/sbx-theme-install-plain.log; then
+            echo 'NO_COLOR=1 时安装器仍有 ANSI 颜色' >&2; exit 1
+          fi
+
       - name: Re-run installer reuses the existing config
         run: |
           rm -rf /tmp/sbx-reinstall /tmp/sbx-reinstall-bin

@@ -36,9 +36,15 @@ TMP_DIR=""
 SOURCE_DIR=""
 env_backup=""
 
-info() { printf '\033[32m[INFO]\033[0m %s\n' "$*"; }
-warn() { printf '\033[33m[WARN]\033[0m %s\n' "$*" >&2; }
-die() { printf '\033[31m[ERROR]\033[0m %s\n' "$*" >&2; exit 1; }
+# 终端配色：黑底可读优先（明绿/明黄/明红）；NO_COLOR=1 或 SBX_NO_COLOR=1 关闭
+if [[ -n "${NO_COLOR:-}" || "${SBX_NO_COLOR:-0}" == "1" ]]; then
+  C_INFO=''; C_WARN=''; C_ERR=''; C_OK=''; C_RST=''
+else
+  C_INFO='\033[92m'; C_WARN='\033[93m'; C_ERR='\033[91m'; C_OK='\033[92m'; C_RST='\033[0m'
+fi
+info() { printf '%b[INFO]%b %s\n' "$C_INFO" "$C_RST" "$*"; }
+warn() { printf '%b[WARN]%b %s\n' "$C_WARN" "$C_RST" "$*" >&2; }
+die() { printf '%b[ERROR]%b %s\n' "$C_ERR" "$C_RST" "$*" >&2; exit 1; }
 
 cleanup() {
   if [[ -n "$TMP_DIR" && -d "$TMP_DIR" ]]; then
@@ -808,7 +814,7 @@ install -m 0644 "$SOURCE_DIR/VERSION" "$INSTALL_DIR/VERSION"
 if [[ "$MANAGER_ONLY" == "1" ]]; then
   manager_version="$(tr -d '[:space:]' < "$INSTALL_DIR/VERSION" 2>/dev/null || true)"
   printf '\n'
-  printf '\033[32m管理器更新完成：%s\033[0m\n' "${manager_version:-unknown}"
+  printf '%b管理器更新完成：%s%b\n' "$C_OK" "${manager_version:-unknown}" "$C_RST"
   printf '  未修改 .env / nodes.json / config.json，也未重启 sing-box。\n'
   printf '  快速更新: sbx self-update\n'
   printf '  完整安装器: sbx-install\n'
@@ -895,7 +901,7 @@ if (( image_ready )); then
 fi
 
 printf '\n'
-printf '\033[32m安装完成。\033[0m\n'
+printf '%b安装完成。%b\n' "$C_OK" "$C_RST"
 if (( UPGRADE )); then
   printf '  就地更新：沿用现有 .env 的版本/监听/端口，未做任何重新询问（需要改这些值: SBX_RECONFIGURE=1 bash install.sh）\n'
 fi
