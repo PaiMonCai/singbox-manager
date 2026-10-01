@@ -15,8 +15,8 @@ curl -fsSL https://raw.githubusercontent.com/PaiMonCai/singbox-manager/main/inst
 安装器会交互询问：
 
 - sing-box 版本
-- 本地监听地址
-- mixed HTTP/SOCKS5 端口
+- 本地监听地址（必须是 IPv4/IPv6 地址，例如 `127.0.0.1`）
+- mixed HTTP/SOCKS5 端口（1–65535）
 - Docker 未安装时是否自动安装
 - 是否立即拉取镜像
 - 是否立即添加第一个代理节点
@@ -34,7 +34,19 @@ curl -fsSL https://raw.githubusercontent.com/PaiMonCai/singbox-manager/main/inst
 /usr/local/bin/sbx
 ```
 
-已有安装再次运行安装器时，会更新管理器文件，同时保留本机 `.env`、节点库和运行配置。
+已有安装再次运行安装器时，会更新管理器文件，同时保留本机 `.env`、节点库和运行配置（包括自定义的 `SING_BOX_CONTAINER_NAME`，不会被重置回 `sing-box`）。
+
+### 安装时的输入校验
+
+- 监听地址必须是 IPv4/IPv6 地址字面量（`127.0.0.1`、`::1` 等），端口必须是 1–65535 的整数；非法值会立即报错，而不是写进 `.env`、等到 `sbx start` 时才由 Docker 报错。
+- 使用 `0.0.0.0` 或 `::` 会把代理端口暴露到所有网卡，安装器会给出安全警告。
+- 非交互模式（`SBX_NONINTERACTIVE=1`；`SBX_MANAGER_ONLY=1` 会自动隐含）下无法重新输入，因此 `.env` 中的非法端口或监听地址会**直接失败并提示修正**，不会停在提示符上等待输入。
+
+### 安装失败时会做什么
+
+- 写入新 `.env` 之前会先备份：若随后的节点库校验失败（例如 `nodes.json` 含当前版本不支持的协议），会**回滚 `.env`**、保留已装好的管理器文件，以非零状态退出并提示先修复 `nodes/nodes.json`。
+- `VERSION` 文件在最后一步写入，因此“`VERSION` 已是新值”可以认为管理器文件已经装全。
+- 只更新管理器的流程（`sbx manager update`）不再询问、也不再校验 sing-box 版本与端口，因此 `.env` 里即使是 `SING_BOX_VERSION=latest` 也不会阻塞管理器更新。
 
 ## 节点管理
 
@@ -75,6 +87,8 @@ VLESS 支持 TLS、Reality，以及 TCP / WebSocket / gRPC / HTTPUpgrade 传输�
 
 该文件以及实际生成的 `config/config.json` 都被 `.gitignore` 排除。
 
+节点名称在当前节点库内必须唯一：新增/编辑时会拒绝重名，因为重名会让 `edit`、`delete`、`default`、`show`、`test` 这些按名称的操作无法确定目标。确实需要同名时，请改用 8 位节点 ID 操作。
+
 ## 配置生成与回滚
 
 节点操作采用事务式流程：
@@ -93,6 +107,10 @@ sing-box check
 ```
 
 默认节点会成为 sing-box 的最终出站；没有节点时默认走 direct。
+
+所有会改写节点库的命令（`add` / `edit` / `delete` / `default` / `render` / 导入 / 订阅 / 入口 / 策略等）在改写期间对节点库加锁，只读命令不受影响。两个终端（或脚本与交互界面）同时操作不会互相覆盖；等待超时会明确提示“节点库正被其它进程占用，请稍后重试”。锁文件是 `nodes/.sbx-nodes.lock`，仅用于加锁，可以随时删除。
+
+落盘顺序是「先渲染 `config.json`，成功后才写入 `nodes.json`」，所以生成失败不会留下“节点库已改、配置没跟上”的不一致状态；删除最后一个节点时，指向 `proxy`/`auto` 的入口会自动回退为 `direct`，保证节点库始终可校验。
 
 ## 单节点真实测试
 
@@ -270,13 +288,21 @@ Docker Watcher 是否运行
 sbx docker-network verify-all
 ```
 
-默认使用快速模式检查所有正在运行的托管目标，不对每个容器重复请求外部 IP 服务。
-
-如果需要单个容器的真实出口测试，使用：
+默认对每个正在运行的托管容器做真实出口探测，与单容器命令一致：
 
 ```bash
 sbx docker-network verify <container>
 ```
+
+只想做结构检查、不重复请求外部 IP 服务时，显式使用快速模式：
+
+```bash
+sbx docker-network verify-all --quick
+```
+
+如果托管状态**无法查询**（例如缺少 `lib/sbx_docker_targets.py`、托管清单损坏），`verify-all` 与 `sbx doctor` 会失败并打印具体原因，而不是报“没有托管目标”后返回成功——不要把这类情况当成健康。
+
+另外，托管目标引用的入口被删除后不会再静默：`sbx docker-network managed` 会把这些行标成 `MISSING` 并汇总提示，`sbx docker-network sync` 在共享网络已关闭时会直接跳过并说明原因。
 
 ### 如何理解结果
 
@@ -465,6 +491,8 @@ singbox-manager-docker-watch.service
 ```
 
 watcher 监听 Docker 容器 `create` 和 `start` 事件。发现容器变化后执行幂等同步，把匹配的托管目标重新接入 `singbox-proxy`。
+
+Docker daemon 重启（例如开启 Docker 代理时会重启 Docker）导致事件流中断时，watcher 不会退出，而是等待重试后重新订阅事件；如果 `SBX_WATCH_SBX` 指向的 `sbx` 不可执行，会在日志里持续报错，而不是静默空转。systemd 单元名取自实际写入的服务文件路径，所以用 `SBX_DOCKER_WATCH_SERVICE` 覆盖路径时 `systemctl` 也会操作对应的单元。
 
 手工管理：
 
@@ -675,6 +703,28 @@ sbx manager check
 sbx manager update --force
 ```
 
+更新时会检查安装器退出码，并在更新后确认 `bin/sbx`、`lib/*`、`VERSION` 等关键文件存在且非空，因此“`VERSION` 已更新、代码没装全”不会再被报告成成功。
+
+### 固定更新源与校验更新内容
+
+```text
+SBX_UPDATE_REPO        仓库，例如 your-name/singbox-manager
+SBX_UPDATE_BRANCH      分支或 tag，默认 main
+SBX_UPDATE_BASE_URL    直接指定 raw 根地址（镜像 / CDN）
+SBX_UPDATE_SHA256      校验 install.sh 的 sha256，不匹配则拒绝执行
+```
+
+例如把更新源固定到自己的 tag 并校验安装器内容：
+
+```bash
+SBX_UPDATE_REPO=your-name/singbox-manager \
+SBX_UPDATE_BRANCH=v0.11.0 \
+SBX_UPDATE_SHA256=<install.sh 的 sha256> \
+sbx manager update
+```
+
+默认更新源是可变的 `main` 分支，且拉取到的 `install.sh` 会以 root 执行。需要长期无人值守的自动更新时，建议用上面的变量把来源固定到自己的 tag 或镜像，并设置 `SBX_UPDATE_SHA256` 校验内容。
+
 ### 最新安装器快捷入口
 
 首次升级到 0.7 后会安装：
@@ -758,6 +808,8 @@ sbx inbound delete [ID|名称]
 sbx inbound show [ID|名称]
 sbx inbound test [ID|名称]
 ```
+
+入口名称不能重复，也不能是 `default`：内置的默认入口占用了这个名称和 ID，自定义入口再叫 `default` 会让按名称解析产生歧义。
 
 每个入口当前使用 `mixed` 协议，同时提供 HTTP 和 SOCKS 代理能力。出口可以选择：
 
@@ -1152,7 +1204,8 @@ export HTTPS_PROXY=http://127.0.0.1:7890
 ├── lib/
 │   └── sbx_nodes.py
 ├── nodes/
-│   └── nodes.json
+│   ├── nodes.json
+│   └── .sbx-nodes.lock       # 节点库写锁（flock，仅加锁用，可删除）
 ├── config/
 │   └── config.json
 ├── data/
@@ -1165,6 +1218,8 @@ export HTTPS_PROXY=http://127.0.0.1:7890
 - 不要把生产节点密码、UUID、Reality Key 或完整 `nodes.json` 提交到 Git。
 - `sbx node show` 默认对敏感字段做脱敏显示。
 - 升级 sing-box 前会先备份并用目标版本检查现有配置，失败时回滚版本设置。
+- 管理器自更新默认从可变的 `main` 分支拉取并以 root 执行；无人值守场景请用 `SBX_UPDATE_BRANCH` 固定到 tag，并设置 `SBX_UPDATE_SHA256` 校验。
+- Docker daemon 代理、Git/APT/npm 系统代理都会写入宿主机全局配置；关闭时请使用对应的 `sbx proxy ... off`，不要只手工删文件（会留下引用已删除配置的残留）。
 
 ## Roadmap
 
