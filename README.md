@@ -2,7 +2,7 @@
 
 面向 Linux 服务器的 sing-box Docker 管理层。sing-box 保持官方镜像运行，宿主机通过 `sbx` 完成安装、节点管理、配置生成、校验、测试、备份恢复与升级。
 
-当前版本：**0.3.0**
+当前版本：**0.4.0**
 
 ## 一键交互式安装
 
@@ -194,6 +194,111 @@ sbx route cn-direct-full
 
 升级到 0.3 后不会自动改变原有流量策略：旧节点库会迁移到新格式，但默认保持 `manual + global`，需要你主动开启 `auto` 或国内直连模式。
 
+
+## 宿主机应用代理
+
+0.4 增加了 Docker、Git、APT、npm 的一键代理接入。所有集成都指向 sing-box 的本地 mixed 端口，默认是：
+
+```text
+http://127.0.0.1:7890
+```
+
+进入交互菜单：
+
+```bash
+sbx proxy
+```
+
+直接命令：
+
+```bash
+sbx proxy status
+
+sbx proxy docker on
+sbx proxy docker off
+
+sbx proxy git on
+sbx proxy git off
+
+sbx proxy apt on
+sbx proxy apt off
+
+sbx proxy npm on
+sbx proxy npm off
+
+sbx proxy all on
+sbx proxy all off
+```
+
+临时给当前 Shell 设置代理环境变量：
+
+```bash
+eval "$(sbx proxy env)"
+```
+
+取消：
+
+```bash
+eval "$(sbx proxy env off)"
+```
+
+### Docker
+
+Docker 使用独立 systemd drop-in：
+
+```text
+/etc/systemd/system/docker.service.d/99-singbox-manager-proxy.conf
+```
+
+开启/关闭 Docker daemon 代理需要重启 Docker 服务，因此运行中的容器可能短暂中断。管理器会等待 Docker daemon 恢复，并重新确保 sing-box 容器处于启动状态。
+
+当前自动配置针对普通 rootful + systemd Docker。检测到 rootless Docker 时不会擅自修改用户级 systemd 配置。
+
+如果 `/etc/docker/daemon.json` 已显式配置 `proxies`，管理器会给出警告，因为 Docker daemon 配置文件的代理设置优先于 systemd 环境变量。
+
+### Git
+
+Git 使用一个独立的系统级 include 文件：
+
+```text
+/etc/singbox-manager/git-proxy.conf
+```
+
+只向系统 Git 配置增加该 include；关闭时删除自己的 include，不直接覆盖已有 Git 用户配置。
+
+### APT
+
+APT 使用：
+
+```text
+/etc/apt/apt.conf.d/99singbox-manager-proxy
+```
+
+关闭时仅删除这个文件。
+
+### npm
+
+npm 在其 `globalconfig` 中维护一段带 singbox-manager 标记的配置块，只删除和重写自己的区块。已有 npm 配置文件的权限不会被主动放宽。
+
+### 推荐用法
+
+国内服务器配置好节点并确认：
+
+```bash
+sbx test
+```
+
+之后可以：
+
+```bash
+sbx strategy auto
+sbx route cn-direct-lite
+sbx proxy all on
+sbx proxy status
+```
+
+这样 Docker 拉镜像、Git、APT 与 npm 都会统一经过本机 sing-box。
+
 ## 常用命令
 
 ```bash
@@ -255,7 +360,7 @@ export HTTPS_PROXY=http://127.0.0.1:7890
 
 下一层计划：
 
-- Docker / APT / Git / npm 一键代理
 - 订阅定时更新与健康检查
+- Docker build / 容器级代理模板
 - 更丰富的路由规则管理
 - TUN / 透明代理

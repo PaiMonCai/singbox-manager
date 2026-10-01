@@ -18,6 +18,7 @@ jobs:
           bash -n install.sh
           bash -n bin/sbx
           bash -n lib/sbx_v3.sh
+          bash -n lib/sbx_proxy.sh
 
       - name: Python syntax
         run: python -m py_compile lib/sbx_nodes.py
@@ -119,6 +120,31 @@ jobs:
           python lib/sbx_nodes.py validate
           python lib/sbx_nodes.py render
           python -m json.tool "$SBX_HOME/config/config.json" >/dev/null
+
+      - name: Exercise host proxy config generation
+        run: |
+          export HOME_DIR="${{ github.workspace }}/.ci-home"
+          export ENV="${{ github.workspace }}/.ci-proxy.env"
+          export SBX_PROXY_STATE_DIR="${{ github.workspace }}/.ci-proxy-state"
+          export SBX_DOCKER_DROPIN_DIR="${{ github.workspace }}/.ci-systemd"
+          export SBX_DOCKER_PROXY_FILE="$SBX_DOCKER_DROPIN_DIR/99-singbox-manager-proxy.conf"
+          export SBX_APT_PROXY_FILE="${{ github.workspace }}/.ci-apt/99singbox-manager-proxy"
+          export SBX_GIT_PROXY_FILE="${{ github.workspace }}/.ci-git/git-proxy.conf"
+          export SBX_PROXY_NO_APPLY=1
+          mkdir -p "$HOME_DIR" "$SBX_PROXY_STATE_DIR"
+          cp .env.example "$ENV"
+          envval() { grep -E "^$1=" "$ENV" | tail -n1 | cut -d= -f2- || printf '%s' "$2"; }
+          running() { return 0; }
+          dc() { return 0; }
+          info() { :; }
+          warn() { :; }
+          die() { printf 'ERROR: %s\n' "$*" >&2; return 1; }
+          source lib/sbx_proxy.sh
+          proxy_apt_on
+          proxy_docker_on
+          grep -F 'Acquire::https::Proxy "http://127.0.0.1:7890";' "$SBX_APT_PROXY_FILE"
+          grep -F 'Environment="HTTPS_PROXY=http://127.0.0.1:7890"' "$SBX_DOCKER_PROXY_FILE"
+          proxy_env | grep -F "export HTTPS_PROXY='http://127.0.0.1:7890'"
 
       - name: Validate generated config with sing-box
         env:
