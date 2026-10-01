@@ -186,7 +186,8 @@ urltest(){
 node(){
   local op="${1:-menu}" ref="${2:-}"
   case "$op" in
-    list|ls) python3 "$HELPER" list ;;
+    # 序号是交互层主入口；--ids 等额外参数原样透传给 helper
+    list|ls) shift || true; python3 "$HELPER" list "$@" ;;
     add|edit|delete|del|rm|default|use)
       case "$op" in del|rm) op=delete;; use) op=default;; esac
       node_tx "$op" "$ref"

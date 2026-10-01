@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # singbox-manager v0.7 self-update integration.
 
-VERSION="0.11.3"
+VERSION="0.11.4"
 
 UPDATE_REPO="${SBX_UPDATE_REPO:-PaiMonCai/singbox-manager}"
 UPDATE_BRANCH="${SBX_UPDATE_BRANCH:-main}"
@@ -505,7 +505,10 @@ EOF
 help(){
   cat <<'EOF'
 sbx                                  交互菜单
-sbx node                             节点管理
+sbx node                             节点管理（列表里的序号就是操作时填的值）
+sbx node list [--ids]                节点列表；--ids 才显示内部 ID
+sbx node edit|delete|default|show|test <序号|名称>
+                                     按序号操作节点，例如 sbx node test 2
 sbx reapply                          按现有节点库重新生成配置并重启 sing-box
 sbx inbound                          多入口 -> 出口路由管理
 sbx import uri|file                  分享链接 / 文件导入

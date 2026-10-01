@@ -10,6 +10,7 @@ import re
 import secrets
 import sys
 import time
+import unicodedata
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 from urllib.parse import parse_qs, unquote, urlsplit
@@ -344,7 +345,8 @@ def target_label(data: Dict[str, Any], target: Any) -> str:
         return str(typ or "INVALID")
     node_id = target.get("node_id")
     node = next((n for n in data.get("nodes", []) if n.get("id") == node_id), None)
-    return f"{node.get('name')} ({node_id})" if node else f"MISSING ({node_id})"
+    # 正常情况下只显示名称（ID 是内部标识）；节点已不存在时才带上 ID 方便排查
+    return str(node.get("name")) if node else f"MISSING ({node_id})"
 
 
 def choose_target(data: Dict[str, Any], current: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
@@ -354,7 +356,7 @@ def choose_target(data: Dict[str, Any], current: Optional[Dict[str, Any]] = None
     print("  3. direct 直连")
     base = 4
     for idx, node in enumerate(data.get("nodes", []), base):
-        print(f"  {idx}. {node.get('name')} [{node.get('id')}]")
+        print(f"  {idx}. {node.get('name')}")
     default = "1"
     if isinstance(current, dict):
         typ = current.get("type")
@@ -483,16 +485,33 @@ def repair_inbound_targets(data: Dict[str, Any], removed_ids: Iterable[str],
     return changed
 
 
+def is_node_index(ref: str) -> bool:
+    # 只认 ASCII 数字：交互层用序号，持久层仍然是 8 位节点 ID
+    return bool(ref) and all(ch in "0123456789" for ch in ref)
+
+
 def resolve_node(data: Dict[str, Any], ref: Optional[str]) -> Dict[str, Any]:
+    """按序号 / 名称 / 节点 ID 解析节点。
+
+    顺序很重要：先做完整 ID 匹配，再当序号解释。
+    这样 8 位十六进制 ID 恰好全是数字时（例如 11111111）仍可按 ID 使用，
+    而 "1"/"2" 这种不会出现在生成的 ID 里的输入自然落到序号分支。
+    """
     nodes = data["nodes"]
     if not nodes:
         raise ValueError("当前没有节点")
     if not ref:
         list_nodes(data)
-        ref = prompt("请输入节点 ID 或名称", required=True)
+        ref = prompt("请输入节点序号（也可输入名称）", required=True)
+    ref = ref.strip()
     exact = [n for n in nodes if n.get("id") == ref]
     if len(exact) == 1:
         return exact[0]
+    if is_node_index(ref):
+        idx = int(ref)
+        if not (1 <= idx <= len(nodes)):
+            raise ValueError(f"节点序号超出范围: {ref}（当前 1-{len(nodes)}）")
+        return nodes[idx - 1]
     prefix = [n for n in nodes if str(n.get("id", "")).startswith(ref)]
     if len(prefix) == 1:
         return prefix[0]
@@ -500,8 +519,9 @@ def resolve_node(data: Dict[str, Any], ref: Optional[str]) -> Dict[str, Any]:
     if len(named) == 1:
         return named[0]
     if len(prefix) > 1 or len(named) > 1:
-        raise ValueError("匹配到多个节点，请使用完整 ID")
-    raise ValueError(f"未找到节点: {ref}")
+        raise ValueError("匹配到多个节点，请改用序号（见 sbx node list）")
+    raise ValueError(f"未找到节点: {ref}（可用序号 1-{len(nodes)}，或用 sbx node list 查看）")
+
 
 
 def resolve_subscription(data: Dict[str, Any], ref: Optional[str]) -> Dict[str, Any]:
@@ -782,7 +802,7 @@ def ensure_unique_node_name(data: Dict[str, Any], node: Dict[str, Any], ignore_i
         if other.get("id") == skip:
             continue
         if str(other.get("name") or "").strip() == name:
-            raise ValueError(f"节点名称重复: {name}（请换一个名称，或改用节点 ID 操作）")
+            raise ValueError(f"节点名称重复: {name}（请换一个名称；确实要同名时用序号操作，例如 sbx node edit 2）")
 
 
 def add_imported_nodes(data: Dict[str, Any], nodes: List[Dict[str, Any]], source: str = "import", replace_ids: Optional[List[str]] = None) -> List[str]:
@@ -891,14 +911,37 @@ def render(data: Optional[Dict[str, Any]] = None, target: Optional[Path] = None,
         render_inbound_compose(data)
 
 
-def list_nodes(data: Optional[Dict[str, Any]] = None) -> None:
+def disp_width(text: Any) -> int:
+    """终端显示宽度：CJK 全角字符按 2 列计算。"""
+    return sum(2 if unicodedata.east_asian_width(ch) in ("W", "F") else 1 for ch in str(text))
+
+
+def pad_cell(text: Any, width: int) -> str:
+    s = str(text)
+    return s + " " * max(0, width - disp_width(s))
+
+
+def clip_cell(text: Any, width: int) -> str:
+    out = ""; used = 0
+    for ch in str(text):
+        w = 2 if unicodedata.east_asian_width(ch) in ("W", "F") else 1
+        if used + w > width: break
+        out += ch; used += w
+    return out
+
+
+def list_nodes(data: Optional[Dict[str, Any]] = None, show_id: bool = False) -> None:
+    """节点列表。默认只显示交互用的序号，ID 是内部唯一标识（--ids 才显示）。"""
     data = data or load_registry(); nodes = data["nodes"]
     if not nodes: print("暂无节点。"); return
-    print(f"{'默认':<4} {'ID':<10} {'协议':<12} {'名称':<22} {'来源':<14} 地址")
-    print("-" * 96)
-    for n in nodes:
+    id_head = pad_cell("ID", 10) if show_id else ""
+    print(f"{pad_cell('默认', 6)}{pad_cell('序号', 6)}{id_head}{pad_cell('协议', 14)}{pad_cell('名称', 22)}{pad_cell('来源', 16)}地址")
+    print("-" * (106 if show_id else 96))
+    for i, n in enumerate(nodes, 1):
         mark = "*" if n.get("id") == data.get("default") else ""; src = str(n.get("source", "manual"))
-        print(f"{mark:<4} {n.get('id',''):<10} {n.get('type',''):<12} {n.get('name','')[:20]:<22} {src[:12]:<14} {n.get('server')}:{n.get('server_port')}")
+        id_cell = pad_cell(n.get("id", ""), 10) if show_id else ""
+        name = pad_cell(clip_cell(n.get("name", ""), 20), 22)
+        print(f"{pad_cell(mark, 6)}{pad_cell(i, 6)}{id_cell}{pad_cell(n.get('type', ''), 14)}{name}{pad_cell(src[:12], 16)}{n.get('server')}:{n.get('server_port')}")
 
 
 def list_inbounds(data: Optional[Dict[str, Any]] = None, include_default: bool = True) -> None:
@@ -980,11 +1023,11 @@ def validate(data: Optional[Dict[str, Any]] = None) -> None:
 
 def cmd_init(_: argparse.Namespace) -> int:
     data = load_registry(); render(data); save_registry(data); return 0
-def cmd_list(_: argparse.Namespace) -> int: list_nodes(); return 0
+def cmd_list(args: argparse.Namespace) -> int: list_nodes(show_id=bool(getattr(args, "ids", False))); return 0
 def cmd_add(_: argparse.Namespace) -> int:
     data = load_registry(); node = build_node(); ensure_unique_node_name(data, node); node["id"] = new_id(data["nodes"]); data["nodes"].append(node)
     if not data.get("default"): data["default"] = node["id"]
-    render(data); save_registry(data); print(f"已添加节点：{node['name']} ({node['id']})"); return 0
+    render(data); save_registry(data); print(f"已添加节点：{node['name']}（序号 {len(data['nodes'])}）"); return 0
 def cmd_edit(args: argparse.Namespace) -> int:
     data = load_registry(); old = resolve_node(data, args.ref); node = build_node(old); ensure_unique_node_name(data, node, old.get("id")); node["id"] = old["id"]; data["nodes"][data["nodes"].index(old)] = node; render(data); save_registry(data); print("节点已更新。"); return 0
 def cmd_delete(args: argparse.Namespace) -> int:
@@ -1004,7 +1047,7 @@ def cmd_test_config(args: argparse.Namespace) -> int:
     data = load_registry(); atomic_json(Path(args.output), make_config(data, args.port, resolve_node(data, args.ref)), 0o600); return 0
 def cmd_validate(_: argparse.Namespace) -> int: validate(); print("OK"); return 0
 def cmd_import_uri(args: argparse.Namespace) -> int:
-    uri = args.uri or prompt_secret("粘贴分享链接", required=True); data = load_registry(); node = parse_uri(uri); ids = add_imported_nodes(data, [node], "import-uri"); render(data); save_registry(data); print(f"导入成功: {data['nodes'][-1]['name']} ({ids[0]})"); return 0
+    uri = args.uri or prompt_secret("粘贴分享链接", required=True); data = load_registry(); node = parse_uri(uri); ids = add_imported_nodes(data, [node], "import-uri"); render(data); save_registry(data); print(f"导入成功: {data['nodes'][-1]['name']}（序号 {len(data['nodes'])}）"); return 0
 def cmd_import_file(args: argparse.Namespace) -> int:
     text = Path(args.file).read_text(encoding="utf-8", errors="replace"); nodes, errors = parse_subscription(text)
     if not nodes: raise ValueError("没有解析到支持的节点" + (("；" + errors[0]) if errors else ""))
@@ -1140,7 +1183,8 @@ def cmd_sub_get(args: argparse.Namespace) -> int:
 
 def parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description="singbox-manager helper"); sub = p.add_subparsers(dest="cmd", required=True)
-    sub.add_parser("init").set_defaults(func=cmd_init); sub.add_parser("list").set_defaults(func=cmd_list); sub.add_parser("add").set_defaults(func=cmd_add)
+    l=sub.add_parser("list"); l.add_argument("--ids", action="store_true", help="额外显示内部节点 ID")
+    sub.add_parser("init").set_defaults(func=cmd_init); l.set_defaults(func=cmd_list); sub.add_parser("add").set_defaults(func=cmd_add)
     e=sub.add_parser("edit"); e.add_argument("ref", nargs="?"); e.set_defaults(func=cmd_edit)
     d=sub.add_parser("delete"); d.add_argument("ref", nargs="?"); d.add_argument("--yes", action="store_true"); d.set_defaults(func=cmd_delete)
     df=sub.add_parser("default"); df.add_argument("ref", nargs="?"); df.set_defaults(func=cmd_default)

@@ -1,6 +1,7 @@
 .env
 config/config.json
 nodes/nodes.json
+nodes/.sbx-nodes.lock
 data/*
 backup/*
 *.tar.gz
@@ -17,6 +18,7 @@ compose.network.yml
 docker-managed.json
 
 # 本地手工跑 CI 步骤时生成的临时目录
+.ci-home/
 .ci-update-src/
 .ci-version-home/
 .ci-systemd/

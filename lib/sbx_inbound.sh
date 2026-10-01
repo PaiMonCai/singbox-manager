@@ -93,9 +93,10 @@ sbx inbound test [ID|名称]        测试该入口的真实代理
 
 高级非交互参数：
 sbx inbound add --name NAME --listen 127.0.0.1 --port 7891 --target proxy
-sbx inbound add --name HK --listen 127.0.0.1 --port 7892 --target node:<节点ID>
+sbx inbound add --name HK --listen 127.0.0.1 --port 7892 --target node:2
 
-target 支持：direct / proxy / auto / node:<节点ID或名称>
+target 支持：direct / proxy / auto / node:<节点序号|名称>
+（节点序号来自 sbx node list，按节点库顺序从 1 开始）
 EOF
       ;;
     *) die "未知 inbound 命令: $op" ;;

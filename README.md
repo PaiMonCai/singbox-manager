@@ -2,7 +2,7 @@
 
 面向 Linux 服务器的 sing-box Docker 管理层。sing-box 保持官方镜像运行，宿主机通过 `sbx` 完成安装、节点管理、配置生成、校验、测试、备份恢复与升级。
 
-当前版本：**0.11.3**
+当前版本：**0.11.4**
 
 ## 一键交互式安装
 
@@ -85,15 +85,32 @@ sbx node
 也可直接使用：
 
 ```bash
-sbx node list
+sbx node list            # 只看列表（默认不显示内部 ID）
+sbx node list --ids      # 需要排障/写脚本时，额外显示内部 ID
 sbx node add
-sbx node edit [ID|名称]
-sbx node delete [ID|名称]
-sbx node default [ID|名称]
-sbx node show [ID|名称]
-sbx node test [ID|名称]
+sbx node edit <序号>
+sbx node delete <序号>
+sbx node default <序号>
+sbx node show <序号>
+sbx node test <序号>
 sbx node render
 ```
+
+列表里的第一列就是操作时要填的序号（节点库顺序，从 1 开始）：
+
+```text
+默认  序号   协议          名称                    来源          地址
+------------------------------------------------------------------------------------------------
+      1      vless         美国【优化|×3】          import-uri    38.47.116.141:32242
+*     2      shadowsocks   香港【ix|×4】            import-uri    5434se.viaspeed.shop:27644
+```
+
+```bash
+sbx node test 2          # 测试第 2 个节点（就是上面标记 * 的默认节点）
+             # 直接回车则先打印列表，再输入序号选择
+```
+
+交互层用序号，持久层仍然是 8 位节点 ID：序号只是"当前这份节点库里的第几个"，导入/删除节点后序号会跟着变化；节点 ID 只作为内部唯一标识保存（`sbx node list --ids` 或 `sbx node show <序号>` 可见），用于入口绑定、订阅迁移和 `docker-managed.json`。按名称操作仍然可用，脚本里继续传 ID 也不会失效。
 
 当前交互式节点类型：
 
@@ -113,7 +130,7 @@ VLESS 支持 TLS、Reality，以及 TCP / WebSocket / gRPC / HTTPUpgrade 传输�
 
 该文件以及实际生成的 `config/config.json` 都被 `.gitignore` 排除。
 
-节点名称在当前节点库内必须唯一：新增/编辑时会拒绝重名，因为重名会让 `edit`、`delete`、`default`、`show`、`test` 这些按名称的操作无法确定目标。确实需要同名时，请改用 8 位节点 ID 操作。
+节点名称在当前节点库内必须唯一：新增/编辑时会拒绝重名，因为重名会让按名称的操作无法确定目标。确实需要同名时，请改用序号操作（`sbx node edit 2`）。
 
 ## 配置生成与回滚
 
@@ -251,6 +268,45 @@ sbx route cn-direct-full
 
 
 
+
+## 0.11.4：节点改用序号操作，ID 退到内部
+
+节点操作不再要求你记 8 位 ID，也不需要先复制 ID 再粘贴：
+
+```text
+默认  序号   协议          名称                    来源          地址
+------------------------------------------------------------------------------------------------
+      1      vless         美国【优化|×3】          import-uri    38.47.116.141:32242
+*     2      shadowsocks   香港【ix|×4】            import-uri    5434se.viaspeed.shop:27644
+```
+
+`sbx node` 菜单里 编辑 / 删除 / 默认 / 详情 / 测试 都只问序号（直接回车会先打印列表再让你输序号）：
+
+```text
+序号(留空可列表选择): 2
+```
+
+CLI 同样收序号：
+
+```bash
+sbx node test 2
+sbx node default 1
+sbx node delete 3
+```
+
+层次划分和 [0.10.1 的入口序号](#0101代理入口改为序号选择)保持一致：
+
+```text
+交互层：序号（1..N，节点库顺序）
+持久层：节点 ID（8 位，仅内部使用）
+```
+
+- `sbx node list` 默认不再显示 ID；需要排障或写脚本时用 `sbx node list --ids`。
+- 入口出口选择（`sbx inbound`）、`target node:<...>` 也改成按序号或名称，例如 `--target node:2`。
+- 添加/导入的提示从 `（ID）` 改为 `（序号 N）`。
+- 按名称/ID 的老用法仍然兼容：`sbx node test 香港【ix|×4】`、脚本里传 ID 都还能用；重名节点改用序号即可。
+- 解析顺序是 **完整 ID → 序号 → ID 前缀 → 名称**，所以 8 位全数字的节点 ID（例如 `11111111`）不会被误当成序号；反之 `1`/`2` 这种不会出现在生成的 ID 里的输入按序号解释。
+- 序号会随导入/删除变化，跨时间引用请用名称；入口绑定、订阅迁移、`docker-managed.json` 里保存的始终是节点 ID，不受序号变化影响。
 
 ## 0.11.3：安装源并发测速，自动选最快
 
