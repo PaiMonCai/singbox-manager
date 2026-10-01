@@ -157,6 +157,7 @@ main(){ root "$@"; ready; local cmd="${1:-menu}"; shift||true; case "$cmd" in me
 [[ -f "$HOME_DIR/lib/sbx_bootstrap.sh" ]] && source "$HOME_DIR/lib/sbx_bootstrap.sh"
 [[ -f "$HOME_DIR/lib/sbx_image.sh" ]] && source "$HOME_DIR/lib/sbx_image.sh"
 [[ -f "$HOME_DIR/lib/sbx_inbound.sh" ]] && source "$HOME_DIR/lib/sbx_inbound.sh"
+[[ -f "$HOME_DIR/lib/sbx_update.sh" ]] && source "$HOME_DIR/lib/sbx_update.sh"
 if [[ "${1:-}" == "image" ]]; then
   root "$@"
   ready

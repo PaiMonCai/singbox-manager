@@ -22,6 +22,8 @@ jobs:
           bash -n lib/sbx_bootstrap.sh
           bash -n lib/sbx_image.sh
           bash -n lib/sbx_inbound.sh
+          bash -n lib/sbx_update.sh
+          bash -n bin/sbx-install
 
       - name: Python syntax
         run: python -m py_compile lib/sbx_nodes.py
@@ -32,8 +34,66 @@ jobs:
           grep -F 'raw.githubusercontent.com' install.sh
           grep -F 'raw 源不可用，回退 GitHub archive' install.sh
           grep -F 'lib/sbx_inbound.sh' install.sh
+          grep -F 'lib/sbx_update.sh' install.sh
+          grep -F 'bin/sbx-install' install.sh
+          grep -F 'VERSION' install.sh
           awk '/get_source\(\)/,/read_env_value\(\)/' install.sh | grep -F 'SOURCE_BASE_URL'
           awk '/get_source\(\)/,/read_env_value\(\)/' install.sh | grep -F 'ARCHIVE_URL'
+
+      - name: Exercise manager-only update mode
+        run: |
+          test "$(tr -d '[:space:]' < VERSION)" = "0.7.0"
+          rm -rf /tmp/sbx-manager-only /tmp/sbx-ci-bin
+          mkdir -p /tmp/sbx-manager-only/nodes /tmp/sbx-manager-only/config /tmp/sbx-ci-bin
+          cat > /tmp/sbx-manager-only/.env <<'EOF'
+          SING_BOX_IMAGE=ghcr.io/sagernet/sing-box
+          SING_BOX_VERSION=v1.14.2
+          SING_BOX_CONTAINER_NAME=sing-box
+          SING_BOX_BIND_ADDR=127.0.0.1
+          SING_BOX_MIXED_PORT=7890
+          EOF
+          cat > /tmp/sbx-manager-only/nodes/nodes.json <<'EOF'
+          {"sentinel":"nodes-unchanged"}
+          EOF
+          cat > /tmp/sbx-manager-only/config/config.json <<'EOF'
+          {"sentinel":"config-unchanged"}
+          EOF
+          sha256sum /tmp/sbx-manager-only/.env /tmp/sbx-manager-only/nodes/nodes.json /tmp/sbx-manager-only/config/config.json > /tmp/before.sha
+          sudo env \
+            SBX_MANAGER_ONLY=1 \
+            SBX_NONINTERACTIVE=1 \
+            SBX_INSTALL_DIR=/tmp/sbx-manager-only \
+            SBX_BIN_LINK=/tmp/sbx-ci-bin/sbx \
+            SBX_INSTALLER_LINK=/tmp/sbx-ci-bin/sbx-install \
+            bash install.sh
+          sha256sum -c /tmp/before.sha
+          test "$(tr -d '[:space:]' < /tmp/sbx-manager-only/VERSION)" = "0.7.0"
+          test -x /tmp/sbx-ci-bin/sbx-install
+          test -x /tmp/sbx-manager-only/lib/sbx_update.sh
+
+      - name: Exercise auto-update timer generation
+        run: |
+          export HOME_DIR="${{ github.workspace }}/.ci-update-home"
+          export SBX_UPDATE_NO_APPLY=1
+          export SBX_UPDATE_SERVICE_FILE="${{ github.workspace }}/.ci-systemd/singbox-manager-update.service"
+          export SBX_UPDATE_TIMER_FILE="${{ github.workspace }}/.ci-systemd/singbox-manager-update.timer"
+          export SBX_BIN_LINK=/usr/local/bin/sbx
+          mkdir -p "$HOME_DIR" "$(dirname "$SBX_UPDATE_SERVICE_FILE")"
+          cp VERSION "$HOME_DIR/VERSION"
+          info() { :; }
+          warn() { :; }
+          die() { printf 'ERROR: %s\n' "$*" >&2; return 1; }
+          pause() { :; }
+          source lib/sbx_update.sh
+          manager_auto_on
+          grep -F 'ExecStart=/usr/local/bin/sbx manager update --quiet' "$SBX_UPDATE_SERVICE_FILE"
+          grep -F 'Environment="SBX_UPDATE_BASE_URL=' "$SBX_UPDATE_SERVICE_FILE"
+          grep -F 'OnUnitActiveSec=24h' "$SBX_UPDATE_TIMER_FILE"
+          grep -F 'RandomizedDelaySec=30min' "$SBX_UPDATE_TIMER_FILE"
+          manager_auto_status | grep -F '自动更新: CONFIGURED'
+          manager_auto_off
+          test ! -e "$SBX_UPDATE_SERVICE_FILE"
+          test ! -e "$SBX_UPDATE_TIMER_FILE"
 
       - name: Validate example JSON
         run: python -m json.tool config/config.example.json >/dev/null

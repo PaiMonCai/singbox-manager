@@ -7,6 +7,9 @@ INSTALL_DIR="${SBX_INSTALL_DIR:-/opt/singbox-manager}"
 BIN_LINK="${SBX_BIN_LINK:-/usr/local/bin/sbx}"
 DEFAULT_VERSION="${SBX_DEFAULT_VERSION:-v1.14.2}"
 NONINTERACTIVE="${SBX_NONINTERACTIVE:-0}"
+MANAGER_ONLY="${SBX_MANAGER_ONLY:-0}"
+INSTALLER_LINK="${SBX_INSTALLER_LINK:-/usr/local/bin/sbx-install}"
+[[ "$MANAGER_ONLY" == "1" ]] && NONINTERACTIVE=1
 SOURCE_BASE_URL="${SBX_SOURCE_BASE_URL:-https://raw.githubusercontent.com/${REPO}/${BRANCH}}"
 ARCHIVE_URL="${SBX_ARCHIVE_URL:-https://github.com/${REPO}/archive/refs/heads/${BRANCH}.tar.gz}"
 
@@ -121,6 +124,9 @@ get_source() {
     "lib/sbx_bootstrap.sh"
     "lib/sbx_image.sh"
     "lib/sbx_inbound.sh"
+    "lib/sbx_update.sh"
+    "bin/sbx-install"
+    "VERSION"
   )
 
   if [[ -n "${BASH_SOURCE[0]:-}" && "${BASH_SOURCE[0]}" != "bash" ]]; then
@@ -212,11 +218,16 @@ printf '      singbox-manager 安装器\n'
 printf '━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n'
 
 ensure_basic_dependencies
-ensure_docker
+if [[ "$MANAGER_ONLY" != "1" ]]; then
+  ensure_docker
+fi
 get_source
 
 UPGRADE=0
 [[ -f "$INSTALL_DIR/.env" ]] && UPGRADE=1
+if [[ "$MANAGER_ONLY" == "1" && "$UPGRADE" != "1" ]]; then
+  die "manager-only 更新要求已有安装。"
+fi
 
 old_version="$DEFAULT_VERSION"
 old_image="ghcr.io/sagernet/sing-box"
@@ -246,6 +257,7 @@ mkdir -p "$INSTALL_DIR/bin" "$INSTALL_DIR/lib" "$INSTALL_DIR/config" "$INSTALL_D
 
 install -m 0644 "$SOURCE_DIR/compose.yml" "$INSTALL_DIR/compose.yml"
 install -m 0644 "$SOURCE_DIR/.env.example" "$INSTALL_DIR/.env.example"
+install -m 0644 "$SOURCE_DIR/VERSION" "$INSTALL_DIR/VERSION"
 install -m 0644 "$SOURCE_DIR/config/config.example.json" "$INSTALL_DIR/config/config.example.json"
 install -m 0755 "$SOURCE_DIR/bin/sbx" "$INSTALL_DIR/bin/sbx"
 install -m 0755 "$SOURCE_DIR/lib/sbx_nodes.py" "$INSTALL_DIR/lib/sbx_nodes.py"
@@ -254,10 +266,24 @@ install -m 0755 "$SOURCE_DIR/lib/sbx_proxy.sh" "$INSTALL_DIR/lib/sbx_proxy.sh"
 install -m 0755 "$SOURCE_DIR/lib/sbx_bootstrap.sh" "$INSTALL_DIR/lib/sbx_bootstrap.sh"
 install -m 0755 "$SOURCE_DIR/lib/sbx_image.sh" "$INSTALL_DIR/lib/sbx_image.sh"
 install -m 0755 "$SOURCE_DIR/lib/sbx_inbound.sh" "$INSTALL_DIR/lib/sbx_inbound.sh"
-write_env "$version" "$bind" "$port" "$old_image"
+install -m 0755 "$SOURCE_DIR/lib/sbx_update.sh" "$INSTALL_DIR/lib/sbx_update.sh"
+install -m 0755 "$SOURCE_DIR/bin/sbx-install" "$INSTALLER_LINK"
 
 chmod 700 "$INSTALL_DIR/config" "$INSTALL_DIR/nodes" "$INSTALL_DIR/data" "$INSTALL_DIR/backup"
 ln -sfn "$INSTALL_DIR/bin/sbx" "$BIN_LINK"
+chmod 0755 "$INSTALLER_LINK"
+
+if [[ "$MANAGER_ONLY" == "1" ]]; then
+  manager_version="$(tr -d '[:space:]' < "$INSTALL_DIR/VERSION" 2>/dev/null || true)"
+  printf '\n'
+  printf '\033[32m管理器更新完成：%s\033[0m\n' "${manager_version:-unknown}"
+  printf '  未修改 .env / nodes.json / config.json，也未重启 sing-box。\n'
+  printf '  快速更新: sbx self-update\n'
+  printf '  完整安装器: sbx-install\n'
+  exit 0
+fi
+
+write_env "$version" "$bind" "$port" "$old_image"
 
 export SBX_HOME="$INSTALL_DIR"
 if [[ ! -f "$INSTALL_DIR/nodes/nodes.json" ]]; then
@@ -315,5 +341,7 @@ printf '  管理菜单: sbx\n'
 printf '  节点管理: sbx node\n'
 printf '  添加节点: sbx node add\n'
 printf '  测试节点: sbx node test\n'
+printf '  快速更新: sbx self-update\n'
+printf '  最新安装器: sbx-install\n'
 printf '  当前代理: http://%s:%s 或 socks5://%s:%s\n' "$bind" "$port" "$bind" "$port"
 printf '\n'

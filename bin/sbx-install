@@ -1,0 +1,23 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+REPO="${SBX_REPO:-PaiMonCai/singbox-manager}"
+BRANCH="${SBX_INSTALL_BRANCH:-main}"
+URL="${SBX_INSTALL_URL:-https://raw.githubusercontent.com/${REPO}/${BRANCH}/install.sh}"
+
+if [[ ${EUID:-$(id -u)} -ne 0 ]]; then
+  if command -v sudo >/dev/null 2>&1; then
+    exec sudo -E "$0" "$@"
+  fi
+  printf '[ERROR] 需要 root 权限。\n' >&2
+  exit 1
+fi
+
+tmp="$(mktemp /tmp/sbx-install.XXXXXX.sh)"
+cleanup(){ rm -f "$tmp"; }
+trap cleanup EXIT
+
+printf '[INFO] 获取最新 singbox-manager 安装器...\n'
+curl -fL --retry 3 --connect-timeout 10 --max-time 45 "$URL" -o "$tmp"
+chmod 700 "$tmp"
+bash "$tmp" "$@"

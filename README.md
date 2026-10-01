@@ -2,7 +2,7 @@
 
 面向 Linux 服务器的 sing-box Docker 管理层。sing-box 保持官方镜像运行，宿主机通过 `sbx` 完成安装、节点管理、配置生成、校验、测试、备份恢复与升级。
 
-当前版本：**0.6.0**
+当前版本：**0.7.0**
 
 ## 一键交互式安装
 
@@ -199,6 +199,104 @@ sbx route cn-direct-full
 
 
 
+
+
+## 0.7：管理器快捷更新与自动更新
+
+0.7 把“更新 singbox-manager”和“升级 sing-box 内核”彻底分开。
+
+快速更新管理器：
+
+```bash
+sbx self-update
+```
+
+等价于：
+
+```bash
+sbx manager update
+```
+
+它只更新 manager 自身文件，例如 `bin/sbx`、`lib/*.sh`、Python helper、Compose 模板和版本文件；不会修改：
+
+```text
+.env
+nodes/nodes.json
+config/config.json
+```
+
+也不会拉取 sing-box 镜像或重启正在运行的 sing-box。
+
+检查是否有新版本：
+
+```bash
+sbx manager check
+```
+
+强制重新安装当前远端版本：
+
+```bash
+sbx manager update --force
+```
+
+### 最新安装器快捷入口
+
+首次升级到 0.7 后会安装：
+
+```text
+/usr/local/bin/sbx-install
+```
+
+以后直接执行：
+
+```bash
+sbx-install
+```
+
+它会先从当前仓库的 raw 地址获取最新 `install.sh`，然后进入完整安装/升级流程。因此不需要再手工输入长 `curl` 命令。
+
+`sbx-install` 是“完整安装器”，可能询问 sing-box 版本、监听端口、镜像准备和启动等问题；而 `sbx self-update` 是“只更新 manager”的安全快捷方式。
+
+### 自动更新
+
+自动更新默认关闭。明确开启：
+
+```bash
+sbx manager auto on
+```
+
+需要输入 `AUTO` 确认，因为这意味着服务器将定期信任并执行配置仓库分支中的 manager 更新。
+
+关闭：
+
+```bash
+sbx manager auto off
+```
+
+查看状态：
+
+```bash
+sbx manager auto status
+```
+
+当前 systemd timer 使用：
+
+```text
+OnBootSec=15min
+OnUnitActiveSec=24h
+RandomizedDelaySec=30min
+Persistent=true
+```
+
+也就是每天检查一次，并加入最多约 30 分钟随机延迟，避免所有机器同一时刻访问更新源。
+
+自动更新只执行：
+
+```bash
+sbx manager update --quiet
+```
+
+不会自动升级 sing-box 镜像版本。
 
 ## 0.6：多入口 -> 多出口路由
 
@@ -575,6 +673,10 @@ sbx test
 sbx backup
 sbx restore
 sbx version
+sbx self-update
+sbx manager check
+sbx manager auto status
+sbx-install
 sbx upgrade v1.14.2
 sbx pull
 ```
@@ -600,8 +702,10 @@ export HTTPS_PROXY=http://127.0.0.1:7890
 ├── compose.yml
 ├── compose.inbounds.yml      # 有自定义入口时自动生成
 ├── .env
+├── VERSION
 ├── bin/
-│   └── sbx
+│   ├── sbx
+│   └── sbx-install
 ├── lib/
 │   └── sbx_nodes.py
 ├── nodes/
@@ -623,7 +727,7 @@ export HTTPS_PROXY=http://127.0.0.1:7890
 
 下一层计划：
 
-- 订阅定时更新与健康检查
+- 订阅定时更新与节点健康检查
 - Docker build / 容器级代理模板
 - 更丰富的路由规则管理
 - TUN / 透明代理
