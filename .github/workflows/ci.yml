@@ -120,6 +120,29 @@ jobs:
           fi
           grep -F '安装不完整' /tmp/sbx-broken.err
 
+      - name: Re-run installer reuses the existing config
+        run: |
+          rm -rf /tmp/sbx-reinstall /tmp/sbx-reinstall-bin
+          mkdir -p /tmp/sbx-reinstall/nodes /tmp/sbx-reinstall-bin
+          # 预置一份“已有安装”：.env + 一个节点
+          printf 'SING_BOX_IMAGE=localhost.invalid/sing-box\nSING_BOX_VERSION=v1.14.2\nSING_BOX_CONTAINER_NAME=sing-box\nSING_BOX_BIND_ADDR=127.0.0.1\nSING_BOX_MIXED_PORT=7890\nSING_BOX_DOCKER_NETWORK=singbox-proxy\n' > /tmp/sbx-reinstall/.env
+          printf '{"version":3,"default":"n1","settings":{},"subscriptions":[],"inbounds":[],"nodes":[{"id":"n1","name":"N1","type":"vless","server":"e.example.com","server_port":443,"uuid":"11111111-2222-3333-4444-555555555555"}]}' > /tmp/sbx-reinstall/nodes/nodes.json
+          ENVS="SBX_BOOTSTRAP_PULL_TIMEOUT=3 SBX_INSTALL_DIR=/tmp/sbx-reinstall SBX_BIN_LINK=/tmp/sbx-reinstall-bin/sbx SBX_INSTALLER_LINK=/tmp/sbx-reinstall-bin/sbx-install"
+          # stdin 喂入非法值：沿用现有配置时根本不读 stdin（应当成功）；
+          # 一旦真的去询问配置，读取到非法值就会失败。
+          # 不用 `yes | head`：在 pipefail 的 shell 下会因 SIGPIPE 返回 141
+          for _ in $(seq 1 30); do echo 70000; done > /tmp/sbx-bad-stdin
+          sudo env $ENVS bash install.sh < /tmp/sbx-bad-stdin > /tmp/sbx-reuse.log 2>&1 || {
+            echo "二次运行失败（应沿用现有配置）" >&2; cat /tmp/sbx-reuse.log; exit 1; }
+          grep -F '检测到已有安装，沿用现有配置' /tmp/sbx-reuse.log
+          if sudo env $ENVS SBX_RECONFIGURE=1 bash install.sh < /tmp/sbx-bad-stdin > /tmp/sbx-reconf.log 2>&1; then
+            echo "SBX_RECONFIGURE=1 时应重新询问（并因非法输入失败）" >&2
+            cat /tmp/sbx-reconf.log; exit 1
+          fi
+          if grep -F '检测到已有安装，沿用现有配置' /tmp/sbx-reconf.log; then
+            echo "SBX_RECONFIGURE=1 时不应走沿用分支" >&2; exit 1
+          fi
+
       - name: Exercise auto-update timer generation
         run: |
           export HOME_DIR="${{ github.workspace }}/.ci-update-home"

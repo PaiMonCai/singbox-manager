@@ -360,6 +360,7 @@ help(){
   cat <<'EOF'
 sbx                                  交互菜单
 sbx node                             节点管理
+sbx reapply                          按现有节点库重新生成配置并重启 sing-box
 sbx inbound                          多入口 -> 出口路由管理
 sbx import uri|file                  分享链接 / 文件导入
 sbx subscription                     订阅管理
@@ -409,6 +410,7 @@ main(){
   case "$cmd" in
     menu) menu ;;
     node) node "$@" ;;
+    apply|reapply|reload) node render ;;
     inbound|in) inbound_cmd "$@" ;;
     import) import_cmd "$@" ;;
     subscription|sub) subscription "$@" ;;

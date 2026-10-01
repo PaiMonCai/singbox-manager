@@ -36,6 +36,32 @@ curl -fsSL https://raw.githubusercontent.com/PaiMonCai/singbox-manager/main/inst
 
 已有安装再次运行安装器时，会更新管理器文件，同时保留本机 `.env`、节点库和运行配置（包括自定义的 `SING_BOX_CONTAINER_NAME`，不会被重置回 `sing-box`）。
 
+### 重复运行（升级）时不再重新配置
+
+检测到已有安装后，安装器**直接沿用现有 `.env`**，不再逐项询问 sing-box 版本 / 监听地址 / 端口：
+
+- 只在镜像缺失时才询问是否准备镜像；
+- 只在节点库为空时才询问是否添加第一个节点；
+- **如果 sing-box 正在运行，会自动重新生成配置并重启**，让新脚本与新生成的配置立即生效（不再问“是否立即启动”）。
+
+要修改版本 / 监听地址 / 端口（回到交互式逐项询问）：
+
+```bash
+SBX_RECONFIGURE=1 bash install.sh
+# 或
+SBX_RECONFIGURE=1 sbx-install
+```
+
+自动化场景可再加 `SBX_ASSUME_YES=1`，所有确认都取默认值，全程无交互。
+
+只想让改动生效、不重跑安装器时：
+
+```bash
+sbx reapply
+```
+
+它会按现有节点库重新生成 `config/config.json`、跑 `sing-box check`，通过后重启正在运行的 sing-box；不重装管理器，也不改 `.env`。
+
 ### 安装时的输入校验
 
 - 监听地址必须是 IPv4/IPv6 地址字面量（`127.0.0.1`、`::1` 等），端口必须是 1–65535 的整数；非法值会立即报错，而不是写进 `.env`、等到 `sbx start` 时才由 Docker 报错。
@@ -1158,6 +1184,7 @@ sbx restart
 sbx logs
 sbx check
 sbx test
+sbx reapply
 sbx backup
 sbx restore
 sbx version

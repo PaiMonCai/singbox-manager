@@ -8,8 +8,10 @@ BIN_LINK="${SBX_BIN_LINK:-/usr/local/bin/sbx}"
 DEFAULT_VERSION="${SBX_DEFAULT_VERSION:-v1.14.2}"
 NONINTERACTIVE="${SBX_NONINTERACTIVE:-0}"
 MANAGER_ONLY="${SBX_MANAGER_ONLY:-0}"
+RECONFIGURE="${SBX_RECONFIGURE:-0}"
 INSTALLER_LINK="${SBX_INSTALLER_LINK:-/usr/local/bin/sbx-install}"
 [[ "$MANAGER_ONLY" == "1" ]] && NONINTERACTIVE=1
+[[ "${SBX_ASSUME_YES:-0}" == "1" ]] && NONINTERACTIVE=1
 SOURCE_BASE_URL="${SBX_SOURCE_BASE_URL:-https://raw.githubusercontent.com/${REPO}/${BRANCH}}"
 ARCHIVE_URL="${SBX_ARCHIVE_URL:-https://github.com/${REPO}/archive/refs/heads/${BRANCH}.tar.gz}"
 
@@ -280,14 +282,24 @@ port=""
 # manager-only 更新不使用这三个值（它在 write_env 之前就退出），
 # 因此 sing-box 的版本/端口不能用来挡住管理器自身的更新路径。
 if [[ "$MANAGER_ONLY" != "1" ]]; then
-  version="$(ask 'sing-box 版本' "$old_version")"
-  [[ "$version" == v* ]] || version="v$version"
-  [[ "$version" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$ ]] || die "版本格式无效: $version"
+  if (( UPGRADE )) && [[ "$RECONFIGURE" != "1" ]]; then
+    # 已有安装：直接沿用现有 .env，不再逐项询问（要改这些值请用 SBX_RECONFIGURE=1 重跑）
+    version="$old_version"; bind="$old_bind"; port="$old_port"
+    info "检测到已有安装，沿用现有配置：sing-box $version，监听 $bind:$port"
+  else
+    version="$(ask 'sing-box 版本' "$old_version")"
+    [[ "$version" == v* ]] || version="v$version"
+    bind="$(ask '本地代理监听地址' "$old_bind")"
+    port="$(ask '本地 mixed HTTP/SOCKS5 端口' "$old_port")"
+  fi
 
-  bind="$(ask '本地代理监听地址' "$old_bind")"
+  [[ "$version" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$ ]] || die "版本格式无效: $version（可修正 $INSTALL_DIR/.env 的 SING_BOX_VERSION，或用 SBX_RECONFIGURE=1 重新输入）"
+
+  bind_attempts=0
   while ! validate_bind "$bind"; do
-    if [[ "$NONINTERACTIVE" == "1" ]]; then
-      die "监听地址无效: ${bind:-（空）}。非交互模式无法重新输入，请修正 $INSTALL_DIR/.env 中的 SING_BOX_BIND_ADDR 后重试。"
+    bind_attempts=$((bind_attempts+1))
+    if [[ "$NONINTERACTIVE" == "1" || $bind_attempts -ge 5 ]]; then
+      die "监听地址无效: ${bind:-（空）}。请修正 $INSTALL_DIR/.env 中的 SING_BOX_BIND_ADDR 后重试。"
     fi
     warn "监听地址必须是 IPv4/IPv6 地址，例如 127.0.0.1。"
     bind="$(ask '本地代理监听地址' "$old_bind")"
@@ -296,11 +308,12 @@ if [[ "$MANAGER_ONLY" != "1" ]]; then
     0.0.0.0|"::") warn "监听地址 $bind 会把代理端口暴露到所有网卡（可能含公网），请确认这是你的意图。" ;;
   esac
 
-  port="$(ask '本地 mixed HTTP/SOCKS5 端口' "$old_port")"
   # 非交互模式下 ask 永远回显同一个默认值，重试不可能成功，必须直接失败而不是空转。
+  port_attempts=0
   while ! validate_port "$port"; do
-    if [[ "$NONINTERACTIVE" == "1" ]]; then
-      die "端口无效: ${port:-（空）}。非交互模式无法重新输入，请修正 $INSTALL_DIR/.env 中的 SING_BOX_MIXED_PORT 后重试。"
+    port_attempts=$((port_attempts+1))
+    if [[ "$NONINTERACTIVE" == "1" || $port_attempts -ge 5 ]]; then
+      die "端口无效: ${port:-（空）}。请修正 $INSTALL_DIR/.env 中的 SING_BOX_MIXED_PORT 后重试。"
     fi
     warn "端口必须是 1-65535 的整数。"
     port="$(ask '本地 mixed HTTP/SOCKS5 端口' "$old_port")"
@@ -370,14 +383,15 @@ if [[ -n "$env_backup" ]]; then rm -f "$env_backup"; env_backup=""; fi
 
 source "$INSTALL_DIR/lib/sbx_bootstrap.sh"
 image_ready=0
-if confirm "现在准备 sing-box $version 镜像？" yes; then
+if docker image inspect "$old_image:$version" >/dev/null 2>&1; then
+  info "本地已有镜像: $old_image:$version"
+  image_ready=1
+elif confirm "本地缺少 sing-box $version 镜像，是否现在准备？" yes; then
   if bootstrap_ensure_image "$version" "$INSTALL_DIR/.env"; then
     image_ready=1
   else
     warn "sing-box 镜像尚未准备好。你可以稍后重新运行安装器。"
   fi
-elif docker image inspect "$old_image:$version" >/dev/null 2>&1; then
-  image_ready=1
 fi
 
 node_count="$(python3 - "$INSTALL_DIR/nodes/nodes.json" <<'PY'
@@ -403,14 +417,30 @@ PY
 )"
 fi
 
-start_default="no"
-[[ "$node_count" != "0" ]] && start_default="yes"
-if (( image_ready )) && confirm "是否立即启动 sing-box？" "$start_default"; then
-  "$BIN_LINK" start || warn "启动失败，请运行 sbx check 和 sbx logs 查看详情。"
+# sing-box 已在运行（本次多半只是更新脚本/配置）：直接重启让新配置生效，不再询问
+container_running=0
+if docker ps --filter "name=^${old_container_name}$" --format '{{.Names}}' 2>/dev/null | grep -qx "$old_container_name"; then
+  container_running=1
+fi
+
+if (( image_ready )); then
+  if (( container_running )); then
+    info "sing-box 正在运行，重新生成配置后自动重启以生效..."
+    "$BIN_LINK" restart || warn "重启失败，请运行 sbx logs 查看详情。"
+  else
+    start_default="no"
+    [[ "$node_count" != "0" ]] && start_default="yes"
+    if confirm "是否立即启动 sing-box？" "$start_default"; then
+      "$BIN_LINK" start || warn "启动失败，请运行 sbx check 和 sbx logs 查看详情。"
+    fi
+  fi
 fi
 
 printf '\n'
 printf '\033[32m安装完成。\033[0m\n'
+if (( UPGRADE )); then
+  printf '  就地更新：沿用现有 .env 的版本/监听/端口，未做任何重新询问（需要改这些值: SBX_RECONFIGURE=1 bash install.sh）\n'
+fi
 printf '  管理菜单: sbx\n'
 printf '  节点管理: sbx node\n'
 printf '  添加节点: sbx node add\n'
