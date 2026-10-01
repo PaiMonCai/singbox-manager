@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # singbox-manager v0.7 self-update integration.
 
-VERSION="0.11.1"
+VERSION="0.11.2"
 
 UPDATE_REPO="${SBX_UPDATE_REPO:-PaiMonCai/singbox-manager}"
 UPDATE_BRANCH="${SBX_UPDATE_BRANCH:-main}"
@@ -54,17 +54,45 @@ manager_remote_version(){
   manager_fetch_stdout "${UPDATE_BASE%/}/VERSION" | tr -d '[:space:]'
 }
 
+# 版本号比较（纯 bash，不依赖 GNU sort -V；busybox 环境也不会静默失效）：
+#   远端更新 → 0；相同 → 1；远端更旧 → 2；无法解析 → 3
+manager_version_cmp(){
+  local local_v="$1" remote_v="$2" lc rci n i ln rn
+  local -a lparts=() rparts=()
+  lc="${local_v#v}"; lc="${lc#V}"
+  rci="${remote_v#v}"; rci="${rci#V}"
+  lc="${lc%%[^0-9.]*}"      # 去掉 "-rc1" 之类后缀与尾部空白
+  rci="${rci%%[^0-9.]*}"
+  [[ "$lc" =~ ^[0-9]+(\.[0-9]+)*$ ]] || return 3
+  [[ "$rci" =~ ^[0-9]+(\.[0-9]+)*$ ]] || return 3
+  IFS='.' read -r -a lparts <<< "$lc"
+  IFS='.' read -r -a rparts <<< "$rci"
+  n=${#lparts[@]}
+  (( ${#rparts[@]} > n )) && n=${#rparts[@]}
+  for (( i = 0; i < n; i++ )); do
+    ln="${lparts[i]:-0}"; rn="${rparts[i]:-0}"
+    if (( 10#$rn > 10#$ln )); then return 0; fi
+    if (( 10#$rn < 10#$ln )); then return 2; fi
+  done
+  # 数字部分相同：字符串也相同才是"已是最新"，否则（0.11.1 与 0.11.1-rc1、0.11 与 0.11.0）按有更新处理
+  [[ "$local_v" == "$remote_v" ]] && return 1
+  return 0
+}
+
 manager_check(){
   command -v curl >/dev/null 2>&1 || die "检查更新需要 curl。"
   local local_v remote_v
   local_v="$(manager_local_version)"
   remote_v="$(manager_remote_version)" || die "无法获取远端版本。"
   printf '当前版本: %s\n远端版本: %s\n' "$local_v" "$remote_v"
-  if [[ "$local_v" == "$remote_v" ]]; then
-    printf '状态: 已是最新版本\n'
-  else
-    printf '状态: 有可用更新\n'
-  fi
+  local state=0
+  manager_version_cmp "$local_v" "$remote_v" || state=$?
+  case "$state" in
+    0) printf '状态: 有可用更新\n' ;;
+    1) printf '状态: 已是最新版本\n' ;;
+    2) printf '状态: 本地版本更新，远端较旧（不会自动降级；确实要降级: sbx manager update --force）\n' ;;
+    *) printf '状态: 版本号无法比较（按“有可用更新”处理）\n' ;;
+  esac
 }
 
 manager_update(){
@@ -84,9 +112,19 @@ manager_update(){
     return 1
   }
 
-  if [[ "$local_v" == "$remote_v" && "$force" != "1" ]]; then
-    ((quiet)) || info "singbox-manager 已是最新版本: $local_v"
-    return 0
+  # 只有"远端严格更新"才自动执行；远端更旧时不降级（--force 是唯一降级路径）。
+  # 版本号无法解析时按"有可用更新"处理，避免解析失败把更新永久挡住。
+  local state=0
+  manager_version_cmp "$local_v" "$remote_v" || state=$?
+  if [[ "$force" != "1" ]]; then
+    if (( state == 1 )); then
+      ((quiet)) || info "singbox-manager 已是最新版本: $local_v"
+      return 0
+    fi
+    if (( state == 2 )); then
+      ((quiet)) || warn "远端版本 $remote_v 比本地 $local_v 更旧，已跳过（确实要降级请加 --force）。"
+      return 0
+    fi
   fi
 
   ((quiet)) || info "更新 singbox-manager: $local_v -> $remote_v"
@@ -270,7 +308,7 @@ manager_cmd(){
       cat <<'EOF'
 sbx manager check               检查 manager 更新
 sbx manager update              立即更新 manager，不动 sing-box 镜像/节点
-sbx manager update --force      强制重装当前远端版本
+sbx manager update --force      强制重装/降级到远端版本（唯一会降级的路径）
 sbx manager auto on             开启每日自动更新
 sbx manager auto off            关闭自动更新
 sbx manager auto status         查看自动更新状态
