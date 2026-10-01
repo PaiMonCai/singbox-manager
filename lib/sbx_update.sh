@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # singbox-manager v0.7 self-update integration.
 
-VERSION="0.11.0"
+VERSION="0.11.1"
 
 UPDATE_REPO="${SBX_UPDATE_REPO:-PaiMonCai/singbox-manager}"
 UPDATE_BRANCH="${SBX_UPDATE_BRANCH:-main}"

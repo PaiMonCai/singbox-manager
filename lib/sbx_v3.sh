@@ -1,6 +1,5 @@
 #!/usr/bin/env bash
 # singbox-manager v0.3 extension. Sourced by bin/sbx after core functions load.
-VERSION="0.3.0"
 
 transaction_v3(){
   local rollback rc=0
