@@ -1,0 +1,6 @@
+.env
+config/config.json
+data/*
+backup/*
+*.tar.gz
+.DS_Store

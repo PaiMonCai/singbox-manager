@@ -1,0 +1,19 @@
+name: singbox-manager
+
+services:
+  sing-box:
+    image: ghcr.io/sagernet/sing-box:${SING_BOX_VERSION:-v1.14.1}
+    container_name: ${SING_BOX_CONTAINER_NAME:-sing-box}
+    restart: unless-stopped
+    volumes:
+      - ./config:/etc/sing-box
+      - ./data:/var/lib/sing-box
+    ports:
+      - "${SING_BOX_BIND_ADDR:-127.0.0.1}:${SING_BOX_MIXED_PORT:-7890}:7890/tcp"
+      - "${SING_BOX_BIND_ADDR:-127.0.0.1}:${SING_BOX_MIXED_PORT:-7890}:7890/udp"
+    command:
+      - -D
+      - /var/lib/sing-box
+      - -C
+      - /etc/sing-box/
+      - run

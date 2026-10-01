@@ -1,0 +1,528 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+MANAGER_VERSION="0.1.0"
+BASE_DIR="${SBX_HOME:-/opt/singbox-manager}"
+COMPOSE_FILE="$BASE_DIR/compose.yml"
+ENV_FILE="$BASE_DIR/.env"
+CONFIG_FILE="$BASE_DIR/config/config.json"
+BACKUP_DIR="$BASE_DIR/backup"
+BIN_LINK="${SBX_BIN_LINK:-/usr/local/bin/sbx}"
+
+C_RESET='\033[0m'
+C_GREEN='\033[32m'
+C_YELLOW='\033[33m'
+C_RED='\033[31m'
+C_CYAN='\033[36m'
+
+info() {
+  printf '%b[INFO]%b %s\n' "$C_GREEN" "$C_RESET" "$*"
+}
+
+warn() {
+  printf '%b[WARN]%b %s\n' "$C_YELLOW" "$C_RESET" "$*" >&2
+}
+
+error() {
+  printf '%b[ERROR]%b %s\n' "$C_RED" "$C_RESET" "$*" >&2
+}
+
+die() {
+  error "$*"
+  exit 1
+}
+
+ensure_root() {
+  if [[ "${EUID:-$(id -u)}" -ne 0 ]]; then
+    if command -v sudo >/dev/null 2>&1; then
+      exec sudo -- "$0" "$@"
+    fi
+    die "该命令需要 root 权限。"
+  fi
+}
+
+ensure_installation() {
+  [[ -f "$COMPOSE_FILE" ]] || die "未找到 $COMPOSE_FILE，请先运行安装脚本。"
+  [[ -f "$ENV_FILE" ]] || die "未找到 $ENV_FILE，请重新安装或从 .env.example 创建。"
+  [[ -f "$CONFIG_FILE" ]] || die "未找到 $CONFIG_FILE。"
+  mkdir -p "$BACKUP_DIR" "$BASE_DIR/data"
+}
+
+ensure_docker() {
+  command -v docker >/dev/null 2>&1 || die "未检测到 Docker。"
+  docker compose version >/dev/null 2>&1 || die "未检测到 Docker Compose v2。"
+  docker info >/dev/null 2>&1 || die "无法连接 Docker daemon。"
+}
+
+compose() {
+  docker compose     --project-directory "$BASE_DIR"     --env-file "$ENV_FILE"     -f "$COMPOSE_FILE"     "$@"
+}
+
+get_env() {
+  local key="$1"
+  local fallback="${2:-}"
+  local value
+  value="$(grep -E "^${key}=" "$ENV_FILE" 2>/dev/null | tail -n 1 | cut -d= -f2- || true)"
+  if [[ -n "$value" ]]; then
+    printf '%s\n' "$value"
+  else
+    printf '%s\n' "$fallback"
+  fi
+}
+
+set_env() {
+  local key="$1"
+  local value="$2"
+  local tmp
+  tmp="$(mktemp)"
+
+  awk -v key="$key" -v value="$value" '
+    BEGIN { found = 0 }
+    index($0, key "=") == 1 {
+      print key "=" value
+      found = 1
+      next
+    }
+    { print }
+    END {
+      if (!found) print key "=" value
+    }
+  ' "$ENV_FILE" > "$tmp"
+
+  cat "$tmp" > "$ENV_FILE"
+  rm -f "$tmp"
+  chmod 600 "$ENV_FILE"
+}
+
+container_name() {
+  get_env "SING_BOX_CONTAINER_NAME" "sing-box"
+}
+
+mixed_port() {
+  get_env "SING_BOX_MIXED_PORT" "7890"
+}
+
+pinned_version() {
+  get_env "SING_BOX_VERSION" "v1.14.1"
+}
+
+config_check() {
+  info "检查 sing-box 配置..."
+  compose run --rm --no-deps sing-box     check     -c /etc/sing-box/config.json     -D /var/lib/sing-box
+}
+
+config_format() {
+  create_backup
+  info "格式化 config.json..."
+  compose run --rm --no-deps sing-box     format -w     -c /etc/sing-box/config.json     -D /var/lib/sing-box
+  config_check
+  info "格式化完成。"
+}
+
+status() {
+  compose ps
+}
+
+start_service() {
+  config_check || die "配置检查失败，未启动容器。"
+  info "启动 sing-box..."
+  compose up -d sing-box
+  status
+}
+
+stop_service() {
+  info "停止 sing-box..."
+  compose stop sing-box
+}
+
+restart_service() {
+  config_check || die "配置检查失败，保留当前运行状态。"
+  info "重新创建 sing-box 容器..."
+  compose up -d --force-recreate sing-box
+  status
+}
+
+logs() {
+  compose logs --tail=100 -f sing-box
+}
+
+edit_config() {
+  local editor="${SBX_EDITOR:-${EDITOR:-vi}}"
+  command -v "$editor" >/dev/null 2>&1 || die "找不到编辑器: $editor"
+
+  create_backup
+  "$editor" "$CONFIG_FILE"
+
+  if config_check; then
+    info "配置有效。"
+    if [[ -t 0 ]]; then
+      local answer
+      read -r -p "现在重启 sing-box 应用配置？[Y/n] " answer || true
+      case "${answer:-Y}" in
+        y|Y|yes|YES|"")
+          restart_service
+          ;;
+        *)
+          info "未重启，配置将在下次启动/重启时生效。"
+          ;;
+      esac
+    fi
+  else
+    warn "配置检查失败。已保留文件，但没有重启容器。"
+    return 1
+  fi
+}
+
+BACKUP_RESULT=""
+create_backup() {
+  local stamp
+  stamp="$(date '+%Y%m%d-%H%M%S')"
+  BACKUP_RESULT="$BACKUP_DIR/config-${stamp}.tar.gz"
+
+  tar -czf "$BACKUP_RESULT" -C "$BASE_DIR" config
+  chmod 600 "$BACKUP_RESULT"
+  info "备份完成: $BACKUP_RESULT"
+}
+
+validate_backup_archive() {
+  local file="$1"
+  local entry
+
+  while IFS= read -r entry; do
+    [[ "$entry" != *".."* ]] || die "备份包包含不安全路径: $entry"
+    case "$entry" in
+      config|config/|config/*) ;;
+      *) die "备份包包含未知路径: $entry" ;;
+    esac
+  done < <(tar -tzf "$file")
+}
+
+latest_backup() {
+  ls -1t "$BACKUP_DIR"/config-*.tar.gz 2>/dev/null | sed -n '1p' || true
+}
+
+restore_config() {
+  local file="${1:-}"
+  local rollback
+  local tmp
+
+  if [[ -z "$file" ]]; then
+    file="$(latest_backup)"
+  elif [[ "$file" != /* ]]; then
+    file="$BACKUP_DIR/$file"
+  fi
+
+  [[ -n "$file" && -f "$file" ]] || die "没有找到可恢复的备份。"
+
+  validate_backup_archive "$file"
+  create_backup
+  rollback="$BACKUP_RESULT"
+
+  tmp="$(mktemp -d)"
+  tar -xzf "$file" -C "$tmp"
+  [[ -f "$tmp/config/config.json" ]] || {
+    rm -rf "$tmp"
+    die "备份包缺少 config/config.json。"
+  }
+
+  rm -rf "$BASE_DIR/config"
+  mv "$tmp/config" "$BASE_DIR/config"
+  rm -rf "$tmp"
+  chmod 700 "$BASE_DIR/config"
+  chmod 600 "$CONFIG_FILE"
+
+  if config_check; then
+    info "恢复完成: $file"
+    if compose ps --status running --services | grep -qx 'sing-box'; then
+      restart_service
+    fi
+  else
+    warn "恢复后的配置无效，正在回滚..."
+    tmp="$(mktemp -d)"
+    tar -xzf "$rollback" -C "$tmp"
+    rm -rf "$BASE_DIR/config"
+    mv "$tmp/config" "$BASE_DIR/config"
+    rm -rf "$tmp"
+    chmod 700 "$BASE_DIR/config"
+    chmod 600 "$CONFIG_FILE"
+    die "恢复失败，已回滚到恢复前配置。"
+  fi
+}
+
+test_proxy() {
+  local port
+  local proxy
+  local code=""
+  local ip=""
+
+  command -v curl >/dev/null 2>&1 || die "测试功能需要 curl。"
+  port="$(mixed_port)"
+  proxy="http://127.0.0.1:${port}"
+
+  if ! compose ps --status running --services | grep -qx 'sing-box'; then
+    die "sing-box 当前未运行。"
+  fi
+
+  info "本地代理: $proxy"
+  info "测试国际 HTTPS 连通性..."
+
+  code="$(curl     --proxy "$proxy"     --connect-timeout 5     --max-time 15     --silent     --show-error     --output /dev/null     --write-out '%{http_code}'     https://www.google.com/generate_204 2>/dev/null || true)"
+
+  if [[ "$code" == "204" ]]; then
+    info "Google generate_204: OK (HTTP 204)"
+  else
+    warn "Google generate_204 未通过 (HTTP ${code:-N/A})，继续测试 GitHub..."
+    code="$(curl       --proxy "$proxy"       --connect-timeout 5       --max-time 15       --silent       --show-error       --output /dev/null       --write-out '%{http_code}'       https://github.com/ 2>/dev/null || true)"
+
+    if [[ "$code" =~ ^(200|301|302)$ ]]; then
+      info "GitHub: OK (HTTP $code)"
+    else
+      error "代理国际连通性测试失败 (HTTP ${code:-N/A})。"
+      return 1
+    fi
+  fi
+
+  ip="$(curl     --proxy "$proxy"     --connect-timeout 5     --max-time 10     --silent     --show-error     https://api.ipify.org 2>/dev/null || true)"
+
+  if [[ -n "$ip" ]]; then
+    info "代理出口 IP: $ip"
+  else
+    warn "无法获取代理出口 IP，但连通性测试已通过。"
+  fi
+}
+
+show_version() {
+  local name
+  name="$(container_name)"
+
+  printf 'singbox-manager: %s\n' "$MANAGER_VERSION"
+  printf 'pinned sing-box: %s\n' "$(pinned_version)"
+
+  if docker inspect "$name" >/dev/null 2>&1 && [[ "$(docker inspect -f '{{.State.Running}}' "$name" 2>/dev/null || true)" == "true" ]]; then
+    printf 'running sing-box: '
+    docker exec "$name" sing-box version 2>/dev/null | sed -n '1p' || printf 'unknown\n'
+  else
+    printf 'running sing-box: not running\n'
+  fi
+}
+
+normalize_version() {
+  local version="$1"
+  if [[ "$version" != v* ]]; then
+    version="v$version"
+  fi
+  [[ "$version" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$ ]] || die "版本格式无效: $version"
+  printf '%s\n' "$version"
+}
+
+upgrade_version() {
+  local requested="${1:-}"
+  local old_version
+  local new_version
+
+  [[ -n "$requested" ]] || die "用法: sbx upgrade <version>，例如 sbx upgrade v1.14.1"
+
+  old_version="$(pinned_version)"
+  new_version="$(normalize_version "$requested")"
+
+  if [[ "$new_version" == "$old_version" ]]; then
+    warn "目标版本与当前固定版本相同，将执行 pull。"
+    pull_current
+    return
+  fi
+
+  create_backup
+  info "准备升级: $old_version -> $new_version"
+  set_env "SING_BOX_VERSION" "$new_version"
+
+  if ! compose pull sing-box; then
+    set_env "SING_BOX_VERSION" "$old_version"
+    die "镜像拉取失败，已恢复版本设置。"
+  fi
+
+  if ! config_check; then
+    set_env "SING_BOX_VERSION" "$old_version"
+    die "新版本无法通过现有配置检查；未替换运行中的容器，已恢复版本设置。"
+  fi
+
+  if ! compose up -d --force-recreate sing-box; then
+    warn "新版本启动失败，尝试回滚到 $old_version..."
+    set_env "SING_BOX_VERSION" "$old_version"
+    compose up -d --force-recreate sing-box || true
+    die "升级失败，已尝试回滚。"
+  fi
+
+  info "升级完成。"
+  show_version
+}
+
+pull_current() {
+  local version
+  version="$(pinned_version)"
+  create_backup
+  info "拉取当前固定版本: $version"
+  compose pull sing-box
+  config_check || die "拉取后的镜像无法通过配置检查，未替换运行中的容器。"
+  compose up -d --force-recreate sing-box
+  info "镜像更新完成。"
+}
+
+uninstall_manager() {
+  local purge="${1:-}"
+  local answer=""
+
+  printf '将停止并移除 sing-box 容器。\n'
+  if [[ "$purge" == "--purge" ]]; then
+    printf '同时删除 %s 下的配置、数据和备份。\n' "$BASE_DIR"
+  else
+    printf '配置、数据和备份将保留在 %s。\n' "$BASE_DIR"
+  fi
+
+  read -r -p '输入 REMOVE 确认卸载: ' answer || true
+  [[ "$answer" == "REMOVE" ]] || {
+    info "已取消。"
+    return
+  }
+
+  compose down --remove-orphans || true
+  rm -f "$BIN_LINK"
+
+  if [[ "$purge" == "--purge" ]]; then
+    rm -rf "$BASE_DIR"
+    printf '已完全卸载。\n'
+  else
+    printf '管理命令已卸载；数据仍保留在 %s。\n' "$BASE_DIR"
+  fi
+}
+
+print_help() {
+  cat <<'EOF'
+singbox-manager (sbx)
+
+Usage:
+  sbx                         打开交互菜单
+  sbx status                  查看状态
+  sbx start                   启动
+  sbx stop                    停止
+  sbx restart                 校验配置后重启
+  sbx logs                    实时日志
+  sbx edit                    编辑配置
+  sbx check                   检查配置
+  sbx format                  备份并格式化配置
+  sbx test                    测试代理国际连通性
+  sbx backup                  备份配置
+  sbx restore [file]          恢复备份；省略 file 时恢复最新备份
+  sbx version                 查看版本
+  sbx upgrade <version>       切换 sing-box 版本
+  sbx pull                    拉取当前固定版本并安全重建
+  sbx uninstall [--purge]     卸载；--purge 同时删除全部数据
+  sbx help                    显示帮助
+EOF
+}
+
+pause_menu() {
+  printf '\n'
+  read -r -p '按 Enter 返回菜单...' _ || true
+}
+
+menu() {
+  local choice
+  while true; do
+    clear
+    printf '%b' "$C_CYAN"
+    cat <<'EOF'
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+        singbox-manager
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ 1. 查看运行状态
+ 2. 启动 sing-box
+ 3. 停止 sing-box
+ 4. 重启 sing-box
+ 5. 查看实时日志
+
+ 6. 编辑配置
+ 7. 检查配置
+ 8. 格式化配置
+
+ 9. 测试国际连接
+10. 备份配置
+11. 恢复配置
+
+12. 查看版本
+13. 升级 sing-box
+14. 拉取当前版本
+15. 卸载管理器
+
+ 0. 退出
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+EOF
+    printf '%b' "$C_RESET"
+    read -r -p '请选择: ' choice || exit 0
+
+    case "$choice" in
+      1) status; pause_menu ;;
+      2) start_service; pause_menu ;;
+      3) stop_service; pause_menu ;;
+      4) restart_service; pause_menu ;;
+      5) logs || true; pause_menu ;;
+      6) edit_config || true; pause_menu ;;
+      7) config_check || true; pause_menu ;;
+      8) config_format || true; pause_menu ;;
+      9) test_proxy || true; pause_menu ;;
+      10) create_backup; pause_menu ;;
+      11)
+        local file
+        read -r -p '备份文件名/完整路径（留空恢复最新备份）: ' file || true
+        restore_config "$file" || true
+        pause_menu
+        ;;
+      12) show_version; pause_menu ;;
+      13)
+        local version
+        read -r -p '目标版本（例如 v1.14.1）: ' version || true
+        [[ -n "$version" ]] && upgrade_version "$version" || warn "未输入版本。"
+        pause_menu
+        ;;
+      14) pull_current; pause_menu ;;
+      15) uninstall_manager; exit 0 ;;
+      0) exit 0 ;;
+      *) warn "无效选项。"; pause_menu ;;
+    esac
+  done
+}
+
+main() {
+  ensure_root "$@"
+  ensure_installation
+  ensure_docker
+
+  local command="${1:-menu}"
+  shift || true
+
+  case "$command" in
+    menu) menu ;;
+    status|ps) status ;;
+    start|up) start_service ;;
+    stop|down) stop_service ;;
+    restart) restart_service ;;
+    logs|log) logs ;;
+    edit|config) edit_config ;;
+    check) config_check ;;
+    format|fmt) config_format ;;
+    test) test_proxy ;;
+    backup) create_backup ;;
+    restore) restore_config "${1:-}" ;;
+    version|-v|--version) show_version ;;
+    upgrade) upgrade_version "${1:-}" ;;
+    pull|update) pull_current ;;
+    uninstall) uninstall_manager "${1:-}" ;;
+    help|-h|--help) print_help ;;
+    *)
+      error "未知命令: $command"
+      print_help
+      return 2
+      ;;
+  esac
+}
+
+main "$@"

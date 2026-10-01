@@ -1,0 +1,29 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Bash syntax
+        run: |
+          bash -n install.sh
+          bash -n bin/sbx
+
+      - name: Validate JSON
+        run: python -m json.tool config/config.example.json >/dev/null
+
+      - name: Validate Compose
+        run: |
+          cp .env.example .env
+          mkdir -p data backup
+          cp config/config.example.json config/config.json
+          docker compose -f compose.yml config >/dev/null
