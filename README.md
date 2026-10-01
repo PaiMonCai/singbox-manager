@@ -2,7 +2,7 @@
 
 面向 Linux 服务器的 sing-box Docker 管理层。sing-box 保持官方镜像运行，宿主机通过 `sbx` 完成安装、节点管理、配置生成、校验、测试、备份恢复与升级。
 
-当前版本：**0.8.0**
+当前版本：**0.8.1**
 
 ## 一键交互式安装
 
@@ -201,6 +201,40 @@ sbx route cn-direct-full
 
 
 
+
+
+## 0.8.1：安装器入口自动代理回退
+
+`sbx-install` 获取最新 `install.sh` 时，现在采用：
+
+```text
+直连 raw.githubusercontent.com
+        ↓ 失败
+检测/使用本机 sing-box
+        ↓
+http://127.0.0.1:<mixed端口>
+```
+
+也可以手工指定：
+
+```bash
+SBX_INSTALL_PROXY=http://127.0.0.1:7890 sbx-install
+```
+
+或者直接切换安装器镜像：
+
+```bash
+SBX_INSTALL_URL=https://example.com/install.sh sbx-install
+```
+
+如果机器还没有升级到带 `sbx-install` 的版本，而本机 sing-box 已经运行，可以使用：
+
+```bash
+curl -x http://127.0.0.1:7890 -fsSL \
+  https://raw.githubusercontent.com/PaiMonCai/singbox-manager/main/install.sh \
+  -o /tmp/sbx-install.sh \
+  && sudo bash /tmp/sbx-install.sh
+```
 
 ## 0.8：Docker 容器共享代理网络
 

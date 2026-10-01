@@ -98,6 +98,33 @@ jobs:
           test ! -e "$SBX_UPDATE_SERVICE_FILE"
           test ! -e "$SBX_UPDATE_TIMER_FILE"
 
+      - name: Exercise sbx-install proxy fallback
+        run: |
+          rm -rf /tmp/sbx-fake-bin /tmp/sbx-launcher-test
+          mkdir -p /tmp/sbx-fake-bin /tmp/sbx-launcher-test
+          cat > /tmp/sbx-fake-bin/curl <<'EOF'
+          #!/usr/bin/env bash
+          set -eu
+          out=""
+          proxy=0
+          while [ "$#" -gt 0 ]; do
+            case "$1" in
+              --proxy) proxy=1; shift 2 ;;
+              -o) out="$2"; shift 2 ;;
+              *) shift ;;
+            esac
+          done
+          if [ "$proxy" -eq 0 ]; then
+            exit 28
+          fi
+          printf '#!/usr/bin/env bash\nexit 0\n' > "$out"
+          EOF
+          chmod +x /tmp/sbx-fake-bin/curl
+          sudo env \
+            PATH="/tmp/sbx-fake-bin:$PATH" \
+            SBX_INSTALL_PROXY=http://127.0.0.1:7890 \
+            bash bin/sbx-install
+
       - name: Validate example JSON
         run: python -m json.tool config/config.example.json >/dev/null
 

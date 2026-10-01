@@ -4,6 +4,8 @@ set -Eeuo pipefail
 REPO="${SBX_REPO:-PaiMonCai/singbox-manager}"
 BRANCH="${SBX_INSTALL_BRANCH:-main}"
 URL="${SBX_INSTALL_URL:-https://raw.githubusercontent.com/${REPO}/${BRANCH}/install.sh}"
+HOME_DIR="${SBX_HOME:-/opt/singbox-manager}"
+ENV_FILE="${SBX_ENV_FILE:-$HOME_DIR/.env}"
 
 if [[ ${EUID:-$(id -u)} -ne 0 ]]; then
   if command -v sudo >/dev/null 2>&1; then
@@ -14,10 +16,54 @@ if [[ ${EUID:-$(id -u)} -ne 0 ]]; then
 fi
 
 tmp="$(mktemp /tmp/sbx-install.XXXXXX.sh)"
-cleanup(){ rm -f "$tmp"; }
+cleanup(){ rm -f "$tmp"; return 0; }
 trap cleanup EXIT
 
-printf '[INFO] 获取最新 singbox-manager 安装器...\n'
-curl -fL --retry 3 --connect-timeout 10 --max-time 45 "$URL" -o "$tmp"
+detect_proxy(){
+  if [[ -n "${SBX_INSTALL_PROXY:-}" ]]; then
+    printf '%s\n' "$SBX_INSTALL_PROXY"
+    return 0
+  fi
+
+  local port=""
+  if [[ -f "$ENV_FILE" ]]; then
+    port="$(grep -E '^SING_BOX_MIXED_PORT=' "$ENV_FILE" 2>/dev/null | tail -n1 | cut -d= -f2- || true)"
+  fi
+  [[ -n "$port" ]] || port="7890"
+
+  if command -v curl >/dev/null 2>&1 &&      curl --proxy "http://127.0.0.1:$port" --connect-timeout 3 --max-time 6        -fsS -o /dev/null https://www.gstatic.com/generate_204 2>/dev/null; then
+    printf 'http://127.0.0.1:%s\n' "$port"
+    return 0
+  fi
+  return 1
+}
+
+fetch_installer(){
+  printf '[INFO] 获取最新 singbox-manager 安装器...\n'
+  if curl -fL --retry 1 --connect-timeout 8 --max-time 25 "$URL" -o "$tmp"; then
+    return 0
+  fi
+
+  local proxy=""
+  proxy="$(detect_proxy || true)"
+  if [[ -n "$proxy" ]]; then
+    printf '[WARN] 直连更新源失败，尝试本机 sing-box: %s\n' "$proxy" >&2
+    if curl -fL --proxy "$proxy" --retry 2 --connect-timeout 8 --max-time 35 "$URL" -o "$tmp"; then
+      return 0
+    fi
+  fi
+
+  printf '[ERROR] 无法获取 install.sh。\n' >&2
+  printf '        可手工指定代理：SBX_INSTALL_PROXY=http://127.0.0.1:7890 sbx-install\n' >&2
+  printf '        或指定镜像地址：SBX_INSTALL_URL=https://你的镜像/install.sh sbx-install\n' >&2
+  return 1
+}
+
+command -v curl >/dev/null 2>&1 || {
+  printf '[ERROR] 未找到 curl。\n' >&2
+  exit 1
+}
+
+fetch_installer
 chmod 700 "$tmp"
 bash "$tmp" "$@"
