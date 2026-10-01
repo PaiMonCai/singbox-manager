@@ -416,6 +416,7 @@ jobs:
       - name: Exercise Docker shared proxy network
         run: |
           export HOME_DIR="${{ github.workspace }}/.ci-docker-net-home"
+          export SBX_HOME="$HOME_DIR"
           export ENV="$HOME_DIR/.env"
           export NODES="$HOME_DIR/nodes/nodes.json"
           export HELPER="${{ github.workspace }}/lib/sbx_nodes.py"

@@ -3,6 +3,7 @@ set -Eeuo pipefail
 
 VERSION="0.2.0"
 HOME_DIR="${SBX_HOME:-/opt/singbox-manager}"
+export SBX_HOME="$HOME_DIR"
 COMPOSE="$HOME_DIR/compose.yml"
 ENV="$HOME_DIR/.env"
 CONFIG="$HOME_DIR/config/config.json"
