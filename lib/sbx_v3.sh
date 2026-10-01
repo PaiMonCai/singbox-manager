@@ -202,7 +202,8 @@ subscription_menu(){
   local x r
   while true; do
     clear
-    printf '%b订阅管理%b\n1 查看  2 添加  3 更新  4 删除  5 详情  0 返回\n' "$C" "$N"
+    printf '%b订阅管理%b\n' "$C" "$N"
+    printf '1 查看     2 添加     3 更新\n4 删除     5 详情\n\n0 返回\n'
     read -r -p '请选择: ' x || return
     case "$x" in
       1) subscription list ;;
@@ -221,7 +222,8 @@ import_menu(){
   local x f
   while true; do
     clear
-    printf '%b导入%b\n1 分享链接  2 订阅  3 本地订阅/URI 文件  0 返回\n' "$C" "$N"
+    printf '%b导入%b\n' "$C" "$N"
+    printf '1 分享链接\n2 订阅\n3 本地订阅 / URI 文件\n\n0 返回\n'
     read -r -p '请选择: ' x || return
     case "$x" in
       1) import_uri || true ;;
@@ -238,8 +240,9 @@ strategy_menu(){
   local x
   while true; do
     clear
-    printf '%b出口策略%b\n当前: %s\n1 manual 手动默认节点\n2 auto URLTest 自动测速\n3 查看 URLTest 参数\n0 返回\n' \
-      "$C" "$N" "$(python3 "$HELPER" strategy)"
+    printf '%b出口策略%b\n' "$C" "$N"
+    printf '%b当前: %s%b\n\n' "$D" "$(python3 "$HELPER" strategy)" "$N"
+    printf '1  manual  手动指定默认节点\n2  auto    URLTest 自动测速\n3  查看 URLTest 参数\n\n0  返回\n'
     read -r -p '请选择: ' x || return
     case "$x" in
       1) strategy manual || true ;;
@@ -256,8 +259,9 @@ route_menu(){
   local x
   while true; do
     clear
-    printf '%b路由模式%b\n当前: %s\n1 global           私网直连，其余代理\n2 cn-direct-lite   私网 + .cn 直连\n3 cn-direct-full   私网 + .cn + CN rule-set 直连\n0 返回\n' \
-      "$C" "$N" "$(python3 "$HELPER" route-mode)"
+    printf '%b路由模式%b\n' "$C" "$N"
+    printf '%b当前: %s%b\n\n' "$D" "$(python3 "$HELPER" route-mode)" "$N"
+    printf '1  manual          私网直连，其余代理\n2  cn-direct-lite   私网 + .cn 直连\n3  cn-direct-full   私网 + .cn + CN rule-set 直连\n\n0  返回\n'
     read -r -p '请选择: ' x || return
     case "$x" in
       1) route_mode global || true ;;
@@ -276,16 +280,29 @@ menu(){
     clear
     printf '%b' "$C"
     cat <<'__MENU__'
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
         singbox-manager 0.3
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
- 1 状态      2 启动      3 停止      4 重启
- 5 日志      6 节点管理  7 导入      8 订阅管理
- 9 出口策略 10 路由模式 11 检查     12 测试代理
-13 备份     14 恢复     15 版本     16 升级
-17 拉取当前版本       18 高级编辑配置
- 0 退出
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+【服务控制】
+   1  状态          2  启动
+   3  停止          4  重启
+   5  日志
+
+【节点与入口】
+   6  节点管理      7  导入
+   8  订阅管理
+
+【出口与分流】
+   9  出口策略     10  路由模式
+
+【维护与诊断】
+  11  检查         12  测试代理
+  13  备份         14  恢复
+  15  版本         16  升级
+  17  拉取当前版本 18  高级编辑配置
+
+   0  退出
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 __MENU__
     printf '%b' "$N"
     read -r -p '请选择: ' x || exit

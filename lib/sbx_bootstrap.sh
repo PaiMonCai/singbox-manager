@@ -121,6 +121,8 @@ bootstrap_load_tar() {
 }
 
 bootstrap_menu() {
+  # 颜色变量来自 bin/sbx；install.sh 直接 source 本文件时需要兜底。
+  local Y="${Y:-\033[33m}" C="${C:-\033[36m}" D="${D:-\033[2m}" N="${N:-\033[0m}"
   local version="$1" env_file="$2" target choice proxy mirror tarfile
   target="$(bootstrap_target_image "$version" "$env_file")"
 
@@ -132,17 +134,15 @@ bootstrap_menu() {
   [[ "${NONINTERACTIVE:-0}" == "1" ]] && return 1
 
   while true; do
+    printf '\n%b本地缺少 sing-box 镜像%b\n  %b%s%b\n\n' "$Y" "$N" "$D" "$target" "$N"
+    printf '%bBootstrap 镜像获取方式%b\n' "$C" "$N"
     cat <<EOF
+  1  使用临时 HTTP/HTTPS 代理拉取目标镜像
+  2  使用自定义 / 可信镜像仓库拉取并重新 tag
+  3  docker load 本地 .tar 镜像包
+  4  明确尝试当前镜像源（最长约 ${BOOTSTRAP_PULL_TIMEOUT}s）
 
-本地缺少 sing-box 镜像：
-  $target
-
-Bootstrap 镜像获取方式：
-  1. 使用临时 HTTP/HTTPS 代理拉取目标镜像
-  2. 使用自定义/可信镜像仓库拉取并重新 tag
-  3. docker load 本地 .tar 镜像包
-  4. 明确尝试当前镜像源（最长约 ${BOOTSTRAP_PULL_TIMEOUT}s）
-  0. 取消
+  0  取消
 EOF
     read -r -p '请选择: ' choice || return 1
     case "$choice" in

@@ -14,7 +14,7 @@ INBOUND_COMPOSE="$HOME_DIR/compose.inbounds.yml"
 NETWORK_COMPOSE="$HOME_DIR/compose.network.yml"
 DOCKER_MANAGED="$HOME_DIR/docker-managed.json"
 
-G='\033[32m'; Y='\033[33m'; R='\033[31m'; C='\033[36m'; N='\033[0m'
+G='\033[32m'; Y='\033[33m'; R='\033[31m'; C='\033[36m'; N='\033[0m'; D='\033[2m'
 info(){ printf '%b[INFO]%b %s\n' "$G" "$N" "$*"; }
 warn(){ printf '%b[WARN]%b %s\n' "$Y" "$N" "$*" >&2; }
 die(){ printf '%b[ERROR]%b %s\n' "$R" "$N" "$*" >&2; exit 1; }
@@ -141,17 +141,27 @@ pull(){ backup; dc pull sing-box; check; dc up -d --force-recreate sing-box; }
 edit(){ local e="${SBX_EDITOR:-${EDITOR:-vi}}"; command -v "$e" >/dev/null || die "找不到编辑器 $e"; backup; warn "config.json 由节点库生成，后续节点操作会覆盖手工改动。"; "$e" "$CONFIG"; check; }
 
 pause(){ read -r -p '按 Enter 返回...' _ || true; }
-node_menu(){ local x r; while true; do clear; printf '%b节点管理%b\n1 查看  2 添加  3 编辑  4 删除\n5 默认  6 详情  7 测试  8 重建配置  0 返回\n' "$C" "$N"; read -r -p '请选择: ' x || return; case "$x" in 1) node list;;2) node_tx add;;3) read -r -p 'ID/名称(留空后选择): ' r; node_tx edit "$r"||true;;4) read -r -p 'ID/名称(留空后选择): ' r; node_tx delete "$r"||true;;5) read -r -p 'ID/名称(留空后选择): ' r; node_tx default "$r"||true;;6) read -r -p 'ID/名称(留空后选择): ' r; python3 "$HELPER" show ${r:+"$r"}||true;;7) read -r -p 'ID/名称(留空后选择): ' r; test_node "$r"||true;;8) node render;;0) return;;*) warn "无效选项";; esac; [[ "$x" != 0 ]] && pause; done; }
+node_menu(){ local x r; while true; do clear; printf '%b节点管理%b\n' "$C" "$N"; printf '1 查看     2 添加     3 编辑     4 删除\n5 默认     6 详情     7 测试     8 重建配置\n\n0 返回\n'; read -r -p '请选择: ' x || return; case "$x" in 1) node list;;2) node_tx add;;3) read -r -p 'ID/名称(留空后选择): ' r; node_tx edit "$r"||true;;4) read -r -p 'ID/名称(留空后选择): ' r; node_tx delete "$r"||true;;5) read -r -p 'ID/名称(留空后选择): ' r; node_tx default "$r"||true;;6) read -r -p 'ID/名称(留空后选择): ' r; python3 "$HELPER" show ${r:+"$r"}||true;;7) read -r -p 'ID/名称(留空后选择): ' r; test_node "$r"||true;;8) node render;;0) return;;*) warn "无效选项";; esac; [[ "$x" != 0 ]] && pause; done; }
 menu(){ local x v f; while true; do clear; printf '%b' "$C"; cat <<'__MENU__'
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
         singbox-manager 0.2
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-1 状态   2 启动   3 停止   4 重启   5 日志
-6 节点管理          7 检查配置   8 测试代理
-9 备份   10 恢复   11 版本      12 升级
-13 拉取当前版本     14 高级编辑配置
-0 退出
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+【服务控制】
+   1  状态          2  启动
+   3  停止          4  重启
+   5  日志
+
+【节点与入口】
+   6  节点管理
+
+【维护与诊断】
+   7  检查配置      8  测试代理
+   9  备份         10  恢复
+  11  版本         12  升级
+  13  拉取当前版本 14  高级编辑配置
+
+   0  退出
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 __MENU__
     printf '%b' "$N"; read -r -p '请选择: ' x || exit; case "$x" in 1) status;;2) start;;3) stop;;4) restart;;5) logs||true;;6) node_menu; continue;;7) check||true;;8) test_current||true;;9) backup;;10) read -r -p '备份文件(留空最新): ' f; restore "$f"||true;;11) version;;12) read -r -p '目标版本: ' v; [[ -n "$v" ]]&&upgrade "$v"||true;;13) pull;;14) edit||true;;0) exit;;*) warn "无效选项";; esac; pause; done; }
 help(){ cat <<'__HELP__'

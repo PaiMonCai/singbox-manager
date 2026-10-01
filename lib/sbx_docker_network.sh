@@ -539,12 +539,15 @@ docker_network_menu(){
     printf '%bDocker 容器共享代理网络%b\n\n' "$C" "$N"
     docker_network_status || true
     docker_network_watch_status || true
-    printf '\n1 扫描并托管  2 查看托管目标  3 立即同步\n'
-    printf '4 取消托管    5 临时接入容器  6 临时移除容器\n'
-    printf '7 查看成员    8 查看代理地址  9 Compose 模板\n'
-    printf '10 Watcher开启 11 Watcher关闭 12 开启共享网络\n'
-    printf '13 关闭共享网络 14 验证容器代理 15 验证全部托管\n'
-    printf '0 返回\n'
+    printf '\n【托管与同步】\n'
+    printf '  1 扫描并托管        2 查看托管目标\n  3 立即同步          4 取消托管\n'
+    printf '\n【临时接入】\n'
+    printf '  5 临时接入容器      6 临时移除容器\n  7 查看成员          8 查看代理地址\n  9 Compose 模板\n'
+    printf '\n【Watcher 与共享网络】\n'
+    printf ' 10 Watcher 开启     11 Watcher 关闭\n 12 开启共享网络     13 关闭共享网络\n'
+    printf '\n【验证】\n'
+    printf ' 14 验证容器代理     15 验证全部托管\n'
+    printf '\n  0 返回\n'
     read -r -p '请选择: ' x || return
     case "$x" in
       1) docker_network_scan_manage ;;
