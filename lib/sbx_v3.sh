@@ -204,8 +204,14 @@ subscription_menu(){
   local x r
   while true; do
     clear
-    printf '%b订阅管理%b\n' "$C" "$N"
-    printf '1 查看     2 添加     3 更新\n4 删除     5 详情\n\n0 返回\n'
+    menu_title '订阅管理'
+    menu_block '订阅操作' <<'EOF'
+   1  查看                 2  添加
+   3  更新                 4  删除
+   5  详情
+EOF
+    menu_footer '0  返回'
+    menu_end
     read -r -p '请选择: ' x || return
     case "$x" in
       1) subscription list ;;
@@ -224,8 +230,14 @@ import_menu(){
   local x f
   while true; do
     clear
-    printf '%b导入%b\n' "$C" "$N"
-    printf '1 分享链接\n2 订阅\n3 本地订阅 / URI 文件\n\n0 返回\n'
+    menu_title '导入'
+    menu_block '导入方式' <<'EOF'
+   1  分享链接
+   2  订阅
+   3  本地订阅 / URI 文件
+EOF
+    menu_footer '0  返回'
+    menu_end
     read -r -p '请选择: ' x || return
     case "$x" in
       1) import_uri || true ;;
@@ -242,9 +254,15 @@ strategy_menu(){
   local x
   while true; do
     clear
-    printf '%b出口策略%b\n' "$C" "$N"
-    printf '%b当前: %s%b\n\n' "$D" "$(python3 "$HELPER" strategy)" "$N"
-    printf '1  manual  手动指定默认节点\n2  auto    URLTest 自动测速\n3  查看 URLTest 参数\n\n0  返回\n'
+    menu_title '出口策略'
+    menu_note "当前: $(python3 "$HELPER" strategy)"
+    menu_block '切换策略' <<'EOF'
+   1  manual            手动指定默认节点
+   2  auto              URLTest 自动测速
+   3  查看 URLTest 参数
+EOF
+    menu_footer '0  返回'
+    menu_end
     read -r -p '请选择: ' x || return
     case "$x" in
       1) strategy manual || true ;;
@@ -261,9 +279,15 @@ route_menu(){
   local x
   while true; do
     clear
-    printf '%b路由模式%b\n' "$C" "$N"
-    printf '%b当前: %s%b\n\n' "$D" "$(python3 "$HELPER" route-mode)" "$N"
-    printf '1  manual          私网直连，其余代理\n2  cn-direct-lite   私网 + .cn 直连\n3  cn-direct-full   私网 + .cn + CN rule-set 直连\n\n0  返回\n'
+    menu_title '路由模式'
+    menu_note "当前: $(python3 "$HELPER" route-mode)"
+    menu_block '切换模式' <<'EOF'
+   1  manual           私网直连，其余代理
+   2  cn-direct-lite   私网 + .cn 直连
+   3  cn-direct-full   私网 + .cn + CN rule-set 直连
+EOF
+    menu_footer '0  返回'
+    menu_end
     read -r -p '请选择: ' x || return
     case "$x" in
       1) route_mode global || true ;;

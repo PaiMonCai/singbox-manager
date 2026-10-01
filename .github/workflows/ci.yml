@@ -481,6 +481,50 @@ jobs:
             echo 'NO_COLOR=1 时安装器仍有 ANSI 颜色' >&2; exit 1
           fi
 
+      - name: Verify menu layout
+        run: |
+          set -e
+          THEME_BIN=/tmp/sbx-layout-bin
+          mkdir -p "$THEME_BIN"
+          printf '#!/usr/bin/env bash\nexit 0\n' > "$THEME_BIN/clear"
+          chmod +x "$THEME_BIN/clear"
+          # 颜色由 theme 步骤单独校验，这里先剥掉 ANSI 转义再看版式
+          ESC=$(printf '\033')
+          strip_ansi() { sed "s/${ESC}\[[0-9;]*m//g"; }
+          run_menu() {
+            printf '0\n' | sudo env -u NO_COLOR COLUMNS=76 PATH="$THEME_BIN:$PATH" TERM=xterm "$@" \
+              SBX_HOME=/tmp/sbx-manager-only bash bin/sbx 2>&1 | strip_ansi || true
+          }
+
+          wide="$(run_menu)"
+          printf '%s\n' "$wide" | sed -n '1,14p'
+          # 标题带真实版本号，且上下有分隔线
+          printf '%s' "$wide" | grep -qF "singbox-manager $(cat VERSION)"
+          printf '%s' "$wide" | grep -qF '━'
+          # 区块标题缩进 2 格、条目再缩进（行距与缩进）
+          printf '%s' "$wide" | grep -qE '^  【服务控制】'
+          printf '%s' "$wide" | grep -qE '^  【维护与诊断】'
+          printf '%s' "$wide" | grep -qE '^     1  状态'
+          # 区块标题后有空行（comfortable 版式）
+          printf '%s\n' "$wide" | grep -A1 -F '【服务控制】' | sed -n 2p | grep -q '^$'
+          # 分隔线宽度跟随终端（COLUMNS=76 → 上限 72），━ 是 3 字节字符
+          rule="$(printf '%s\n' "$wide" | grep -F '━' | head -1)"
+          chars="$(LC_ALL=C.UTF-8 bash -c 'printf %s "$1" | wc -m' _ "$rule")"
+          test "$chars" -eq 72
+
+          # compact：不缩进、不留空行
+          tight="$(run_menu SBX_MENU_DENSITY=compact)"
+          printf '%s' "$tight" | grep -qE '^   1  状态'
+          printf '%s' "$tight" | grep -qE '^【服务控制】'
+          if printf '%s\n' "$tight" | grep -A1 -F '【服务控制】' | sed -n 2p | grep -q '^$'; then
+            echo 'compact 版式不应有空行' >&2; exit 1
+          fi
+
+          # 窄终端自动降级为 compact
+          narrow="$(printf '0\n' | sudo env -u NO_COLOR COLUMNS=52 PATH="$THEME_BIN:$PATH" TERM=xterm \
+            SBX_HOME=/tmp/sbx-manager-only bash bin/sbx 2>&1 | strip_ansi || true)"
+          printf '%s' "$narrow" | grep -qE '^【服务控制】'
+
       - name: Re-run installer reuses the existing config
         run: |
           rm -rf /tmp/sbx-reinstall /tmp/sbx-reinstall-bin

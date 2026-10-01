@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # singbox-manager v0.7 self-update integration.
 
-VERSION="0.11.7"
+VERSION="0.11.8"
 
 UPDATE_REPO="${SBX_UPDATE_REPO:-PaiMonCai/singbox-manager}"
 UPDATE_BRANCH="${SBX_UPDATE_BRANCH:-main}"
@@ -497,9 +497,20 @@ manager_menu(){
   local x
   while true; do
     clear
-    printf '%b管理器更新%b\n' "$C" "$N"
-    printf '%b当前版本: %s%b\n\n' "$D" "$(manager_local_version)" "$N"
-    printf '1  检查更新\n2  立即更新\n3  强制重装管理器\n\n4  开启自动更新\n5  关闭自动更新\n6  自动更新状态\n\n0  返回\n'
+    menu_title '管理器更新'
+    menu_note "当前版本: $(manager_local_version)"
+    menu_block '手动更新' <<'EOF'
+   1  检查更新
+   2  立即更新
+   3  强制重装管理器
+EOF
+    menu_block '自动更新' <<'EOF'
+   4  开启自动更新
+   5  关闭自动更新
+   6  自动更新状态
+EOF
+    menu_footer '0  返回'
+    menu_end
     read -r -p '请选择: ' x || return
     case "$x" in
       1) manager_check || true ;;
@@ -564,36 +575,30 @@ menu(){
   local x v f
   while true; do
     clear
-    printf '%b' "$C"
-    cat <<'EOF'
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-        singbox-manager 0.11
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-【服务控制】
-   1  状态          2  启动
-   3  停止          4  重启
+    menu_title "singbox-manager $(manager_local_version)"
+    menu_block '服务控制' <<'EOF'
+   1  状态                 2  启动
+   3  停止                 4  重启
    5  日志
-
-【节点与入口】
-   6  节点管理      7  订阅管理
-   8  导入         12  入口管理
-
-【出口与分流】
-   9  出口策略     10  路由模式
-  11  应用代理
-
-【维护与诊断】
-  13  检查         14  测试代理
-  15  备份         16  恢复
-  17  版本         18  sing-box 升级
-  19  拉取当前镜像
-  20  管理器更新   21  Docker 容器网络
-  22  系统诊断     23  高级编辑
-
-   0  退出
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 EOF
-    printf '%b' "$N"
+    menu_block '节点与入口' <<'EOF'
+   6  节点管理             7  订阅管理
+   8  导入                12  入口管理
+EOF
+    menu_block '出口与分流' <<'EOF'
+   9  出口策略            10  路由模式
+  11  应用代理
+EOF
+    menu_block '维护与诊断' <<'EOF'
+  13  检查                14  测试代理
+  15  备份                16  恢复
+  17  版本                18  sing-box 升级
+  19  拉取当前镜像
+  20  管理器更新          21  Docker 容器网络
+  22  系统诊断            23  高级编辑
+EOF
+    menu_footer '0  退出'
+    menu_end
     read -r -p '请选择: ' x || exit
     case "$x" in
       1) status ;;

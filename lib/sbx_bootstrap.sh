@@ -149,7 +149,8 @@ bootstrap_menu() {
   while true; do
     printf '\n%b本地缺少 sing-box 镜像%b\n  %b%s%b\n\n' "$Y" "$N" "$D" "$target" "$N"
     printf '%bBootstrap 镜像获取方式%b\n' "$C" "$N"
-    cat <<EOF
+    if [[ "${SBX_MENU_DENSITY:-comfortable}" == "compact" ]]; then
+      cat <<EOF
   1  使用临时 HTTP/HTTPS 代理拉取目标镜像
   2  使用自定义 / 可信镜像仓库拉取并重新 tag
   3  docker load 本地 .tar 镜像包
@@ -157,6 +158,20 @@ bootstrap_menu() {
 
   0  取消
 EOF
+    else
+      printf '\n'
+      cat <<EOF
+  1  使用临时 HTTP/HTTPS 代理拉取目标镜像
+
+  2  使用自定义 / 可信镜像仓库拉取并重新 tag
+
+  3  docker load 本地 .tar 镜像包
+
+  4  明确尝试当前镜像源（最长约 ${BOOTSTRAP_PULL_TIMEOUT}s）
+
+  0  取消
+EOF
+    fi
     read -r -p '请选择: ' choice || return 1
     case "$choice" in
       1)

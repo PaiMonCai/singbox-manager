@@ -1,4 +1,9 @@
 .env
+
+# 本地手工跑 CI 步骤时生成的临时目录/文件
+.ci-*/
+.ci-proxy.env
+.ci-update-src/
 config/config.json
 nodes/nodes.json
 nodes/.sbx-nodes.lock
@@ -18,11 +23,3 @@ compose.network.yml
 docker-managed.json
 
 # 本地手工跑 CI 步骤时生成的临时目录
-.ci-home/
-.ci-proxy.env
-.ci-proxy-state/
-.ci-apt/
-.ci-git/
-.ci-update-src/
-.ci-version-home/
-.ci-systemd/

@@ -107,10 +107,17 @@ inbound_menu(){
   local x ref
   while true; do
     clear
-    printf '%b入口路由管理%b\n' "$C" "$N"
-    printf '%b每个代理入口都有稳定 ID；Docker 托管建议按 ID 绑定。%b\n\n' "$D" "$N"
+    menu_title '入口路由管理'
+    menu_note '每个代理入口都有稳定 ID；Docker 托管建议按 ID 绑定。'
+    printf '\n'
     python3 "$HELPER" inbound-list || true
-    printf '\n1 添加     2 编辑     3 删除\n4 详情     5 测试     0 返回\n'
+    menu_block '入口操作' <<'EOF'
+   1  添加                 2  编辑
+   3  删除                 4  详情
+   5  测试
+EOF
+    menu_footer '0  返回'
+    menu_end
     read -r -p '请选择: ' x || return
     case "$x" in
       1) inbound_tx add "" || true ;;

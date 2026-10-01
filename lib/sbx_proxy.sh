@@ -355,9 +355,21 @@ proxy_menu(){
   local x target action
   while true; do
     clear
-    printf '%b宿主机应用代理%b\n' "$C" "$N"
+    menu_title '宿主机应用代理'
+    printf '\n'
     proxy_status
-    printf '\n1 Docker          2 Git\n3 APT             4 npm\n5 全部开启        6 全部关闭\n7 Shell 环境变量  8 测试 sing-box\n9 curl (~/.curlrc)\n\n0 返回\n'
+    menu_block '单项开关' <<'EOF'
+   1  Docker               2  Git
+   3  APT                  4  npm
+   5  全部开启             6  全部关闭
+   9  curl (~/.curlrc)
+EOF
+    menu_block '调试' <<'EOF'
+   7  Shell 环境变量
+   8  测试 sing-box
+EOF
+    menu_footer '0  返回'
+    menu_end
     read -r -p '请选择: ' x || return
     case "$x" in
       1|2|3|4|9)

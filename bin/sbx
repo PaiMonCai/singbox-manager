@@ -24,14 +24,92 @@ DOCKER_MANAGED="$HOME_DIR/docker-managed.json"
 #   G [INFO] 明绿 / Y [WARN] 明黄 / R [ERROR] 明红 / D 次要文字浅灰（原来纯 dim 偏暗）
 # SBX_COLOR_ACCENT 可换主色（例如 96 明青、1;36 加粗青）；NO_COLOR=1 或 SBX_NO_COLOR=1 关闭全部颜色
 if [[ -n "${NO_COLOR:-}" || "${SBX_NO_COLOR:-0}" == "1" ]]; then
-  G=''; Y=''; R=''; C=''; N=''; D=''
+  G=''; Y=''; R=''; C=''; N=''; D=''; B=''
 else
   G='\033[92m'; Y='\033[93m'; R='\033[91m'; D='\033[37m'; N='\033[0m'
   C="\033[${SBX_COLOR_ACCENT:-92}m"
+  B='\033[1m'
 fi
 info(){ printf '%b[INFO]%b %s\n' "$G" "$N" "$*"; }
 warn(){ printf '%b[WARN]%b %s\n' "$Y" "$N" "$*" >&2; }
 die(){ printf '%b[ERROR]%b %s\n' "$R" "$N" "$*" >&2; exit 1; }
+
+# ── 菜单版式 ─────────────────────────────────────────────────────────────────
+# 终端里的字号由终端自己决定（脚本改不了），这里能调的是：行距、缩进、列宽、
+# 标题块与分隔线宽度。SBX_MENU_DENSITY=comfortable|compact 切换版式，
+# 默认 comfortable；终端太窄（COLUMNS<60）时自动用 compact，避免折行。
+menu_termsize(){ # 终端列数：COLUMNS → tput（COLUMNS 在子脚本里常常拿不到）→ 默认 52
+  local w=""
+  if [[ "${COLUMNS:-}" =~ ^[0-9]+$ ]]; then
+    w="$COLUMNS"
+  elif [[ -t 1 ]] && command -v tput >/dev/null 2>&1; then
+    w="$(tput cols 2>/dev/null || true)"
+  fi
+  [[ "$w" =~ ^[0-9]+$ ]] || w=52
+  printf '%s' "$w"
+}
+menu_density(){
+  case "${SBX_MENU_DENSITY:-comfortable}" in
+    compact|tight|0) printf 'compact'; return ;;
+  esac
+  # 窄终端自动回到紧凑版式，避免折行
+  if (( $(menu_termsize) < 60 )); then
+    printf 'compact'
+    return
+  fi
+  printf 'comfortable'
+}
+menu_width(){ # 分隔线宽度：跟随终端，夹在 40..72
+  local w
+  w="$(menu_termsize)"
+  if [[ "$(menu_density)" == "compact" ]]; then printf '42'; return; fi
+  (( w > 72 )) && w=72
+  (( w < 40 )) && w=40
+  printf '%s' "$w"
+}
+menu_rule(){ # 分隔线
+  local w i line=""
+  w="$(menu_width)"
+  for ((i=0;i<w;i++)); do line+="━"; done
+  printf '%b%s%b\n' "$C" "$line" "$N"
+}
+menu_title(){ # 顶部标题块：分隔线 + 居中加粗标题 + 分隔线
+  local text="$*" w pad
+  w="$(menu_width)"
+  pad=$(( (w - ${#text}) / 2 ))
+  (( pad < 0 )) && pad=0
+  [[ "$(menu_density)" == "compact" ]] || printf '\n'
+  menu_rule
+  printf '%b%b%*s%s%b\n' "$C" "$B" "$pad" "" "$text" "$N"
+  menu_rule
+}
+menu_block(){ # 区块：标题 + 条目（条目从 stdin 传入，comfortable 下统一缩进并留行距）
+  local title="$1"
+  if [[ "$(menu_density)" == "compact" ]]; then
+    printf '%b【%s】%b\n' "$C" "$title" "$N"
+    cat
+  else
+    printf '\n  %b【%s】%b\n\n' "$C" "$title" "$N"
+    sed 's/^/  /'
+  fi
+}
+menu_note(){ # 标题下的一行次要信息（当前版本 / 当前策略…）
+  if [[ "$(menu_density)" == "compact" ]]; then
+    printf '%b%s%b\n\n' "$D" "$*" "$N"
+  else
+    printf '\n    %b%s%b\n' "$D" "$*" "$N"
+  fi
+}
+menu_end(){ # comfortable 版式下补一条收尾分隔线
+  [[ "$(menu_density)" == "compact" ]] || menu_rule
+}
+menu_footer(){ # 收尾项（0 返回 / 0 退出）
+  if [[ "$(menu_density)" == "compact" ]]; then
+    printf '%s\n' "$*"
+  else
+    printf '\n    %b%s%b\n\n' "$D" "$*" "$N"
+  fi
+}
 
 root(){
   if [[ ${EUID:-$(id -u)} -ne 0 ]]; then
@@ -130,7 +208,35 @@ test_current(){ running || die "sing-box 未运行。"; local port; port=$(envva
 edit(){ local e="${SBX_EDITOR:-${EDITOR:-vi}}"; command -v "$e" >/dev/null || die "找不到编辑器 $e"; backup; warn "config.json 由节点库生成，后续节点操作会覆盖手工改动。"; "$e" "$CONFIG"; check; }
 
 pause(){ read -r -p '按 Enter 返回...' _ || true; }
-node_menu(){ local x r p='序号(留空可列表选择): '; while true; do clear; printf '%b节点管理%b\n' "$C" "$N"; printf '1 查看     2 添加     3 编辑     4 删除\n5 默认     6 详情     7 测试     8 重建配置\n\n0 返回\n'; read -r -p '请选择: ' x || return; case "$x" in 1) node list;;2) node_tx add;;3) read -r -p "$p" r; node_tx edit "$r"||true;;4) read -r -p "$p" r; node_tx delete "$r"||true;;5) read -r -p "$p" r; node_tx default "$r"||true;;6) read -r -p "$p" r; python3 "$HELPER" show ${r:+"$r"}||true;;7) read -r -p "$p" r; test_node "$r"||true;;8) node render;;0) return;;*) warn "无效选项";; esac; [[ "$x" != 0 ]] && pause; done; }
+node_menu(){
+  local x r p='序号(留空可列表选择): '
+  while true; do
+    clear
+    menu_title '节点管理'
+    menu_block '节点操作' <<'EOF'
+   1  查看                 2  添加
+   3  编辑                 4  删除
+   5  默认                 6  详情
+   7  测试                 8  重建配置
+EOF
+    menu_footer '0  返回'
+    menu_end
+    read -r -p '请选择: ' x || return
+    case "$x" in
+      1) node list ;;
+      2) node_tx add ;;
+      3) read -r -p "$p" r; node_tx edit "$r" || true ;;
+      4) read -r -p "$p" r; node_tx delete "$r" || true ;;
+      5) read -r -p "$p" r; node_tx default "$r" || true ;;
+      6) read -r -p "$p" r; python3 "$HELPER" show ${r:+"$r"} || true ;;
+      7) read -r -p "$p" r; test_node "$r" || true ;;
+      8) node render ;;
+      0) return ;;
+      *) warn "无效选项" ;;
+    esac
+    [[ "$x" != 0 ]] && pause
+  done
+}
 # 缺任何一个 lib 都要给可读的报错。否则后面只会在 case 分发处报
 # "main: command not found"，或者更糟：静默少掉某个子命令。
 for _lib in sbx_v3.sh sbx_proxy.sh sbx_bootstrap.sh sbx_image.sh sbx_inbound.sh sbx_docker_network.sh sbx_update.sh; do
