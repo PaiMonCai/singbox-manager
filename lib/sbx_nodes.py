@@ -15,6 +15,8 @@ from urllib.parse import parse_qs, unquote, urlsplit
 HOME = Path(os.environ.get("SBX_HOME", "/opt/singbox-manager"))
 REGISTRY = HOME / "nodes" / "nodes.json"
 CONFIG = HOME / "config" / "config.json"
+INBOUND_COMPOSE = HOME / "compose.inbounds.yml"
+ENV_FILE = HOME / ".env"
 SUPPORTED = ("shadowsocks", "vless", "trojan", "hysteria2", "socks")
 DEFAULT_SETTINGS = {
     "strategy": "manual",
@@ -55,22 +57,26 @@ def merged_settings(value: Any) -> Dict[str, Any]:
 
 def load_registry() -> Dict[str, Any]:
     if not REGISTRY.exists():
-        return {"version": 2, "default": None, "settings": merged_settings(None), "subscriptions": [], "nodes": []}
+        return {"version": 3, "default": None, "settings": merged_settings(None), "subscriptions": [], "inbounds": [], "nodes": []}
     with REGISTRY.open("r", encoding="utf-8") as f:
         data = json.load(f)
     if not isinstance(data, dict) or not isinstance(data.get("nodes"), list):
         raise ValueError("节点库格式无效")
-    data["version"] = max(int(data.get("version", 1)), 2)
+    data["version"] = max(int(data.get("version", 1)), 3)
     data.setdefault("default", None)
     data["settings"] = merged_settings(data.get("settings"))
     if not isinstance(data.get("subscriptions"), list):
         data["subscriptions"] = []
+    if not isinstance(data.get("inbounds"), list):
+        data["inbounds"] = []
     return data
 
 
 def save_registry(data: Dict[str, Any]) -> None:
-    data["version"] = 2
+    data["version"] = 3
     data["settings"] = merged_settings(data.get("settings"))
+    if not isinstance(data.get("inbounds"), list):
+        data["inbounds"] = []
     atomic_json(REGISTRY, data)
 
 
@@ -170,6 +176,220 @@ def new_id(existing: Iterable[Dict[str, Any]]) -> str:
 
 def node_tag(node: Dict[str, Any]) -> str:
     return f"node-{node['id']}"
+
+
+def inbound_tag(inbound: Dict[str, Any]) -> str:
+    return f"inbound-{inbound['id']}"
+
+
+def read_env_file() -> Dict[str, str]:
+    out: Dict[str, str] = {}
+    if not ENV_FILE.exists():
+        return out
+    for line in ENV_FILE.read_text(encoding="utf-8", errors="replace").splitlines():
+        raw = line.strip()
+        if not raw or raw.startswith("#") or "=" not in raw:
+            continue
+        key, value = raw.split("=", 1)
+        out[key.strip()] = value.strip()
+    return out
+
+
+def default_host_port() -> int:
+    raw = read_env_file().get("SING_BOX_MIXED_PORT", "7890")
+    try:
+        return int(raw)
+    except ValueError:
+        return 7890
+
+
+def resolve_inbound(data: Dict[str, Any], ref: Optional[str]) -> Dict[str, Any]:
+    items = data.get("inbounds", [])
+    if not items:
+        raise ValueError("当前没有自定义入口")
+    if not ref:
+        list_inbounds(data)
+        ref = prompt("请输入入口 ID 或名称", required=True)
+    exact = [x for x in items if x.get("id") == ref]
+    if len(exact) == 1:
+        return exact[0]
+    prefix = [x for x in items if str(x.get("id", "")).startswith(ref)]
+    if len(prefix) == 1:
+        return prefix[0]
+    named = [x for x in items if x.get("name") == ref]
+    if len(named) == 1:
+        return named[0]
+    if len(prefix) > 1 or len(named) > 1:
+        raise ValueError("匹配到多个入口，请使用完整 ID")
+    raise ValueError(f"未找到入口: {ref}")
+
+
+def target_from_ref(data: Dict[str, Any], value: str) -> Dict[str, Any]:
+    raw = (value or "").strip()
+    if raw in ("direct", "proxy", "auto"):
+        if raw in ("proxy", "auto") and not data.get("nodes"):
+            raise ValueError(f"当前没有节点，不能使用 {raw} 出口")
+        return {"type": raw}
+    if raw.startswith("node:"):
+        node = resolve_node(data, raw[5:])
+        return {"type": "node", "node_id": node["id"]}
+    node = resolve_node(data, raw)
+    return {"type": "node", "node_id": node["id"]}
+
+
+def target_tag(data: Dict[str, Any], target: Any) -> str:
+    if not isinstance(target, dict):
+        raise ValueError("入口 target 格式无效")
+    typ = target.get("type")
+    if typ == "direct":
+        return "direct"
+    if typ in ("proxy", "auto"):
+        if not data.get("nodes"):
+            raise ValueError(f"入口引用 {typ}，但当前没有节点")
+        return str(typ)
+    if typ == "node":
+        node_id = target.get("node_id")
+        node = next((n for n in data.get("nodes", []) if n.get("id") == node_id), None)
+        if not node:
+            raise ValueError(f"入口引用的节点不存在: {node_id}")
+        return node_tag(node)
+    raise ValueError(f"未知入口出口类型: {typ}")
+
+
+def target_label(data: Dict[str, Any], target: Any) -> str:
+    if not isinstance(target, dict):
+        return "INVALID"
+    typ = target.get("type")
+    if typ != "node":
+        return str(typ or "INVALID")
+    node_id = target.get("node_id")
+    node = next((n for n in data.get("nodes", []) if n.get("id") == node_id), None)
+    return f"{node.get('name')} ({node_id})" if node else f"MISSING ({node_id})"
+
+
+def choose_target(data: Dict[str, Any], current: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    print("\n出口：")
+    print("  1. proxy  跟随全局 selector 策略")
+    print("  2. auto   固定使用 URLTest 自动测速组")
+    print("  3. direct 直连")
+    base = 4
+    for idx, node in enumerate(data.get("nodes", []), base):
+        print(f"  {idx}. {node.get('name')} [{node.get('id')}]")
+    default = "1"
+    if isinstance(current, dict):
+        typ = current.get("type")
+        if typ == "proxy": default = "1"
+        elif typ == "auto": default = "2"
+        elif typ == "direct": default = "3"
+        elif typ == "node":
+            for idx, node in enumerate(data.get("nodes", []), base):
+                if node.get("id") == current.get("node_id"):
+                    default = str(idx)
+                    break
+    while True:
+        raw = prompt("请选择出口", default, required=True)
+        if raw == "1":
+            return target_from_ref(data, "proxy")
+        if raw == "2":
+            return target_from_ref(data, "auto")
+        if raw == "3":
+            return target_from_ref(data, "direct")
+        try:
+            idx = int(raw) - base
+        except ValueError:
+            idx = -1
+        nodes = data.get("nodes", [])
+        if 0 <= idx < len(nodes):
+            return {"type": "node", "node_id": nodes[idx]["id"]}
+        print("无效出口。")
+
+
+def validate_listen_address(value: str, interactive: bool = False) -> str:
+    try:
+        addr = ipaddress.ip_address(value)
+    except ValueError as exc:
+        raise ValueError("入口监听地址必须是 IP 地址") from exc
+    if not addr.is_loopback:
+        if not interactive:
+            raise ValueError("非回环监听必须使用交互式入口管理并输入 PUBLIC 确认")
+        confirm = prompt("非回环监听会暴露无认证 mixed 代理；输入 PUBLIC 确认")
+        if confirm != "PUBLIC":
+            raise ValueError("已取消非回环入口")
+    return str(addr)
+
+
+def next_inbound_port(data: Dict[str, Any]) -> int:
+    used = {7890, default_host_port()}
+    used.update(int(x.get("port", 0)) for x in data.get("inbounds", []))
+    port = 7891
+    while port in used and port <= 65535:
+        port += 1
+    if port > 65535:
+        raise ValueError("没有可用入口端口")
+    return port
+
+
+def validate_inbound_port(data: Dict[str, Any], port: int, current_id: Optional[str] = None) -> None:
+    if not 1 <= int(port) <= 65535:
+        raise ValueError("入口端口必须是 1-65535")
+    if int(port) == 7890:
+        raise ValueError("7890 是容器默认 mixed-in 端口，不能用于自定义入口")
+    if int(port) == default_host_port():
+        raise ValueError(f"{port} 已被默认 mixed 入口占用")
+    for item in data.get("inbounds", []):
+        if item.get("id") != current_id and int(item.get("port", 0)) == int(port):
+            raise ValueError(f"入口端口已被占用: {port}")
+
+
+def build_inbound(data: Dict[str, Any], existing: Optional[Dict[str, Any]] = None, *,
+                  name: Optional[str] = None, listen: Optional[str] = None,
+                  port: Optional[int] = None, target_ref: Optional[str] = None) -> Dict[str, Any]:
+    existing = existing or {}
+    interactive = name is None and listen is None and port is None and target_ref is None
+    inbound_id = existing.get("id")
+    if name is None:
+        name = prompt("入口名称", existing.get("name"), True)
+    if not name:
+        raise ValueError("入口名称不能为空")
+    if any(x.get("name") == name and x.get("id") != inbound_id for x in data.get("inbounds", [])):
+        raise ValueError(f"入口名称重复: {name}")
+
+    if listen is None:
+        listen = prompt("宿主机监听地址", existing.get("listen", "127.0.0.1"), True)
+    listen = validate_listen_address(listen, interactive=interactive)
+
+    if port is None:
+        port = prompt_port("入口端口", int(existing.get("port") or next_inbound_port(data)))
+    validate_inbound_port(data, int(port), inbound_id)
+
+    target = target_from_ref(data, target_ref) if target_ref is not None else choose_target(data, existing.get("target"))
+    return {
+        "id": inbound_id,
+        "name": str(name),
+        "type": "mixed",
+        "listen": listen,
+        "port": int(port),
+        "target": target,
+    }
+
+
+def repair_inbound_targets(data: Dict[str, Any], removed_ids: Iterable[str],
+                           replacements: Optional[Dict[str, str]] = None) -> int:
+    removed = set(removed_ids)
+    replacements = replacements or {}
+    changed = 0
+    fallback = {"type": "proxy"} if data.get("nodes") else {"type": "direct"}
+    for inbound in data.get("inbounds", []):
+        target = inbound.get("target")
+        if not isinstance(target, dict) or target.get("type") != "node":
+            continue
+        old_id = target.get("node_id")
+        if old_id not in removed:
+            continue
+        new_id = replacements.get(str(old_id))
+        inbound["target"] = {"type": "node", "node_id": new_id} if new_id else dict(fallback)
+        changed += 1
+    return changed
 
 
 def resolve_node(data: Dict[str, Any], ref: Optional[str]) -> Dict[str, Any]:
@@ -502,7 +722,7 @@ def make_proxy_groups(data: Dict[str, Any], outbounds: List[Dict[str, Any]]) -> 
 
 def route_config(data: Dict[str, Any], proxy_tag: str) -> Dict[str, Any]:
     mode = data["settings"].get("route_mode", "global")
-    route: Dict[str, Any] = {"rules": [{"ip_is_private": True, "action": "route", "outbound": "direct"}], "final": proxy_tag, "auto_detect_interface": True}
+    inbound_rules = [{"inbound": [inbound_tag(x)], "action": "route", "outbound": target_tag(data, x.get("target"))} for x in data.get("inbounds", [])]\n    route: Dict[str, Any] = {"rules": inbound_rules + [{"ip_is_private": True, "action": "route", "outbound": "direct"}], "final": proxy_tag, "auto_detect_interface": True}
     if mode in ("cn-direct-lite", "cn-direct-full"):
         route["rules"].append({"domain_suffix": [".cn"], "action": "route", "outbound": "direct"})
     if mode == "cn-direct-full":
@@ -523,14 +743,39 @@ def make_config(data: Dict[str, Any], listen_port: int = 7890, only_node: Option
         proxy_tag = make_proxy_groups(data, outbounds)
         outbounds.append({"type": "direct", "tag": "direct"})
         route = route_config(data, proxy_tag)
-    cfg: Dict[str, Any] = {"$schema": "https://sing-box.sagernet.org/schema.json", "log": {"level": "info", "timestamp": True}, "inbounds": [{"type": "mixed", "tag": "mixed-in", "listen": "0.0.0.0", "listen_port": int(listen_port)}], "outbounds": outbounds, "route": route}
+    inbounds: List[Dict[str, Any]] = [{"type": "mixed", "tag": "mixed-in", "listen": "0.0.0.0", "listen_port": int(listen_port)}]
+    if not only_node:
+        inbounds.extend({"type": "mixed", "tag": inbound_tag(x), "listen": "0.0.0.0", "listen_port": int(x["port"])} for x in data.get("inbounds", []))
+    cfg: Dict[str, Any] = {"$schema": "https://sing-box.sagernet.org/schema.json", "log": {"level": "info", "timestamp": True}, "inbounds": inbounds, "outbounds": outbounds, "route": route}
     if data["settings"].get("route_mode") == "cn-direct-full" and not only_node:
         cfg["experimental"] = {"cache_file": {"enabled": True}}
     return cfg
 
 
+def render_inbound_compose(data: Dict[str, Any]) -> None:
+    items = data.get("inbounds", [])
+    if not items:
+        try:
+            INBOUND_COMPOSE.unlink()
+        except FileNotFoundError:
+            pass
+        return
+    lines = ["services:", "  sing-box:", "    ports:"]
+    for inbound in items:
+        host = str(inbound["listen"])
+        host_fmt = f"[{host}]" if ":" in host else host
+        port = int(inbound["port"])
+        lines.append(f'      - "{host_fmt}:{port}:{port}/tcp"')
+        lines.append(f'      - "{host_fmt}:{port}:{port}/udp"')
+    INBOUND_COMPOSE.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    os.chmod(INBOUND_COMPOSE, 0o600)
+
+
 def render(data: Optional[Dict[str, Any]] = None, target: Optional[Path] = None, port: int = 7890) -> None:
-    data = data or load_registry(); atomic_json(target or CONFIG, make_config(data, port))
+    data = data or load_registry()
+    atomic_json(target or CONFIG, make_config(data, port))
+    if target is None:
+        render_inbound_compose(data)
 
 
 def list_nodes(data: Optional[Dict[str, Any]] = None) -> None:
@@ -543,12 +788,27 @@ def list_nodes(data: Optional[Dict[str, Any]] = None) -> None:
         print(f"{mark:<4} {n.get('id',''):<10} {n.get('type',''):<12} {n.get('name','')[:20]:<22} {src[:12]:<14} {n.get('server')}:{n.get('server_port')}")
 
 
+def list_inbounds(data: Optional[Dict[str, Any]] = None) -> None:
+    data = data or load_registry()
+    items = data.get("inbounds", [])
+    if not items:
+        print("暂无自定义入口。默认入口仍由 .env 中的 SING_BOX_MIXED_PORT 提供。")
+        return
+    print(f"{'ID':<10} {'名称':<22} {'监听':<24} 出口")
+    print("-" * 90)
+    for item in items:
+        addr = f"{item.get('listen')}:{item.get('port')}"
+        print(f"{item.get('id',''):<10} {item.get('name','')[:20]:<22} {addr:<24} {target_label(data, item.get('target'))}")
+
+
 def list_subscriptions(data: Optional[Dict[str, Any]] = None) -> None:
     data = data or load_registry(); subs = data.get("subscriptions", [])
     if not subs: print("暂无订阅。"); return
-    print(f"{'ID':<10} {'名称':<22} {'节点数':<8} URL")
+    print(f"{'ID':<10} {'名称':<22} {'节点数':<8} URL(脱敏)")
     print("-" * 90)
-    for s in subs: print(f"{s.get('id',''):<10} {s.get('name','')[:20]:<22} {len(s.get('node_ids',[])):<8} {s.get('url','')}")
+    for s in subs:
+        safe_url = redact(s.get("url", ""), "url")
+        print(f"{s.get('id',''):<10} {s.get('name','')[:20]:<22} {len(s.get('node_ids',[])):<8} {safe_url}")
 
 
 def redact(value: Any, key: str = "") -> Any:
@@ -570,6 +830,19 @@ def validate(data: Optional[Dict[str, Any]] = None) -> None:
     if data.get("default") is not None and data.get("default") not in ids: raise ValueError("默认节点不存在")
     if data["settings"]["strategy"] not in ("manual", "auto"): raise ValueError("strategy 无效")
     if data["settings"]["route_mode"] not in ("global", "cn-direct-lite", "cn-direct-full"): raise ValueError("route_mode 无效")
+    inbound_ids = [x.get("id") for x in data.get("inbounds", [])]
+    if len(inbound_ids) != len(set(inbound_ids)): raise ValueError("入口 ID 重复")
+    inbound_names = [x.get("name") for x in data.get("inbounds", [])]
+    if len(inbound_names) != len(set(inbound_names)): raise ValueError("入口名称重复")
+    for inbound in data.get("inbounds", []):
+        if inbound.get("type") != "mixed": raise ValueError("当前仅支持 mixed 自定义入口")
+        if not inbound.get("id") or not inbound.get("name"): raise ValueError("入口缺少必要字段")
+        try:
+            ipaddress.ip_address(str(inbound.get("listen", "")))
+        except ValueError as exc:
+            raise ValueError("入口监听地址必须是 IP 地址") from exc
+        validate_inbound_port(data, int(inbound.get("port", 0)), inbound.get("id"))
+        target_tag(data, inbound.get("target"))
     make_config(data)
 
 
@@ -588,7 +861,8 @@ def cmd_delete(args: argparse.Namespace) -> int:
     data["nodes"] = [n for n in data["nodes"] if n.get("id") != node["id"]]
     for s in data.get("subscriptions", []): s["node_ids"] = [x for x in s.get("node_ids", []) if x != node["id"]]
     if data.get("default") == node["id"]: data["default"] = data["nodes"][0]["id"] if data["nodes"] else None
-    save_registry(data); render(data); print("节点已删除。"); return 0
+    repaired = repair_inbound_targets(data, [node["id"]])
+    save_registry(data); render(data); print("节点已删除。" + (f" {repaired} 个入口已回退到 proxy/direct。" if repaired else "")); return 0
 def cmd_default(args: argparse.Namespace) -> int:
     data = load_registry(); node = resolve_node(data, args.ref); data["default"] = node["id"]; data["settings"]["strategy"] = "manual"; save_registry(data); render(data); print(f"默认出口：{node['name']}；策略已切到 manual。"); return 0
 def cmd_show(args: argparse.Namespace) -> int:
@@ -607,6 +881,44 @@ def cmd_import_file(args: argparse.Namespace) -> int:
     for err in errors[:10]: eprint("跳过:", err)
     if len(errors) > 10: eprint(f"另有 {len(errors)-10} 条错误未显示。")
     return 0
+def cmd_inbound_list(_: argparse.Namespace) -> int:
+    list_inbounds(); return 0
+
+
+def cmd_inbound_add(args: argparse.Namespace) -> int:
+    data = load_registry()
+    inbound = build_inbound(data, name=args.name, listen=args.listen, port=args.port, target_ref=args.target)
+    inbound["id"] = new_id(data.get("inbounds", []))
+    data.setdefault("inbounds", []).append(inbound)
+    validate(data); save_registry(data); render(data)
+    print(f"已添加入口：{inbound['name']} ({inbound['id']}) -> {target_label(data, inbound['target'])}")
+    return 0
+
+
+def cmd_inbound_edit(args: argparse.Namespace) -> int:
+    data = load_registry(); old = resolve_inbound(data, args.ref)
+    inbound = build_inbound(data, old, name=args.name, listen=args.listen, port=args.port, target_ref=args.target)
+    inbound["id"] = old["id"]
+    data["inbounds"][data["inbounds"].index(old)] = inbound
+    validate(data); save_registry(data); render(data)
+    print(f"入口已更新：{inbound['name']} -> {target_label(data, inbound['target'])}")
+    return 0
+
+
+def cmd_inbound_delete(args: argparse.Namespace) -> int:
+    data = load_registry(); inbound = resolve_inbound(data, args.ref)
+    if not args.yes and prompt(f"确认删除入口 {inbound['name']}？输入 DELETE") != "DELETE":
+        print("已取消。"); return 1
+    data["inbounds"] = [x for x in data.get("inbounds", []) if x.get("id") != inbound["id"]]
+    save_registry(data); render(data); print("入口已删除。"); return 0
+
+
+def cmd_inbound_show(args: argparse.Namespace) -> int:
+    data = load_registry(); inbound = resolve_inbound(data, args.ref)
+    out = dict(inbound); out["resolved_outbound"] = target_tag(data, inbound.get("target"))
+    print(json.dumps(out, ensure_ascii=False, indent=2)); return 0
+
+
 def cmd_strategy(args: argparse.Namespace) -> int:
     data = load_registry()
     if not args.value: print(data["settings"]["strategy"]); return 0
@@ -634,13 +946,20 @@ def cmd_sub_register(args: argparse.Namespace) -> int:
 def cmd_sub_apply(args: argparse.Namespace) -> int:
     data = load_registry(); sub = resolve_subscription(data, args.ref); text = Path(args.file).read_text(encoding="utf-8", errors="replace"); nodes, errors = parse_subscription(text)
     if not nodes: raise ValueError("订阅未解析到支持的节点" + (("；" + errors[0]) if errors else ""))
-    ids = add_imported_nodes(data, nodes, f"sub:{sub['id']}", sub.get("node_ids", [])); sub["node_ids"] = ids; save_registry(data); render(data); print(f"订阅 {sub['name']} 已导入 {len(ids)} 个节点。")
+    old_ids = list(sub.get("node_ids", []))
+    old_names = {n.get("id"): n.get("name") for n in data["nodes"] if n.get("id") in set(old_ids)}
+    ids = add_imported_nodes(data, nodes, f"sub:{sub['id']}", old_ids)
+    new_by_name = {n.get("name"): n.get("id") for n in data["nodes"] if n.get("id") in set(ids)}
+    replacements = {old_id: new_by_name[name] for old_id, name in old_names.items() if name in new_by_name}
+    repaired = repair_inbound_targets(data, old_ids, replacements)
+    sub["node_ids"] = ids; save_registry(data); render(data); print(f"订阅 {sub['name']} 已导入 {len(ids)} 个节点。" + (f" 已迁移/回退 {repaired} 个入口绑定。" if repaired else ""))
     for err in errors[:10]: eprint("跳过:", err)
     return 0
 def cmd_sub_delete(args: argparse.Namespace) -> int:
     data = load_registry(); sub = resolve_subscription(data, args.ref); ids = set(sub.get("node_ids", [])); data["nodes"] = [n for n in data["nodes"] if n.get("id") not in ids]; data["subscriptions"] = [s for s in data["subscriptions"] if s.get("id") != sub["id"]]
     if data.get("default") in ids: data["default"] = data["nodes"][0]["id"] if data["nodes"] else None
-    save_registry(data); render(data); print(f"订阅及其 {len(ids)} 个节点已删除。"); return 0
+    repaired = repair_inbound_targets(data, ids)
+    save_registry(data); render(data); print(f"订阅及其 {len(ids)} 个节点已删除。" + (f" {repaired} 个入口已回退到 proxy/direct。" if repaired else "")); return 0
 def cmd_sub_get(args: argparse.Namespace) -> int:
     data = load_registry(); sub = resolve_subscription(data, args.ref)
     if args.field:
@@ -665,6 +984,11 @@ def parser() -> argparse.ArgumentParser:
     sub.add_parser("validate").set_defaults(func=cmd_validate)
     iu=sub.add_parser("import-uri"); iu.add_argument("uri", nargs="?"); iu.set_defaults(func=cmd_import_uri)
     im=sub.add_parser("import-file"); im.add_argument("file"); im.add_argument("--source"); im.set_defaults(func=cmd_import_file)
+    il=sub.add_parser("inbound-list"); il.set_defaults(func=cmd_inbound_list)
+    ia=sub.add_parser("inbound-add"); ia.add_argument("--name"); ia.add_argument("--listen"); ia.add_argument("--port", type=int); ia.add_argument("--target"); ia.set_defaults(func=cmd_inbound_add)
+    ie=sub.add_parser("inbound-edit"); ie.add_argument("ref", nargs="?"); ie.add_argument("--name"); ie.add_argument("--listen"); ie.add_argument("--port", type=int); ie.add_argument("--target"); ie.set_defaults(func=cmd_inbound_edit)
+    idel=sub.add_parser("inbound-delete"); idel.add_argument("ref", nargs="?"); idel.add_argument("--yes", action="store_true"); idel.set_defaults(func=cmd_inbound_delete)
+    ish=sub.add_parser("inbound-show"); ish.add_argument("ref", nargs="?"); ish.set_defaults(func=cmd_inbound_show)
     st=sub.add_parser("strategy"); st.add_argument("value", nargs="?"); st.set_defaults(func=cmd_strategy)
     rt=sub.add_parser("route-mode"); rt.add_argument("value", nargs="?"); rt.set_defaults(func=cmd_route)
     ut=sub.add_parser("urltest"); ut.add_argument("--url"); ut.add_argument("--interval"); ut.add_argument("--tolerance", type=int); ut.set_defaults(func=cmd_urltest)

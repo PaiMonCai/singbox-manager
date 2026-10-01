@@ -21,6 +21,7 @@ jobs:
           bash -n lib/sbx_proxy.sh
           bash -n lib/sbx_bootstrap.sh
           bash -n lib/sbx_image.sh
+          bash -n lib/sbx_inbound.sh
 
       - name: Python syntax
         run: python -m py_compile lib/sbx_nodes.py
@@ -30,6 +31,7 @@ jobs:
           grep -F 'SBX_SOURCE_BASE_URL' install.sh
           grep -F 'raw.githubusercontent.com' install.sh
           grep -F 'raw 源不可用，回退 GitHub archive' install.sh
+          grep -F 'lib/sbx_inbound.sh' install.sh
           awk '/get_source\(\)/,/read_env_value\(\)/' install.sh | grep -F 'SOURCE_BASE_URL'
           awk '/get_source\(\)/,/read_env_value\(\)/' install.sh | grep -F 'ARCHIVE_URL'
 
@@ -139,6 +141,51 @@ jobs:
           python lib/sbx_nodes.py validate
           python lib/sbx_nodes.py render
           python -m json.tool "$SBX_HOME/config/config.json" >/dev/null
+
+      - name: Exercise multi-inbound routing
+        env:
+          SBX_HOME: ${{ github.workspace }}/.ci-home
+        run: |
+          python lib/sbx_nodes.py inbound-add \
+            --name "HK-entry" \
+            --listen 127.0.0.1 \
+            --port 7891 \
+            --target node:11111111
+
+          python lib/sbx_nodes.py inbound-add \
+            --name "Auto-entry" \
+            --listen 127.0.0.1 \
+            --port 7892 \
+            --target auto
+
+          python lib/sbx_nodes.py inbound-list
+          python lib/sbx_nodes.py validate
+          python lib/sbx_nodes.py render
+
+          python - <<'PY'
+          import json, os
+          from pathlib import Path
+          home = Path(os.environ["SBX_HOME"])
+          cfg = json.loads((home / "config/config.json").read_text())
+          custom = [x for x in cfg["inbounds"] if x["tag"].startswith("inbound-")]
+          assert len(custom) == 2, custom
+          rules = cfg["route"]["rules"]
+          assert rules[0]["inbound"][0].startswith("inbound-")
+          assert rules[0]["outbound"] == "node-11111111"
+          assert rules[1]["outbound"] == "auto"
+          ports = (home / "compose.inbounds.yml").read_text()
+          assert "127.0.0.1:7891:7891/tcp" in ports
+          assert "127.0.0.1:7892:7892/tcp" in ports
+          PY
+
+          docker compose \
+            --env-file .env.example \
+            -f compose.yml \
+            -f "$SBX_HOME/compose.inbounds.yml" \
+            config >/tmp/sbx-compose-merged.yml
+
+          grep -F 'published: "7891"' /tmp/sbx-compose-merged.yml
+          grep -F 'published: "7892"' /tmp/sbx-compose-merged.yml
 
       - name: Exercise bootstrap image configuration
         run: |

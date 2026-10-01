@@ -9,6 +9,7 @@ CONFIG="$HOME_DIR/config/config.json"
 NODES="$HOME_DIR/nodes/nodes.json"
 HELPER="$HOME_DIR/lib/sbx_nodes.py"
 BACKUPS="$HOME_DIR/backup"
+INBOUND_COMPOSE="$HOME_DIR/compose.inbounds.yml"
 
 G='\033[32m'; Y='\033[33m'; R='\033[31m'; C='\033[36m'; N='\033[0m'
 info(){ printf '%b[INFO]%b %s\n' "$G" "$N" "$*"; }
@@ -30,7 +31,11 @@ ready(){
   mkdir -p "$BACKUPS" "$HOME_DIR/nodes" "$HOME_DIR/config" "$HOME_DIR/data"
   [[ -f "$NODES" ]] || python3 "$HELPER" init >/dev/null
 }
-dc(){ docker compose --project-directory "$HOME_DIR" --env-file "$ENV" -f "$COMPOSE" "$@"; }
+dc(){
+  local args=(--project-directory "$HOME_DIR" --env-file "$ENV" -f "$COMPOSE")
+  [[ -f "$INBOUND_COMPOSE" ]] && args+=(-f "$INBOUND_COMPOSE")
+  docker compose "${args[@]}" "$@"
+}
 envval(){ grep -E "^$1=" "$ENV" 2>/dev/null | tail -n1 | cut -d= -f2- || printf '%s' "$2"; }
 setenv(){ local k="$1" v="$2" t; t=$(mktemp); awk -v k="$k" -v v="$v" 'BEGIN{f=0} index($0,k"=")==1{print k"="v;f=1;next}{print} END{if(!f)print k"="v}' "$ENV">"$t"; cat "$t">"$ENV"; rm -f "$t"; chmod 600 "$ENV"; }
 running(){ dc ps --status running --services 2>/dev/null | grep -qx sing-box; }
@@ -46,15 +51,17 @@ backup(){
   local d f t; d=$(date '+%Y%m%d-%H%M%S'); f="$BACKUPS/sbx-$d.tar.gz"; t=$(mktemp -d); mkdir -p "$t/snapshot"
   [[ -f "$CONFIG" ]] && cp -a "$CONFIG" "$t/snapshot/config.json"
   [[ -f "$NODES" ]] && cp -a "$NODES" "$t/snapshot/nodes.json"
+  [[ -f "$INBOUND_COMPOSE" ]] && cp -a "$INBOUND_COMPOSE" "$t/snapshot/compose.inbounds.yml"
   cp -a "$ENV" "$t/snapshot/env"
   tar -czf "$f" -C "$t" snapshot; rm -rf "$t"; chmod 600 "$f"; BACKUP_RESULT="$f"; info "备份完成: $f"
 }
 restore_raw(){
   local f="$1" restore_env="${2:-yes}" t e
-  while IFS= read -r e; do [[ "$e" != *".."* ]] || die "备份路径不安全"; case "$e" in snapshot|snapshot/|snapshot/config.json|snapshot/nodes.json|snapshot/env) ;; *) die "备份含未知路径: $e";; esac; done < <(tar -tzf "$f")
+  while IFS= read -r e; do [[ "$e" != *".."* ]] || die "备份路径不安全"; case "$e" in snapshot|snapshot/|snapshot/config.json|snapshot/nodes.json|snapshot/compose.inbounds.yml|snapshot/env) ;; *) die "备份含未知路径: $e";; esac; done < <(tar -tzf "$f")
   t=$(mktemp -d); tar -xzf "$f" -C "$t"
   [[ -f "$t/snapshot/config.json" ]] && install -m600 "$t/snapshot/config.json" "$CONFIG"
   [[ -f "$t/snapshot/nodes.json" ]] && install -m600 "$t/snapshot/nodes.json" "$NODES"
+  if [[ -f "$t/snapshot/compose.inbounds.yml" ]]; then install -m600 "$t/snapshot/compose.inbounds.yml" "$INBOUND_COMPOSE"; else rm -f "$INBOUND_COMPOSE"; fi
   [[ "$restore_env" == yes && -f "$t/snapshot/env" ]] && install -m600 "$t/snapshot/env" "$ENV"
   rm -rf "$t"
 }
@@ -149,6 +156,7 @@ main(){ root "$@"; ready; local cmd="${1:-menu}"; shift||true; case "$cmd" in me
 [[ -f "$HOME_DIR/lib/sbx_proxy.sh" ]] && source "$HOME_DIR/lib/sbx_proxy.sh"
 [[ -f "$HOME_DIR/lib/sbx_bootstrap.sh" ]] && source "$HOME_DIR/lib/sbx_bootstrap.sh"
 [[ -f "$HOME_DIR/lib/sbx_image.sh" ]] && source "$HOME_DIR/lib/sbx_image.sh"
+[[ -f "$HOME_DIR/lib/sbx_inbound.sh" ]] && source "$HOME_DIR/lib/sbx_inbound.sh"
 if [[ "${1:-}" == "image" ]]; then
   root "$@"
   ready

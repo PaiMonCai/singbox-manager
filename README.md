@@ -2,7 +2,7 @@
 
 面向 Linux 服务器的 sing-box Docker 管理层。sing-box 保持官方镜像运行，宿主机通过 `sbx` 完成安装、节点管理、配置生成、校验、测试、备份恢复与升级。
 
-当前版本：**0.5.3**
+当前版本：**0.6.0**
 
 ## 一键交互式安装
 
@@ -198,6 +198,91 @@ sbx route cn-direct-full
 
 
 
+
+
+## 0.6：多入口 -> 多出口路由
+
+0.6 开始支持多个宿主机代理入口，并把每个入口绑定到不同出口。默认入口仍保留：
+
+```text
+127.0.0.1:7890 -> proxy
+```
+
+自定义入口通过：
+
+```bash
+sbx inbound
+```
+
+管理。也可以直接：
+
+```bash
+sbx inbound list
+sbx inbound add
+sbx inbound edit [ID|名称]
+sbx inbound delete [ID|名称]
+sbx inbound show [ID|名称]
+sbx inbound test [ID|名称]
+```
+
+每个入口当前使用 `mixed` 协议，同时提供 HTTP 和 SOCKS 代理能力。出口可以选择：
+
+```text
+proxy   跟随全局 selector 策略
+auto    固定走 URLTest 自动测速组
+direct  直连
+node    固定走某个具体节点
+```
+
+例如：
+
+```text
+127.0.0.1:7891 -> 香港节点
+127.0.0.1:7892 -> 日本节点
+127.0.0.1:7893 -> auto
+127.0.0.1:7894 -> direct
+```
+
+应用侧只需要选择不同代理端口：
+
+```bash
+curl -x http://127.0.0.1:7891 https://api.ipify.org
+curl -x http://127.0.0.1:7892 https://api.ipify.org
+```
+
+### Docker 端口发布
+
+自定义入口不是通过 host network 实现。manager 会自动生成：
+
+```text
+/opt/singbox-manager/compose.inbounds.yml
+```
+
+这里只记录实际创建的入口端口，并与主 `compose.yml` 合并。默认只绑定回环地址，不会一次性暴露一个大端口范围。
+
+### 安全
+
+交互式创建入口时默认监听：
+
+```text
+127.0.0.1
+```
+
+如果改成 `0.0.0.0` 或其他非回环地址，当前 mixed 入口没有用户名/密码认证，因此管理器会显示安全警告，并要求输入 `PUBLIC` 才允许继续。
+
+非交互 CLI 暂不允许直接创建非回环入口。
+
+### 节点更新与入口绑定
+
+入口绑定保存的是 manager 的节点关系，而不是手写 sing-box outbound tag。订阅更新时，如果原节点名称仍存在，会把入口迁移到新节点 ID；如果节点已经消失，则自动回退到 `proxy`，没有任何节点时回退到 `direct`。
+
+入口专属路由规则位于普通的 private/CN 规则之前，因此：
+
+```text
+7891 -> 香港节点
+```
+
+表示该入口的流量强制交给香港节点，不会再被全局 `.cn -> direct` 规则覆盖。
 
 ## 0.5.3：安装器优先走 raw 源
 
@@ -513,6 +598,7 @@ export HTTPS_PROXY=http://127.0.0.1:7890
 ```text
 /opt/singbox-manager
 ├── compose.yml
+├── compose.inbounds.yml      # 有自定义入口时自动生成
 ├── .env
 ├── bin/
 │   └── sbx

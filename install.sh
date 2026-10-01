@@ -120,6 +120,7 @@ get_source() {
     "lib/sbx_proxy.sh"
     "lib/sbx_bootstrap.sh"
     "lib/sbx_image.sh"
+    "lib/sbx_inbound.sh"
   )
 
   if [[ -n "${BASH_SOURCE[0]:-}" && "${BASH_SOURCE[0]}" != "bash" ]]; then
@@ -252,6 +253,7 @@ install -m 0755 "$SOURCE_DIR/lib/sbx_v3.sh" "$INSTALL_DIR/lib/sbx_v3.sh"
 install -m 0755 "$SOURCE_DIR/lib/sbx_proxy.sh" "$INSTALL_DIR/lib/sbx_proxy.sh"
 install -m 0755 "$SOURCE_DIR/lib/sbx_bootstrap.sh" "$INSTALL_DIR/lib/sbx_bootstrap.sh"
 install -m 0755 "$SOURCE_DIR/lib/sbx_image.sh" "$INSTALL_DIR/lib/sbx_image.sh"
+install -m 0755 "$SOURCE_DIR/lib/sbx_inbound.sh" "$INSTALL_DIR/lib/sbx_inbound.sh"
 write_env "$version" "$bind" "$port" "$old_image"
 
 chmod 700 "$INSTALL_DIR/config" "$INSTALL_DIR/nodes" "$INSTALL_DIR/data" "$INSTALL_DIR/backup"
