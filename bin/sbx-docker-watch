@@ -1,0 +1,19 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+SBX_WATCH_SBX="${SBX_WATCH_SBX:-/usr/local/bin/sbx}"
+SBX_WATCH_RETRY="${SBX_WATCH_RETRY:-3}"
+
+while true; do
+  if ! command -v docker >/dev/null 2>&1; then
+    sleep "$SBX_WATCH_RETRY"
+    continue
+  fi
+
+  docker events     --filter type=container     --filter event=create     --filter event=start     --format '{{.ID}}' 2>/dev/null |
+  while IFS= read -r _container_id; do
+    "$SBX_WATCH_SBX" docker-network sync --quiet >/dev/null 2>&1 || true
+  done
+
+  sleep "$SBX_WATCH_RETRY"
+done

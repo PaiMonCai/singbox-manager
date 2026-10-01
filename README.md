@@ -2,7 +2,7 @@
 
 面向 Linux 服务器的 sing-box Docker 管理层。sing-box 保持官方镜像运行，宿主机通过 `sbx` 完成安装、节点管理、配置生成、校验、测试、备份恢复与升级。
 
-当前版本：**0.8.1**
+当前版本：**0.9.0**
 
 ## 一键交互式安装
 
@@ -202,6 +202,102 @@ sbx route cn-direct-full
 
 
 
+
+
+## 0.9：Docker 扫描、托管与自动重连
+
+0.9 在共享代理网络基础上增加“托管接入”。手工：
+
+```bash
+sbx docker-network connect <container>
+```
+
+仍然只针对当前容器实例；如果 Compose 更新删除旧容器并创建新容器，这个临时连接不会自动继承。
+
+托管模式会扫描 Docker，并按稳定身份记录目标：
+
+```text
+Compose 容器 -> com.docker.compose.project + com.docker.compose.service
+普通容器  -> 容器名称
+```
+
+因此容器 ID 改变后仍能找到新实例。
+
+交互使用：
+
+```bash
+sbx docker-network
+```
+
+选择“扫描并托管”，会列出当前 Docker 容器，并显示：
+
+```text
+容器名 / 运行状态 / Compose project/service / 是否已托管
+```
+
+也可以直接：
+
+```bash
+sbx docker-network scan
+sbx docker-network manage new-api 7891
+sbx docker-network managed
+sbx docker-network sync
+sbx docker-network unmanage new-api
+```
+
+托管清单保存在：
+
+```text
+/opt/singbox-manager/docker-managed.json
+```
+
+该文件会进入 manager 备份，但不会提交 Git。
+
+### Docker watcher
+
+第一次托管目标时，如果系统使用 systemd，manager 会自动安装并启动：
+
+```text
+singbox-manager-docker-watch.service
+```
+
+watcher 监听 Docker 容器 `create` 和 `start` 事件。发现容器变化后执行幂等同步，把匹配的托管目标重新接入 `singbox-proxy`。
+
+手工管理：
+
+```bash
+sbx docker-network watch on
+sbx docker-network watch off
+sbx docker-network watch status
+```
+
+即时补接：
+
+```bash
+sbx docker-network sync
+```
+
+Compose 服务如果存在多个实例，同一个 `project/service` 会匹配并接入所有运行实例。
+
+### 边界
+
+托管功能只恢复 Docker network membership，不会修改其他项目的 Compose 文件，也不会给运行中的目标容器强行注入 `HTTP_PROXY` 环境变量。
+
+应用仍应自行配置，例如：
+
+```text
+HTTP_PROXY=http://sing-box:7891
+HTTPS_PROXY=http://sing-box:7891
+ALL_PROXY=socks5h://sing-box:7891
+```
+
+对于“应用启动第一毫秒就必须能解析代理地址”的严格场景，仍建议使用：
+
+```bash
+sbx docker-network snippet 7891
+```
+
+把 external network 声明写进目标应用自己的 Compose；watcher 属于自动恢复机制，不替代声明式 Compose 网络配置。
 
 ## 0.8.1：安装器入口自动代理回退
 
@@ -814,6 +910,9 @@ sbx self-update
 sbx manager check
 sbx manager auto status
 sbx docker-network status
+sbx docker-network scan
+sbx docker-network managed
+sbx docker-network sync
 sbx docker-network urls
 sbx-install
 sbx upgrade v1.14.2
@@ -842,6 +941,7 @@ export HTTPS_PROXY=http://127.0.0.1:7890
 ├── compose.inbounds.yml      # 有自定义入口时自动生成
 ├── compose.network.yml       # 启用 Docker 共享代理网络时生成
 ├── .env
+├── docker-managed.json       # 有托管 Docker 目标时生成
 ├── VERSION
 ├── bin/
 │   ├── sbx

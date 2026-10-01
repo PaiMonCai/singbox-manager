@@ -128,6 +128,8 @@ get_source() {
     "lib/sbx_image.sh"
     "lib/sbx_inbound.sh"
     "lib/sbx_docker_network.sh"
+    "lib/sbx_docker_targets.py"
+    "bin/sbx-docker-watch"
     "lib/sbx_update.sh"
     "bin/sbx-install"
     "VERSION"
@@ -274,6 +276,8 @@ install -m 0755 "$SOURCE_DIR/lib/sbx_bootstrap.sh" "$INSTALL_DIR/lib/sbx_bootstr
 install -m 0755 "$SOURCE_DIR/lib/sbx_image.sh" "$INSTALL_DIR/lib/sbx_image.sh"
 install -m 0755 "$SOURCE_DIR/lib/sbx_inbound.sh" "$INSTALL_DIR/lib/sbx_inbound.sh"
 install -m 0755 "$SOURCE_DIR/lib/sbx_docker_network.sh" "$INSTALL_DIR/lib/sbx_docker_network.sh"
+install -m 0755 "$SOURCE_DIR/lib/sbx_docker_targets.py" "$INSTALL_DIR/lib/sbx_docker_targets.py"
+install -m 0755 "$SOURCE_DIR/bin/sbx-docker-watch" "$INSTALL_DIR/bin/sbx-docker-watch"
 install -m 0755 "$SOURCE_DIR/lib/sbx_update.sh" "$INSTALL_DIR/lib/sbx_update.sh"
 install -m 0755 "$SOURCE_DIR/bin/sbx-install" "$INSTALLER_LINK"
 

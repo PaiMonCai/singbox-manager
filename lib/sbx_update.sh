@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # singbox-manager v0.7 self-update integration.
 
-VERSION="0.8.1"
+VERSION="0.9.0"
 
 UPDATE_REPO="${SBX_UPDATE_REPO:-PaiMonCai/singbox-manager}"
 UPDATE_BRANCH="${SBX_UPDATE_BRANCH:-main}"
@@ -249,7 +249,7 @@ menu(){
     printf '%b' "$C"
     cat <<'EOF'
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-        singbox-manager 0.8.1
+        singbox-manager 0.9
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
  1 状态      2 启动      3 停止      4 重启
  5 日志      6 节点管理  7 导入      8 订阅管理

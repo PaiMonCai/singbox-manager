@@ -11,6 +11,7 @@ HELPER="$HOME_DIR/lib/sbx_nodes.py"
 BACKUPS="$HOME_DIR/backup"
 INBOUND_COMPOSE="$HOME_DIR/compose.inbounds.yml"
 NETWORK_COMPOSE="$HOME_DIR/compose.network.yml"
+DOCKER_MANAGED="$HOME_DIR/docker-managed.json"
 
 G='\033[32m'; Y='\033[33m'; R='\033[31m'; C='\033[36m'; N='\033[0m'
 info(){ printf '%b[INFO]%b %s\n' "$G" "$N" "$*"; }
@@ -60,17 +61,19 @@ backup(){
   [[ -f "$NODES" ]] && cp -a "$NODES" "$t/snapshot/nodes.json"
   [[ -f "$INBOUND_COMPOSE" ]] && cp -a "$INBOUND_COMPOSE" "$t/snapshot/compose.inbounds.yml"
   [[ -f "$NETWORK_COMPOSE" ]] && cp -a "$NETWORK_COMPOSE" "$t/snapshot/compose.network.yml"
+  [[ -f "$DOCKER_MANAGED" ]] && cp -a "$DOCKER_MANAGED" "$t/snapshot/docker-managed.json"
   cp -a "$ENV" "$t/snapshot/env"
   tar -czf "$f" -C "$t" snapshot; rm -rf "$t"; chmod 600 "$f"; BACKUP_RESULT="$f"; info "备份完成: $f"
 }
 restore_raw(){
   local f="$1" restore_env="${2:-yes}" t e
-  while IFS= read -r e; do [[ "$e" != *".."* ]] || die "备份路径不安全"; case "$e" in snapshot|snapshot/|snapshot/config.json|snapshot/nodes.json|snapshot/compose.inbounds.yml|snapshot/compose.network.yml|snapshot/env) ;; *) die "备份含未知路径: $e";; esac; done < <(tar -tzf "$f")
+  while IFS= read -r e; do [[ "$e" != *".."* ]] || die "备份路径不安全"; case "$e" in snapshot|snapshot/|snapshot/config.json|snapshot/nodes.json|snapshot/compose.inbounds.yml|snapshot/compose.network.yml|snapshot/docker-managed.json|snapshot/env) ;; *) die "备份含未知路径: $e";; esac; done < <(tar -tzf "$f")
   t=$(mktemp -d); tar -xzf "$f" -C "$t"
   [[ -f "$t/snapshot/config.json" ]] && install -m600 "$t/snapshot/config.json" "$CONFIG"
   [[ -f "$t/snapshot/nodes.json" ]] && install -m600 "$t/snapshot/nodes.json" "$NODES"
   if [[ -f "$t/snapshot/compose.inbounds.yml" ]]; then install -m600 "$t/snapshot/compose.inbounds.yml" "$INBOUND_COMPOSE"; else rm -f "$INBOUND_COMPOSE"; fi
   if [[ -f "$t/snapshot/compose.network.yml" ]]; then install -m600 "$t/snapshot/compose.network.yml" "$NETWORK_COMPOSE"; else rm -f "$NETWORK_COMPOSE"; fi
+  if [[ -f "$t/snapshot/docker-managed.json" ]]; then install -m600 "$t/snapshot/docker-managed.json" "$DOCKER_MANAGED"; else rm -f "$DOCKER_MANAGED"; fi
   [[ "$restore_env" == yes && -f "$t/snapshot/env" ]] && install -m600 "$t/snapshot/env" "$ENV"
   rm -rf "$t"
 }

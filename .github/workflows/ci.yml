@@ -23,11 +23,14 @@ jobs:
           bash -n lib/sbx_image.sh
           bash -n lib/sbx_inbound.sh
           bash -n lib/sbx_docker_network.sh
+          bash -n bin/sbx-docker-watch
           bash -n lib/sbx_update.sh
           bash -n bin/sbx-install
 
       - name: Python syntax
-        run: python -m py_compile lib/sbx_nodes.py
+        run: |
+          python -m py_compile lib/sbx_nodes.py
+          python -m py_compile lib/sbx_docker_targets.py
 
       - name: Verify installer prefers raw source
         run: |
@@ -36,6 +39,8 @@ jobs:
           grep -F 'raw 源不可用，回退 GitHub archive' install.sh
           grep -F 'lib/sbx_inbound.sh' install.sh
           grep -F 'lib/sbx_docker_network.sh' install.sh
+          grep -F 'lib/sbx_docker_targets.py' install.sh
+          grep -F 'bin/sbx-docker-watch' install.sh
           grep -F 'lib/sbx_update.sh' install.sh
           grep -F 'bin/sbx-install' install.sh
           grep -F 'VERSION' install.sh
@@ -73,6 +78,8 @@ jobs:
           test "$(tr -d '[:space:]' < /tmp/sbx-manager-only/VERSION)" = "$EXPECTED_MANAGER_VERSION"
           test -x /tmp/sbx-ci-bin/sbx-install
           test -x /tmp/sbx-manager-only/lib/sbx_update.sh
+          test -x /tmp/sbx-manager-only/lib/sbx_docker_targets.py
+          test -x /tmp/sbx-manager-only/bin/sbx-docker-watch
 
       - name: Exercise auto-update timer generation
         run: |
@@ -339,6 +346,70 @@ jobs:
           grep -F -- '--pull=never' "$LOG"
           grep -F -- '--pull never' lib/sbx_image.sh
 
+      - name: Exercise Docker managed targets helper
+        run: |
+          rm -rf /tmp/sbx-target-test /tmp/sbx-target-bin
+          mkdir -p /tmp/sbx-target-test /tmp/sbx-target-bin
+          export SBX_HOME=/tmp/sbx-target-test
+          export SBX_DOCKER_MANAGED_FILE=/tmp/sbx-target-test/docker-managed.json
+          cat > /tmp/sbx-target-bin/docker <<'EOF'
+          #!/usr/bin/env python3
+          import json, os, sys
+          args=sys.argv[1:]
+          state=os.environ.get("FAKE_DOCKER_STATE","initial")
+          containers={
+            "initial":[
+              {"Id":"aaa111","Name":"/new-api-old","Config":{"Image":"example/new-api:1","Labels":{"com.docker.compose.project":"new-api","com.docker.compose.service":"app"}},"State":{"Running":True},"NetworkSettings":{"Networks":{"bridge":{}}}},
+              {"Id":"bbb222","Name":"/standalone","Config":{"Image":"example/app:1","Labels":{}},"State":{"Running":True},"NetworkSettings":{"Networks":{"bridge":{}}}}
+            ],
+            "updated":[
+              {"Id":"ccc333","Name":"/new-api-new","Config":{"Image":"example/new-api:2","Labels":{"com.docker.compose.project":"new-api","com.docker.compose.service":"app"}},"State":{"Running":True},"NetworkSettings":{"Networks":{"bridge":{}}}},
+              {"Id":"bbb222","Name":"/standalone","Config":{"Image":"example/app:1","Labels":{}},"State":{"Running":True},"NetworkSettings":{"Networks":{"bridge":{}}}}
+            ]
+          }[state]
+          log=os.environ.get("FAKE_DOCKER_LOG")
+          if args[:2]==["ps","-aq"]:
+            print("\n".join(x["Id"] for x in containers)); raise SystemExit(0)
+          if args and args[0]=="inspect":
+            refs=args[1:]
+            found=[]
+            for ref in refs:
+              for x in containers:
+                if ref in (x["Id"], x["Id"][:12], x["Name"].lstrip("/")):
+                  found.append(x); break
+            if not found: raise SystemExit(1)
+            print(json.dumps(found)); raise SystemExit(0)
+          if args[:2]==["network","inspect"]:
+            print("[]"); raise SystemExit(0)
+          if args[:2]==["network","connect"]:
+            if log:
+              with open(log,"a") as f: f.write(" ".join(args)+"\n")
+            raise SystemExit(0)
+          raise SystemExit(1)
+          EOF
+          chmod +x /tmp/sbx-target-bin/docker
+          export PATH="/tmp/sbx-target-bin:$PATH"
+          export FAKE_DOCKER_LOG=/tmp/sbx-target-test/docker.log
+          : > "$FAKE_DOCKER_LOG"
+
+          python lib/sbx_docker_targets.py scan | grep -F 'new-api-old'
+          python lib/sbx_docker_targets.py add new-api-old --port 7891 | grep -F 'compose:new-api/app'
+          python lib/sbx_docker_targets.py add standalone --port 7892 | grep -F 'name:standalone'
+          chmod 600 "$SBX_DOCKER_MANAGED_FILE"
+
+          python lib/sbx_docker_targets.py list --network singbox-proxy | grep -F 'compose:new-api/app'
+          python lib/sbx_docker_targets.py sync --network singbox-proxy
+          grep -F 'network connect singbox-proxy new-api-old' "$FAKE_DOCKER_LOG"
+          grep -F 'network connect singbox-proxy standalone' "$FAKE_DOCKER_LOG"
+
+          : > "$FAKE_DOCKER_LOG"
+          export FAKE_DOCKER_STATE=updated
+          python lib/sbx_docker_targets.py sync --network singbox-proxy
+          grep -F 'network connect singbox-proxy new-api-new' "$FAKE_DOCKER_LOG"
+          grep -F 'network connect singbox-proxy standalone' "$FAKE_DOCKER_LOG"
+          python lib/sbx_docker_targets.py remove compose:new-api/app
+          ! grep -F 'compose:new-api/app' <(python lib/sbx_docker_targets.py list --network singbox-proxy)
+
       - name: Exercise Docker shared proxy network
         run: |
           export HOME_DIR="${{ github.workspace }}/.ci-docker-net-home"
@@ -346,6 +417,11 @@ jobs:
           export NODES="$HOME_DIR/nodes/nodes.json"
           export SBX_DOCKER_NETWORK_COMPOSE="$HOME_DIR/compose.network.yml"
           export SBX_DOCKER_NETWORK_NO_APPLY=1
+          export SBX_DOCKER_WATCH_NO_APPLY=1
+          export SBX_DOCKER_WATCH_SERVICE="$HOME_DIR/singbox-manager-docker-watch.service"
+          export SBX_DOCKER_WATCH_BIN="${{ github.workspace }}/bin/sbx-docker-watch"
+          export SBX_DOCKER_TARGET_HELPER="${{ github.workspace }}/lib/sbx_docker_targets.py"
+          export SBX_DOCKER_MANAGED_FILE="$HOME_DIR/docker-managed.json"
           mkdir -p "$HOME_DIR/nodes"
           cp .env.example "$ENV"
           cp .ci-home/nodes/nodes.json "$NODES"
@@ -377,6 +453,12 @@ jobs:
           docker_network_env 7891 | grep -F "HTTP_PROXY='http://sing-box:7891'"
           docker_network_snippet 7892 | grep -F 'HTTP_PROXY: http://sing-box:7892'
           docker_network_status | grep -F 'Docker网络: READY'
+          docker_network_watch_on
+          grep -F 'ExecStart=' "$SBX_DOCKER_WATCH_SERVICE"
+          grep -F 'Environment="SBX_HOME=' "$SBX_DOCKER_WATCH_SERVICE"
+          docker_network_watch_status | grep -F 'Watcher: CONFIGURED'
+          docker_network_watch_off
+          test ! -e "$SBX_DOCKER_WATCH_SERVICE"
 
           docker_network_off
           test ! -e "$SBX_DOCKER_NETWORK_COMPOSE"

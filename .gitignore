@@ -13,3 +13,5 @@ proxy-state/*
 compose.inbounds.yml
 
 compose.network.yml
+
+docker-managed.json
