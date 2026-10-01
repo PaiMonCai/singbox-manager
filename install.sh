@@ -127,6 +127,7 @@ get_source() {
     "lib/sbx_bootstrap.sh"
     "lib/sbx_image.sh"
     "lib/sbx_inbound.sh"
+    "lib/sbx_docker_network.sh"
     "lib/sbx_update.sh"
     "bin/sbx-install"
     "VERSION"
@@ -199,13 +200,14 @@ read_env_value() {
 }
 
 write_env() {
-  local version="$1" bind="$2" port="$3" image="${4:-ghcr.io/sagernet/sing-box}"
+  local version="$1" bind="$2" port="$3" image="${4:-ghcr.io/sagernet/sing-box}" docker_network="${5:-singbox-proxy}"
   cat > "$INSTALL_DIR/.env" <<EOF
 SING_BOX_IMAGE=$image
 SING_BOX_VERSION=$version
 SING_BOX_CONTAINER_NAME=sing-box
 SING_BOX_BIND_ADDR=$bind
 SING_BOX_MIXED_PORT=$port
+SING_BOX_DOCKER_NETWORK=$docker_network
 EOF
   chmod 600 "$INSTALL_DIR/.env"
 }
@@ -236,11 +238,13 @@ old_version="$DEFAULT_VERSION"
 old_image="ghcr.io/sagernet/sing-box"
 old_bind="127.0.0.1"
 old_port="7890"
+old_docker_network="singbox-proxy"
 if (( UPGRADE )); then
   old_version="$(read_env_value "$INSTALL_DIR/.env" SING_BOX_VERSION "$DEFAULT_VERSION")"
   old_image="$(read_env_value "$INSTALL_DIR/.env" SING_BOX_IMAGE "ghcr.io/sagernet/sing-box")"
   old_bind="$(read_env_value "$INSTALL_DIR/.env" SING_BOX_BIND_ADDR "127.0.0.1")"
   old_port="$(read_env_value "$INSTALL_DIR/.env" SING_BOX_MIXED_PORT "7890")"
+  old_docker_network="$(read_env_value "$INSTALL_DIR/.env" SING_BOX_DOCKER_NETWORK "singbox-proxy")"
   info "检测到已有安装，将执行就地升级并保留节点数据。"
 fi
 
@@ -269,6 +273,7 @@ install -m 0755 "$SOURCE_DIR/lib/sbx_proxy.sh" "$INSTALL_DIR/lib/sbx_proxy.sh"
 install -m 0755 "$SOURCE_DIR/lib/sbx_bootstrap.sh" "$INSTALL_DIR/lib/sbx_bootstrap.sh"
 install -m 0755 "$SOURCE_DIR/lib/sbx_image.sh" "$INSTALL_DIR/lib/sbx_image.sh"
 install -m 0755 "$SOURCE_DIR/lib/sbx_inbound.sh" "$INSTALL_DIR/lib/sbx_inbound.sh"
+install -m 0755 "$SOURCE_DIR/lib/sbx_docker_network.sh" "$INSTALL_DIR/lib/sbx_docker_network.sh"
 install -m 0755 "$SOURCE_DIR/lib/sbx_update.sh" "$INSTALL_DIR/lib/sbx_update.sh"
 install -m 0755 "$SOURCE_DIR/bin/sbx-install" "$INSTALLER_LINK"
 
@@ -286,7 +291,7 @@ if [[ "$MANAGER_ONLY" == "1" ]]; then
   exit 0
 fi
 
-write_env "$version" "$bind" "$port" "$old_image"
+write_env "$version" "$bind" "$port" "$old_image" "$old_docker_network"
 
 export SBX_HOME="$INSTALL_DIR"
 if [[ ! -f "$INSTALL_DIR/nodes/nodes.json" ]]; then

@@ -2,7 +2,7 @@
 
 面向 Linux 服务器的 sing-box Docker 管理层。sing-box 保持官方镜像运行，宿主机通过 `sbx` 完成安装、节点管理、配置生成、校验、测试、备份恢复与升级。
 
-当前版本：**0.7.0**
+当前版本：**0.8.0**
 
 ## 一键交互式安装
 
@@ -200,6 +200,109 @@ sbx route cn-direct-full
 
 
 
+
+
+## 0.8：Docker 容器共享代理网络
+
+0.8 解决 Docker 场景下的 `127.0.0.1` 隔离问题。
+
+宿主机仍然通过：
+
+```text
+http://127.0.0.1:7890
+```
+
+访问代理；其他 Docker 容器则通过一个专用 external bridge 网络访问：
+
+```text
+http://sing-box:7890
+socks5h://sing-box:7890
+```
+
+开启：
+
+```bash
+sbx docker-network on
+```
+
+默认会创建：
+
+```text
+singbox-proxy
+```
+
+并生成：
+
+```text
+/opt/singbox-manager/compose.network.yml
+```
+
+该 Compose override 会让 sing-box 同时保留项目默认网络，并持久接入 `singbox-proxy`，网络别名固定为 `sing-box`。因此 sing-box 容器重建后仍会重新接入共享网络。
+
+常用命令：
+
+```bash
+sbx docker-network
+sbx docker-network status
+sbx docker-network on
+sbx docker-network connect new-api
+sbx docker-network disconnect new-api
+sbx docker-network list
+sbx docker-network urls
+sbx docker-network env 7891
+sbx docker-network snippet 7891
+sbx docker-network off
+```
+
+例如把现有容器接进共享网络：
+
+```bash
+sbx docker-network connect new-api
+```
+
+然后在该容器/应用配置中使用：
+
+```text
+HTTP_PROXY=http://sing-box:7890
+HTTPS_PROXY=http://sing-box:7890
+ALL_PROXY=socks5h://sing-box:7890
+```
+
+如果使用 0.6 的多入口功能，则：
+
+```text
+sing-box:7891 -> 香港出口
+sing-box:7892 -> 日本出口
+sing-box:7893 -> auto
+```
+
+因此不同容器可以选择不同代理端口。
+
+### 重要：接入网络不等于自动代理
+
+`docker network connect` 只建立网络连通性，不会修改目标容器的环境变量，也不会透明劫持流量。
+
+如果目标容器由 Docker Compose 管理，建议执行：
+
+```bash
+sbx docker-network snippet 7891
+```
+
+把输出的 external network 和代理环境变量写进目标项目自己的 Compose 文件。这样目标容器以后被重新创建时仍然会自动接入 `singbox-proxy`。
+
+手动执行：
+
+```bash
+sbx docker-network connect <container>
+```
+
+适合临时接入，但目标容器如果被其他 Compose 项目删除并重新创建，需要重新接入。
+
+### 安全边界
+
+共享网络本身是一个信任边界。只有加入该网络的容器才能直接访问 `sing-box:789x`。不要把不可信容器加入该网络。
+
+宿主机端口仍然可以继续只绑定 `127.0.0.1`，无需为了 Docker 容器访问而把代理发布到 `0.0.0.0`。
 
 ## 0.7：管理器快捷更新与自动更新
 
@@ -676,6 +779,8 @@ sbx version
 sbx self-update
 sbx manager check
 sbx manager auto status
+sbx docker-network status
+sbx docker-network urls
 sbx-install
 sbx upgrade v1.14.2
 sbx pull
@@ -701,6 +806,7 @@ export HTTPS_PROXY=http://127.0.0.1:7890
 /opt/singbox-manager
 ├── compose.yml
 ├── compose.inbounds.yml      # 有自定义入口时自动生成
+├── compose.network.yml       # 启用 Docker 共享代理网络时生成
 ├── .env
 ├── VERSION
 ├── bin/
@@ -728,6 +834,6 @@ export HTTPS_PROXY=http://127.0.0.1:7890
 下一层计划：
 
 - 订阅定时更新与节点健康检查
-- Docker build / 容器级代理模板
+- Docker build 阶段代理模板
 - 更丰富的路由规则管理
 - TUN / 透明代理

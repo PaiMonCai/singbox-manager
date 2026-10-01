@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # singbox-manager v0.7 self-update integration.
 
-VERSION="0.7.0"
+VERSION="0.8.0"
 
 UPDATE_REPO="${SBX_UPDATE_REPO:-PaiMonCai/singbox-manager}"
 UPDATE_BRANCH="${SBX_UPDATE_BRANCH:-main}"
@@ -249,14 +249,14 @@ menu(){
     printf '%b' "$C"
     cat <<'EOF'
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-        singbox-manager 0.7
+        singbox-manager 0.8
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
  1 状态      2 启动      3 停止      4 重启
  5 日志      6 节点管理  7 导入      8 订阅管理
  9 出口策略 10 路由模式 11 应用代理 12 入口管理
 13 检查     14 测试代理 15 备份     16 恢复
 17 版本     18 sing-box升级          19 拉取当前镜像
-20 管理器更新                       21 高级编辑
+20 管理器更新  21 Docker容器网络 22 高级编辑
  0 退出
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 EOF
@@ -283,7 +283,8 @@ EOF
       18) read -r -p 'sing-box 目标版本: ' v; [[ -n "$v" ]] && upgrade "$v" || true ;;
       19) pull ;;
       20) manager_menu; continue ;;
-      21) edit || true ;;
+      21) docker_network_menu; continue ;;
+      22) edit || true ;;
       0) exit ;;
       *) warn "无效选项" ;;
     esac
@@ -305,6 +306,7 @@ sbx image status|bootstrap|pull|load
 sbx manager                          管理器更新菜单
 sbx manager check|update
 sbx manager auto on|off|status
+sbx docker-network                    Docker 容器共享代理网络
 sbx self-update                      快速更新 singbox-manager
 sbx-install                          获取最新安装器并完整安装/升级
 sbx status/start/stop/restart/logs/check/test
@@ -352,6 +354,7 @@ main(){
     image) image_cmd "$@" ;;
     manager) manager_cmd "$@" ;;
     self-update) manager_update "$@" ;;
+    docker-network|dnet) docker_network_cmd "$@" ;;
     status|ps) status ;;
     start|up) start ;;
     stop|down) stop ;;

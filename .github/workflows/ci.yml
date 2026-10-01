@@ -22,6 +22,7 @@ jobs:
           bash -n lib/sbx_bootstrap.sh
           bash -n lib/sbx_image.sh
           bash -n lib/sbx_inbound.sh
+          bash -n lib/sbx_docker_network.sh
           bash -n lib/sbx_update.sh
           bash -n bin/sbx-install
 
@@ -34,6 +35,7 @@ jobs:
           grep -F 'raw.githubusercontent.com' install.sh
           grep -F 'raw 源不可用，回退 GitHub archive' install.sh
           grep -F 'lib/sbx_inbound.sh' install.sh
+          grep -F 'lib/sbx_docker_network.sh' install.sh
           grep -F 'lib/sbx_update.sh' install.sh
           grep -F 'bin/sbx-install' install.sh
           grep -F 'VERSION' install.sh
@@ -308,6 +310,50 @@ jobs:
           check
           grep -F -- '--pull=never' "$LOG"
           grep -F -- '--pull never' lib/sbx_image.sh
+
+      - name: Exercise Docker shared proxy network
+        run: |
+          export HOME_DIR="${{ github.workspace }}/.ci-docker-net-home"
+          export ENV="$HOME_DIR/.env"
+          export NODES="$HOME_DIR/nodes/nodes.json"
+          export SBX_DOCKER_NETWORK_COMPOSE="$HOME_DIR/compose.network.yml"
+          export SBX_DOCKER_NETWORK_NO_APPLY=1
+          mkdir -p "$HOME_DIR/nodes"
+          cp .env.example "$ENV"
+          cp .ci-home/nodes/nodes.json "$NODES"
+          envval() { grep -E "^$1=" "$ENV" 2>/dev/null | tail -n1 | cut -d= -f2- || printf '%s' "$2"; }
+          setenv() { local k="$1" v="$2" t; t=$(mktemp); awk -v k="$k" -v v="$v" 'BEGIN{f=0} index($0,k"=")==1{print k"="v;f=1;next}{print} END{if(!f)print k"="v}' "$ENV">"$t"; cat "$t">"$ENV"; rm -f "$t"; }
+          info() { :; }
+          warn() { :; }
+          die() { printf 'ERROR: %s\n' "$*" >&2; return 1; }
+          running() { return 1; }
+          pause() { :; }
+          source lib/sbx_docker_network.sh
+
+          NET="sbx-ci-proxy-${{ github.run_id }}"
+          trap 'docker network rm "$NET" >/dev/null 2>&1 || true' EXIT
+          docker_network_on "$NET"
+          docker network inspect "$NET" >/dev/null
+
+          docker compose \
+            --env-file "$ENV" \
+            -f compose.yml \
+            -f "$SBX_DOCKER_NETWORK_COMPOSE" \
+            config >/tmp/sbx-network-compose.yml
+
+          grep -F 'name: '"$NET" /tmp/sbx-network-compose.yml
+          grep -F 'sing-box' /tmp/sbx-network-compose.yml
+          grep -F 'aliases:' /tmp/sbx-network-compose.yml
+          grep -F 'external: true' /tmp/sbx-network-compose.yml
+
+          docker_network_env 7891 | grep -F "HTTP_PROXY='http://sing-box:7891'"
+          docker_network_snippet 7892 | grep -F 'HTTP_PROXY: http://sing-box:7892'
+          docker_network_status | grep -F 'Docker网络: READY'
+
+          docker_network_off
+          test ! -e "$SBX_DOCKER_NETWORK_COMPOSE"
+          docker network rm "$NET" >/dev/null
+          trap - EXIT
 
       - name: Exercise host proxy config generation
         run: |

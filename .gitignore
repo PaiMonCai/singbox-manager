@@ -11,3 +11,5 @@ __pycache__/
 proxy-state/*
 
 compose.inbounds.yml
+
+compose.network.yml
