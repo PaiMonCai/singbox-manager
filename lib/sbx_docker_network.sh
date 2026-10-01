@@ -285,13 +285,35 @@ docker_network_inbound_name(){
 }
 
 docker_network_choose_inbound(){
-  local raw resolved
-  printf '可用代理入口（按 ID 选择）：\n' >&2
-  docker_network_known_inbounds >&2
-  read -r -p '代理入口 ID [default]: ' raw
-  raw="${raw:-default}"
-  resolved="$(docker_network_resolve_inbound "$raw")" || return 1
-  printf '%s\n' "$resolved" | python3 -c 'import json,sys; print(json.load(sys.stdin)["id"])'
+  local raw endpoints count inbound_id
+  endpoints="$(docker_network_endpoints_json)" || return 1
+
+  python3 - "$endpoints" >&2 <<'PY'
+import json,sys
+items=json.loads(sys.argv[1])
+print("可用代理入口：")
+for idx,item in enumerate(items,1):
+    target=item.get("resolved_outbound") or (item.get("target") or {}).get("type","?")
+    print(f"  {idx}. [{item['id']}] {item['name']}  {item['port']} -> {target}")
+PY
+
+  count="$(python3 - "$endpoints" <<'PY'
+import json,sys
+print(len(json.loads(sys.argv[1])))
+PY
+)"
+  read -r -p '请选择代理入口 [1]: ' raw
+  raw="${raw:-1}"
+  [[ "$raw" =~ ^[0-9]+$ ]] || { warn "请输入入口序号。"; return 1; }
+  ((raw >= 1 && raw <= count)) || { warn "入口序号不存在: $raw"; return 1; }
+
+  inbound_id="$(python3 - "$endpoints" "$raw" <<'PY'
+import json,sys
+items=json.loads(sys.argv[1]); idx=int(sys.argv[2])
+print(items[idx-1]["id"])
+PY
+)"
+  printf '%s\n' "$inbound_id"
 }
 
 docker_network_migrate_legacy_targets(){

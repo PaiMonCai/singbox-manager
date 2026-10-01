@@ -455,10 +455,15 @@ jobs:
           grep -F 'aliases:' /tmp/sbx-network-compose.yml
           grep -F 'external: true' /tmp/sbx-network-compose.yml
 
-          chosen_id="$(printf 'default\n' | docker_network_choose_inbound 2>/tmp/sbx-inbound-ui.txt)"
+          chosen_id="$(printf '1\n' | docker_network_choose_inbound 2>/tmp/sbx-inbound-ui.txt)"
           test "$chosen_id" = "default"
-          grep -F '可用代理入口（按 ID 选择）：' /tmp/sbx-inbound-ui.txt
-          grep -F 'default' /tmp/sbx-inbound-ui.txt
+          grep -F '可用代理入口：' /tmp/sbx-inbound-ui.txt
+          grep -F '1. [default]' /tmp/sbx-inbound-ui.txt
+
+          SECOND_ID="$(python lib/sbx_nodes.py inbound-endpoints --json | python -c 'import json,sys; print(json.load(sys.stdin)[1]["id"])')"
+          chosen_second="$(printf '2\n' | docker_network_choose_inbound 2>/tmp/sbx-inbound-ui-2.txt)"
+          test "$chosen_second" = "$SECOND_ID"
+          grep -F '2. ['"$SECOND_ID"']' /tmp/sbx-inbound-ui-2.txt
           docker_network_urls | grep -F '[default] 默认入口'
           docker_network_env default | grep -F "HTTP_PROXY='http://sing-box:7890'"
           CUSTOM_INBOUND_ID="$(python lib/sbx_nodes.py inbound-endpoints --json | python -c 'import json,sys; x=json.load(sys.stdin); print(x[1]["id"])')"
