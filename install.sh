@@ -21,7 +21,10 @@ warn() { printf '\033[33m[WARN]\033[0m %s\n' "$*" >&2; }
 die() { printf '\033[31m[ERROR]\033[0m %s\n' "$*" >&2; exit 1; }
 
 cleanup() {
-  [[ -n "$TMP_DIR" && -d "$TMP_DIR" ]] && rm -rf "$TMP_DIR"
+  if [[ -n "$TMP_DIR" && -d "$TMP_DIR" ]]; then
+    rm -rf "$TMP_DIR"
+  fi
+  return 0
 }
 trap cleanup EXIT
 
