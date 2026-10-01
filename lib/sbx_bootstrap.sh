@@ -1,20 +1,52 @@
 #!/usr/bin/env bash
 # Bootstrap image acquisition for singbox-manager.
-# Sourced by install.sh after helper functions (info/warn/die/ask/confirm) exist.
+# Used by both install.sh and the runtime image guard.
 
 BOOTSTRAP_DOCKER_DROPIN_DIR="${SBX_BOOTSTRAP_DOCKER_DROPIN_DIR:-/etc/systemd/system/docker.service.d}"
 BOOTSTRAP_DOCKER_PROXY_FILE="${SBX_BOOTSTRAP_DOCKER_PROXY_FILE:-$BOOTSTRAP_DOCKER_DROPIN_DIR/98-singbox-manager-bootstrap-proxy.conf}"
 BOOTSTRAP_PULL_TIMEOUT="${SBX_BOOTSTRAP_PULL_TIMEOUT:-45}"
 
+bootstrap_ask() {
+  local text="$1" default="${2:-}" answer
+  if declare -F ask >/dev/null 2>&1; then
+    ask "$text" "$default"
+    return
+  fi
+  if [[ "${NONINTERACTIVE:-0}" == "1" ]]; then
+    printf '%s\n' "$default"
+    return
+  fi
+  if [[ -n "$default" ]]; then
+    read -r -p "$text [$default]: " answer || true
+    printf '%s\n' "${answer:-$default}"
+  else
+    read -r -p "$text: " answer || true
+    printf '%s\n' "$answer"
+  fi
+}
+
 bootstrap_image_repo() {
-  local env_file="${1:-}"
-  local repo="ghcr.io/sagernet/sing-box"
+  local env_file="${1:-}" repo="ghcr.io/sagernet/sing-box" v
   if [[ -n "$env_file" && -f "$env_file" ]]; then
-    local v
     v="$(grep -E '^SING_BOX_IMAGE=' "$env_file" 2>/dev/null | tail -n1 | cut -d= -f2- || true)"
     [[ -n "$v" ]] && repo="$v"
   fi
   printf '%s\n' "$repo"
+}
+
+bootstrap_image_version() {
+  local env_file="${1:-}" fallback="${2:-v1.14.2}" v
+  v="$(grep -E '^SING_BOX_VERSION=' "$env_file" 2>/dev/null | tail -n1 | cut -d= -f2- || true)"
+  printf '%s\n' "${v:-$fallback}"
+}
+
+bootstrap_target_image() {
+  local version="$1" env_file="$2"
+  printf '%s:%s\n' "$(bootstrap_image_repo "$env_file")" "$version"
+}
+
+bootstrap_image_present() {
+  docker image inspect "$1" >/dev/null 2>&1
 }
 
 bootstrap_pull() {
@@ -39,7 +71,7 @@ bootstrap_temp_proxy_pull() {
   local proxy="$1" image="$2"
   command -v systemctl >/dev/null 2>&1 || { warn "临时 Docker daemon 代理需要 systemd。"; return 1; }
   docker info --format '{{json .SecurityOptions}}' 2>/dev/null | grep -qi rootless && {
-    warn "检测到 rootless Docker，安装器不会修改用户级 systemd。"
+    warn "检测到 rootless Docker，暂不自动修改用户级 systemd。"
     return 1
   }
 
@@ -64,93 +96,99 @@ EOF
 }
 
 bootstrap_custom_repo_pull() {
-  local repo="$1" version="$2" target="$3"
+  local repo="$1" version="$2" target="$3" source
   repo="${repo%/}"
-  local source="$repo:$version"
+  source="$repo:$version"
   warn "你选择了自定义镜像仓库。请仅使用你信任的仓库。"
   info "尝试拉取: $source"
   bootstrap_pull "$source" || return 1
   docker tag "$source" "$target"
-  info "已将镜像标记为官方目标名: $target"
+  info "已将镜像标记为运行目标: $target"
 }
 
 bootstrap_load_tar() {
   local file="$1" target="$2" source=""
   [[ -f "$file" ]] || { warn "镜像包不存在: $file"; return 1; }
-
   info "导入本地 Docker 镜像包: $file"
   docker load -i "$file"
 
-  if docker image inspect "$target" >/dev/null 2>&1; then
-    return 0
-  fi
+  bootstrap_image_present "$target" && return 0
 
-  source="$(ask '导入后的镜像名（例如 ghcr.io/sagernet/sing-box:v1.14.2）' '')"
+  source="$(bootstrap_ask '导入后的镜像名（含版本）' '')"
   [[ -n "$source" ]] || { warn "未提供导入后的镜像名。"; return 1; }
-  docker image inspect "$source" >/dev/null 2>&1 || { warn "未找到镜像: $source"; return 1; }
+  bootstrap_image_present "$source" || { warn "未找到镜像: $source"; return 1; }
   docker tag "$source" "$target"
 }
 
-bootstrap_ensure_image() {
-  local version="$1" env_file="$2"
-  local repo target choice proxy mirror tarfile
+bootstrap_menu() {
+  local version="$1" env_file="$2" target choice proxy mirror tarfile
+  target="$(bootstrap_target_image "$version" "$env_file")"
 
-  repo="$(bootstrap_image_repo "$env_file")"
-  target="$repo:$version"
-
-  if docker image inspect "$target" >/dev/null 2>&1; then
+  bootstrap_image_present "$target" && {
     info "本地已存在 sing-box 镜像: $target"
     return 0
-  fi
+  }
 
-  info "首次启动需要 sing-box 镜像。先尝试官方/当前配置源（最长约 ${BOOTSTRAP_PULL_TIMEOUT}s）..."
-  if bootstrap_pull "$target"; then
-    return 0
-  fi
-
-  warn "直接拉取失败，进入 Bootstrap 启动菜单。"
-
-  if [[ "${NONINTERACTIVE:-0}" == "1" ]]; then
-    return 1
-  fi
+  [[ "${NONINTERACTIVE:-0}" == "1" ]] && return 1
 
   while true; do
-    cat <<'EOF'
+    cat <<EOF
+
+本地缺少 sing-box 镜像：
+  $target
 
 Bootstrap 镜像获取方式：
-  1. 使用临时 HTTP/HTTPS 代理拉取官方镜像
+  1. 使用临时 HTTP/HTTPS 代理拉取目标镜像
   2. 使用自定义/可信镜像仓库拉取并重新 tag
   3. docker load 本地 .tar 镜像包
-  4. 再次尝试官方源
-  0. 暂时跳过
+  4. 明确尝试当前镜像源（最长约 ${BOOTSTRAP_PULL_TIMEOUT}s）
+  0. 取消
 EOF
     read -r -p '请选择: ' choice || return 1
     case "$choice" in
       1)
-        proxy="$(ask '临时 HTTP 代理地址（例如 http://1.2.3.4:7890）' '')"
+        proxy="$(bootstrap_ask '临时 HTTP 代理地址（例如 http://1.2.3.4:7890）' '')"
         [[ -n "$proxy" ]] || { warn "代理地址不能为空。"; continue; }
-        if bootstrap_temp_proxy_pull "$proxy" "$target"; then return 0; fi
+        bootstrap_temp_proxy_pull "$proxy" "$target" && return 0
         warn "通过临时代理拉取失败。"
         ;;
       2)
-        mirror="$(ask '镜像仓库（不含版本，例如 mirror.example.com/sagernet/sing-box）' '')"
+        mirror="$(bootstrap_ask '镜像仓库（不含版本）' '')"
         [[ -n "$mirror" ]] || { warn "镜像仓库不能为空。"; continue; }
-        if bootstrap_custom_repo_pull "$mirror" "$version" "$target"; then return 0; fi
+        bootstrap_custom_repo_pull "$mirror" "$version" "$target" && return 0
         warn "自定义镜像仓库拉取失败。"
         ;;
       3)
-        tarfile="$(ask 'Docker 镜像 tar 文件路径' '')"
-        if bootstrap_load_tar "$tarfile" "$target"; then return 0; fi
+        tarfile="$(bootstrap_ask 'Docker 镜像 tar 文件路径' '')"
+        bootstrap_load_tar "$tarfile" "$target" && return 0
         ;;
       4)
-        bootstrap_pull "$target" && return 0 || warn "官方源仍然失败。"
+        bootstrap_pull "$target" && return 0
+        warn "当前镜像源拉取失败。"
         ;;
-      0)
-        return 1
-        ;;
-      *)
-        warn "无效选项。"
-        ;;
+      0) return 1 ;;
+      *) warn "无效选项。" ;;
     esac
   done
+}
+
+bootstrap_ensure_image() {
+  local version="$1" env_file="$2" mode="${3:-install}" target
+  target="$(bootstrap_target_image "$version" "$env_file")"
+
+  if bootstrap_image_present "$target"; then
+    info "本地已存在 sing-box 镜像: $target"
+    return 0
+  fi
+
+  if [[ "$mode" == "runtime" ]]; then
+    warn "本地缺少 sing-box 镜像；不会隐式执行 docker pull。"
+    bootstrap_menu "$version" "$env_file"
+    return
+  fi
+
+  info "首次安装先短时尝试当前镜像源（最长约 ${BOOTSTRAP_PULL_TIMEOUT}s）..."
+  bootstrap_pull "$target" && return 0
+  warn "直接拉取失败，进入 Bootstrap 启动菜单。"
+  bootstrap_menu "$version" "$env_file"
 }

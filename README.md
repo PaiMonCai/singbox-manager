@@ -2,7 +2,7 @@
 
 面向 Linux 服务器的 sing-box Docker 管理层。sing-box 保持官方镜像运行，宿主机通过 `sbx` 完成安装、节点管理、配置生成、校验、测试、备份恢复与升级。
 
-当前版本：**0.5.0**
+当前版本：**0.5.1**
 
 ## 一键交互式安装
 
@@ -195,6 +195,51 @@ sbx route cn-direct-full
 升级到 0.3 后不会自动改变原有流量策略：旧节点库会迁移到新格式，但默认保持 `manual + global`，需要你主动开启 `auto` 或国内直连模式。
 
 
+
+
+## 0.5.1：禁止运行期隐式拉镜像
+
+0.5.1 修复了一个实际安装流程问题：节点导入完成后执行 `sing-box check` 时，如果本地缺少镜像，Docker Compose 以前会按默认策略自动拉取 GHCR，导致国内服务器卡在 `Pulling fs layer`。
+
+现在运行期统一增加了镜像守卫：
+
+```text
+import / node / subscription / check / start
+                    ↓
+             检查本地目标镜像
+                    ↓
+        ┌───────────┴───────────┐
+        │                       │
+      已存在                   缺失
+        │                       │
+        ↓                       ↓
+  --pull=never 执行      立即进入 Bootstrap
+                                │
+                        用户明确选择后才拉取
+```
+
+`check` 和节点测试使用 Docker 的 `--pull=never`；`start/restart/upgrade` 使用 Compose 的 `--pull never`，因此这些运行期命令不会再偷偷触发镜像下载。
+
+新增镜像管理命令：
+
+```bash
+sbx image status
+sbx image bootstrap
+sbx image pull
+sbx image load /path/to/sing-box.tar
+sbx image ref
+```
+
+其中 `sbx image bootstrap` 如果镜像缺失，会直接进入 Bootstrap 菜单，不会先自动尝试 GHCR。只有 `sbx image pull` 或 Bootstrap 菜单中明确选择拉取方式后才会发生网络拉取。
+
+如果你刚才在节点导入时按 `Ctrl+C` 中断了 GHCR 拉取，可以升级到 0.5.1 后先执行：
+
+```bash
+sbx image status
+sbx image bootstrap
+```
+
+镜像准备好后，再重新执行节点导入或 `sbx check`。
 
 ## Bootstrap：解决国内服务器首次拉镜像问题
 

@@ -20,6 +20,7 @@ jobs:
           bash -n lib/sbx_v3.sh
           bash -n lib/sbx_proxy.sh
           bash -n lib/sbx_bootstrap.sh
+          bash -n lib/sbx_image.sh
 
       - name: Python syntax
         run: python -m py_compile lib/sbx_nodes.py
@@ -133,6 +134,56 @@ jobs:
           source lib/sbx_bootstrap.sh
           test "$(bootstrap_image_repo /tmp/sbx-bootstrap.env)" = "ghcr.io/sagernet/sing-box"
           SING_BOX_IMAGE=registry.example.com/sagernet/sing-box docker compose --env-file .env.example -f compose.yml config | grep -F 'registry.example.com/sagernet/sing-box:v1.14.2'
+
+      - name: Verify runtime image guard never pulls implicitly
+        run: |
+          export HOME_DIR="${{ github.workspace }}/.ci-image-home"
+          export ENV="$HOME_DIR/.env"
+          mkdir -p "$HOME_DIR/config" "$HOME_DIR/data"
+          cp .env.example "$ENV"
+          : > "$HOME_DIR/config/config.json"
+          LOG=/tmp/sbx-image-docker.log
+          : > "$LOG"
+          envval() { grep -E "^$1=" "$ENV" | tail -n1 | cut -d= -f2- || printf '%s' "$2"; }
+          info() { :; }
+          warn() { :; }
+          die() { printf 'ERROR: %s\n' "$*" >&2; return 1; }
+          dc() { printf 'compose %s\n' "$*" >> "$LOG"; return 0; }
+          status() { :; }
+          running() { return 0; }
+          http_test() { return 0; }
+          python3() { command python3 "$@"; }
+          bootstrap_ensure_image() {
+            test "$3" = runtime
+            printf 'bootstrap %s %s %s\n' "$1" "$2" "$3" >> "$LOG"
+            return 1
+          }
+          docker() {
+            printf 'docker %s\n' "$*" >> "$LOG"
+            if [[ "$1" == "image" && "$2" == "inspect" ]]; then
+              return 1
+            fi
+            return 0
+          }
+          source lib/sbx_image.sh
+          if image_require; then
+            echo "image_require unexpectedly succeeded" >&2
+            exit 1
+          fi
+          ! grep -E 'docker (pull|compose .*pull)' "$LOG"
+          grep -F 'bootstrap v1.14.2' "$LOG"
+
+          : > "$LOG"
+          docker() {
+            printf 'docker %s\n' "$*" >> "$LOG"
+            if [[ "$1" == "image" && "$2" == "inspect" ]]; then
+              return 0
+            fi
+            return 0
+          }
+          check
+          grep -F -- '--pull=never' "$LOG"
+          grep -F -- '--pull never' lib/sbx_image.sh
 
       - name: Exercise host proxy config generation
         run: |

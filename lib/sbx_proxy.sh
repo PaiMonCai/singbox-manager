@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # singbox-manager v0.4 host application proxy integration.
 # Sourced after v0.3; overrides VERSION/menu/help/main and adds `sbx proxy`.
-VERSION="0.5.0"
+VERSION="0.5.1"
 
 PROXY_STATE_DIR="${SBX_PROXY_STATE_DIR:-$HOME_DIR/proxy-state}"
 DOCKER_DROPIN_DIR="${SBX_DOCKER_DROPIN_DIR:-/etc/systemd/system/docker.service.d}"
@@ -336,7 +336,7 @@ sbx proxy git on|off              Git 系统 HTTP/HTTPS 代理
 sbx proxy apt on|off              APT 系统代理
 sbx proxy npm on|off              npm 全局代理
 sbx proxy all on|off              一键开启/关闭全部可用集成
-sbx proxy env [off]               输出当前 Shell 的 export/unset 命令
+sbx proxy env [off]\nsbx image status|bootstrap|pull|load               输出当前 Shell 的 export/unset 命令
 EOF
       ;;
     *) die "未知 proxy 命令: $target" ;;
@@ -356,7 +356,7 @@ menu(){
     printf '%b' "$C"
     cat <<'EOF'
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-        singbox-manager 0.4
+        singbox-manager 0.5.1
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
  1 状态      2 启动      3 停止      4 重启
  5 日志      6 节点管理  7 导入      8 订阅管理
