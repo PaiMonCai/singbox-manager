@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # singbox-manager v0.4 host application proxy integration.
 # Sourced after v0.3; overrides VERSION/menu/help/main and adds `sbx proxy`.
-VERSION="0.4.0"
+VERSION="0.5.0"
 
 PROXY_STATE_DIR="${SBX_PROXY_STATE_DIR:-$HOME_DIR/proxy-state}"
 DOCKER_DROPIN_DIR="${SBX_DOCKER_DROPIN_DIR:-/etc/systemd/system/docker.service.d}"

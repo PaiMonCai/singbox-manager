@@ -19,6 +19,7 @@ jobs:
           bash -n bin/sbx
           bash -n lib/sbx_v3.sh
           bash -n lib/sbx_proxy.sh
+          bash -n lib/sbx_bootstrap.sh
 
       - name: Python syntax
         run: python -m py_compile lib/sbx_nodes.py
@@ -120,6 +121,18 @@ jobs:
           python lib/sbx_nodes.py validate
           python lib/sbx_nodes.py render
           python -m json.tool "$SBX_HOME/config/config.json" >/dev/null
+
+      - name: Exercise bootstrap image configuration
+        run: |
+          cp .env.example /tmp/sbx-bootstrap.env
+          info() { :; }
+          warn() { :; }
+          die() { printf 'ERROR: %s\n' "$*" >&2; return 1; }
+          ask() { printf '%s\n' "${2:-}"; }
+          confirm() { return 0; }
+          source lib/sbx_bootstrap.sh
+          test "$(bootstrap_image_repo /tmp/sbx-bootstrap.env)" = "ghcr.io/sagernet/sing-box"
+          SING_BOX_IMAGE=registry.example.com/sagernet/sing-box docker compose --env-file .env.example -f compose.yml config | grep -F 'registry.example.com/sagernet/sing-box:v1.14.2'
 
       - name: Exercise host proxy config generation
         run: |

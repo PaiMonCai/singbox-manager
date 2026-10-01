@@ -2,7 +2,7 @@
 
 面向 Linux 服务器的 sing-box Docker 管理层。sing-box 保持官方镜像运行，宿主机通过 `sbx` 完成安装、节点管理、配置生成、校验、测试、备份恢复与升级。
 
-当前版本：**0.4.0**
+当前版本：**0.5.0**
 
 ## 一键交互式安装
 
@@ -194,6 +194,69 @@ sbx route cn-direct-full
 
 升级到 0.3 后不会自动改变原有流量策略：旧节点库会迁移到新格式，但默认保持 `manual + global`，需要你主动开启 `auto` 或国内直连模式。
 
+
+
+## Bootstrap：解决国内服务器首次拉镜像问题
+
+0.5 专门处理第一次安装时的“鸡生蛋”问题：sing-box 还没有启动，Docker 又可能无法直接从 GHCR 拉取 sing-box 镜像。
+
+安装器会先对当前镜像源做一次短时拉取尝试。默认目标仍是官方镜像：
+
+```text
+ghcr.io/sagernet/sing-box:<version>
+```
+
+如果失败，会自动进入 Bootstrap 菜单：
+
+```text
+1. 使用临时 HTTP/HTTPS 代理拉取官方镜像
+2. 使用自定义/可信镜像仓库拉取并重新 tag
+3. docker load 本地 .tar 镜像包
+4. 再次尝试官方源
+0. 暂时跳过
+```
+
+### 临时 HTTP 代理
+
+如果服务器已经能访问某个外部 HTTP 代理，可输入例如：
+
+```text
+http://1.2.3.4:7890
+```
+
+安装器会临时写入 Docker daemon 的 systemd drop-in、重启 Docker、拉取官方镜像，然后立刻删除临时代理配置并再次重启 Docker。
+
+### 自定义镜像仓库
+
+安装器不会硬编码任何第三方公共镜像站。你可以输入自己信任的镜像仓库，例如：
+
+```text
+mirror.example.com/sagernet/sing-box
+```
+
+成功拉取后，安装器会把该镜像重新 tag 成当前正式目标镜像名，因此 compose 后续仍可以使用标准镜像引用。
+
+### 本地镜像包
+
+也可以在其他网络正常的机器上提前：
+
+```bash
+docker pull ghcr.io/sagernet/sing-box:v1.14.2
+docker save ghcr.io/sagernet/sing-box:v1.14.2 -o sing-box-v1.14.2.tar
+```
+
+把 tar 文件传到国内服务器后，在 Bootstrap 菜单选择本地导入。
+
+### 自定义正式镜像源
+
+`.env` 现在支持：
+
+```text
+SING_BOX_IMAGE=ghcr.io/sagernet/sing-box
+SING_BOX_VERSION=v1.14.2
+```
+
+如果你有长期可信的私有镜像仓库，也可以修改 `SING_BOX_IMAGE`。
 
 ## 宿主机应用代理
 

@@ -112,7 +112,7 @@ get_source() {
     script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd || true)"
   fi
 
-  if [[ -n "$script_dir" && -f "$script_dir/compose.yml" && -f "$script_dir/bin/sbx" && -f "$script_dir/lib/sbx_nodes.py" && -f "$script_dir/lib/sbx_v3.sh" && -f "$script_dir/lib/sbx_proxy.sh" ]]; then
+  if [[ -n "$script_dir" && -f "$script_dir/compose.yml" && -f "$script_dir/bin/sbx" && -f "$script_dir/lib/sbx_nodes.py" && -f "$script_dir/lib/sbx_v3.sh" && -f "$script_dir/lib/sbx_proxy.sh" && -f "$script_dir/lib/sbx_bootstrap.sh" ]]; then
     SOURCE_DIR="$script_dir"
     return
   fi
@@ -125,7 +125,7 @@ get_source() {
     -o "$archive"
   tar -xzf "$archive" -C "$TMP_DIR"
   for candidate in "$TMP_DIR"/*/; do
-    if [[ -f "${candidate}compose.yml" && -f "${candidate}bin/sbx" && -f "${candidate}lib/sbx_nodes.py" && -f "${candidate}lib/sbx_v3.sh" && -f "${candidate}lib/sbx_proxy.sh" ]]; then
+    if [[ -f "${candidate}compose.yml" && -f "${candidate}bin/sbx" && -f "${candidate}lib/sbx_nodes.py" && -f "${candidate}lib/sbx_v3.sh" && -f "${candidate}lib/sbx_proxy.sh" && -f "${candidate}lib/sbx_bootstrap.sh" ]]; then
       SOURCE_DIR="${candidate%/}"
       break
     fi
@@ -140,8 +140,9 @@ read_env_value() {
 }
 
 write_env() {
-  local version="$1" bind="$2" port="$3"
+  local version="$1" bind="$2" port="$3" image="${4:-ghcr.io/sagernet/sing-box}"
   cat > "$INSTALL_DIR/.env" <<EOF
+SING_BOX_IMAGE=$image
 SING_BOX_VERSION=$version
 SING_BOX_CONTAINER_NAME=sing-box
 SING_BOX_BIND_ADDR=$bind
@@ -168,10 +169,12 @@ UPGRADE=0
 [[ -f "$INSTALL_DIR/.env" ]] && UPGRADE=1
 
 old_version="$DEFAULT_VERSION"
+old_image="ghcr.io/sagernet/sing-box"
 old_bind="127.0.0.1"
 old_port="7890"
 if (( UPGRADE )); then
   old_version="$(read_env_value "$INSTALL_DIR/.env" SING_BOX_VERSION "$DEFAULT_VERSION")"
+  old_image="$(read_env_value "$INSTALL_DIR/.env" SING_BOX_IMAGE "ghcr.io/sagernet/sing-box")"
   old_bind="$(read_env_value "$INSTALL_DIR/.env" SING_BOX_BIND_ADDR "127.0.0.1")"
   old_port="$(read_env_value "$INSTALL_DIR/.env" SING_BOX_MIXED_PORT "7890")"
   info "检测到已有安装，将执行就地升级并保留节点数据。"
@@ -198,7 +201,8 @@ install -m 0755 "$SOURCE_DIR/bin/sbx" "$INSTALL_DIR/bin/sbx"
 install -m 0755 "$SOURCE_DIR/lib/sbx_nodes.py" "$INSTALL_DIR/lib/sbx_nodes.py"
 install -m 0755 "$SOURCE_DIR/lib/sbx_v3.sh" "$INSTALL_DIR/lib/sbx_v3.sh"
 install -m 0755 "$SOURCE_DIR/lib/sbx_proxy.sh" "$INSTALL_DIR/lib/sbx_proxy.sh"
-write_env "$version" "$bind" "$port"
+install -m 0755 "$SOURCE_DIR/lib/sbx_bootstrap.sh" "$INSTALL_DIR/lib/sbx_bootstrap.sh"
+write_env "$version" "$bind" "$port" "$old_image"
 
 chmod 700 "$INSTALL_DIR/config" "$INSTALL_DIR/nodes" "$INSTALL_DIR/data" "$INSTALL_DIR/backup"
 ln -sfn "$INSTALL_DIR/bin/sbx" "$BIN_LINK"
@@ -212,8 +216,16 @@ else
   python3 "$INSTALL_DIR/lib/sbx_nodes.py" render >/dev/null
 fi
 
-if confirm "现在拉取 sing-box $version 镜像？" yes; then
-  docker compose --project-directory "$INSTALL_DIR" --env-file "$INSTALL_DIR/.env" -f "$INSTALL_DIR/compose.yml" pull sing-box
+source "$INSTALL_DIR/lib/sbx_bootstrap.sh"
+image_ready=0
+if confirm "现在准备 sing-box $version 镜像？" yes; then
+  if bootstrap_ensure_image "$version" "$INSTALL_DIR/.env"; then
+    image_ready=1
+  else
+    warn "sing-box 镜像尚未准备好。你可以稍后重新运行安装器。"
+  fi
+elif docker image inspect "$old_image:$version" >/dev/null 2>&1; then
+  image_ready=1
 fi
 
 node_count="$(python3 - <<PY
@@ -241,7 +253,7 @@ fi
 
 start_default="no"
 [[ "$node_count" != "0" ]] && start_default="yes"
-if confirm "是否立即启动 sing-box？" "$start_default"; then
+if (( image_ready )) && confirm "是否立即启动 sing-box？" "$start_default"; then
   "$BIN_LINK" start || warn "启动失败，请运行 sbx check 和 sbx logs 查看详情。"
 fi
 
