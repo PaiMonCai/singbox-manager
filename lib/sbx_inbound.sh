@@ -63,7 +63,7 @@ inbound_cmd(){
 
   case "$op" in
     menu) inbound_menu ;;
-    list|ls) python3 "$HELPER" inbound-list ;;
+    list|ls) python3 "$HELPER" inbound-list "$@" ;;
     add) inbound_tx add "" "$@" ;;
     edit)
       if [[ "$#" -gt 0 && "${1:-}" != --* ]]; then ref="$1"; shift; fi
@@ -84,12 +84,15 @@ inbound_cmd(){
     help|-h|--help)
       cat <<'EOF'
 sbx inbound                       入口管理菜单
-sbx inbound list                  查看全部入口及唯一 ID
+sbx inbound list [--ids]          入口列表；默认只显示序号，--ids 才显示内部 ID
 sbx inbound add                   添加 mixed 入口
-sbx inbound edit [ID|名称]        编辑入口
-sbx inbound delete [ID|名称]      删除入口
-sbx inbound show [ID|名称]        查看入口及解析后的出口
-sbx inbound test [ID|名称]        测试该入口的真实代理
+sbx inbound edit [序号|名称|ID]    编辑入口（默认入口不能编辑，它由 .env 决定）
+sbx inbound delete [序号|名称|ID]  删除入口（默认入口不能删除）
+sbx inbound show [序号|名称|ID]    查看入口及解析后的出口
+sbx inbound test [序号|名称|ID]    测试该入口的真实代理
+
+序号就是入口列表的第一列：内置默认入口恒为 1，之后按自定义入口的添加顺序。
+数字端口仍可作为引用（例如 sbx inbound show 7891），端口匹配优先于序号。
 
 高级非交互参数：
 sbx inbound add --name NAME --listen 127.0.0.1 --port 7891 --target proxy
@@ -104,11 +107,11 @@ EOF
 }
 
 inbound_menu(){
-  local x ref
+  local x ref p='序号(留空可列表选择): '
   while true; do
     clear
     menu_title '入口路由'
-    menu_note 'Docker 托管建议按入口 ID 绑定。'
+    menu_note '序号即操作时填的值；Docker 托管按入口 ID 绑定。'
     printf '\n'
     python3 "$HELPER" inbound-list || true
     menu_block '入口操作' <<'EOF'
@@ -123,10 +126,10 @@ EOF
     read -r -p '请选择: ' x || return
     case "$x" in
       1) inbound_tx add "" || true ;;
-      2) read -r -p '入口 ID/名称(留空后选择): ' ref; inbound_tx edit "$ref" || true ;;
-      3) read -r -p '入口 ID/名称(留空后选择): ' ref; inbound_tx delete "$ref" || true ;;
-      4) read -r -p '入口 ID/名称(留空后选择): ' ref; python3 "$HELPER" inbound-show ${ref:+"$ref"} || true ;;
-      5) read -r -p '入口 ID/名称(留空后选择): ' ref; inbound_test "$ref" || true ;;
+      2) read -r -p "$p" ref; inbound_tx edit "$ref" || true ;;
+      3) read -r -p "$p" ref; inbound_tx delete "$ref" || true ;;
+      4) read -r -p "$p" ref; python3 "$HELPER" inbound-show ${ref:+"$ref"} || true ;;
+      5) read -r -p "$p" ref; inbound_test "$ref" || true ;;
       0) return ;;
       *) warn "无效选项" ;;
     esac

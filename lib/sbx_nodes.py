@@ -264,45 +264,51 @@ def inbound_endpoints(data: Optional[Dict[str, Any]] = None) -> List[Dict[str, A
 
 
 def resolve_inbound_endpoint(data: Dict[str, Any], ref: Optional[str]) -> Dict[str, Any]:
+    """按 序号 / 完整 ID / ID 前缀 / 名称 / 端口 解析入口（含内置默认入口）。
+
+    顺序很重要：先做完整 ID、前缀、名称、端口匹配，最后才把纯数字当序号解释。
+    这样既保留“数字端口仍可作为查询引用”（0.10 起的行为），又能让交互层用序号，
+    与节点一致（见 resolve_node）。
+    """
     items = inbound_endpoints(data)
-    raw = (ref or "default").strip()
+    raw = (ref or "").strip()
+    if not raw:
+        list_inbounds(data)
+        raw = prompt("请输入入口序号（也可输入名称）", required=True).strip()
     exact = [x for x in items if str(x.get("id")) == raw]
     if len(exact) == 1:
         return exact[0]
+    if raw.isdigit():
+        by_port = [x for x in items if int(x.get("port", 0)) == int(raw)]
+        if len(by_port) == 1:
+            return by_port[0]
+    # 序号必须在 ID 前缀之前判断：否则 "9" 会命中 9d52daa0 这种前缀，
+    # 用户得不到“序号越界”的提示（节点解析也是这个顺序）
+    if is_node_index(raw):
+        idx = int(raw)
+        if not (1 <= idx <= len(items)):
+            raise ValueError(f"入口序号超出范围: {raw}（当前 1-{len(items)}）")
+        return items[idx - 1]
     prefix = [x for x in items if str(x.get("id", "")).startswith(raw)]
     if len(prefix) == 1:
         return prefix[0]
     named = [x for x in items if x.get("name") == raw]
     if len(named) == 1:
         return named[0]
-    if raw.isdigit():
-        by_port = [x for x in items if int(x.get("port", 0)) == int(raw)]
-        if len(by_port) == 1:
-            return by_port[0]
     if len(prefix) > 1 or len(named) > 1:
-        raise ValueError("匹配到多个代理入口，请使用完整 ID")
-    raise ValueError(f"未找到代理入口: {raw}")
+        raise ValueError("匹配到多个代理入口，请改用序号（见 sbx inbound list）")
+    raise ValueError(f"未找到入口: {raw}（可用序号 1-{len(items)}，或用 sbx inbound list 查看）")
 
 
-def resolve_inbound(data: Dict[str, Any], ref: Optional[str]) -> Dict[str, Any]:
-    items = data.get("inbounds", [])
-    if not items:
-        raise ValueError("当前没有自定义入口")
-    if not ref:
-        list_inbounds(data, include_default=False)
-        ref = prompt("请输入自定义入口 ID 或名称", required=True)
-    exact = [x for x in items if x.get("id") == ref]
-    if len(exact) == 1:
-        return exact[0]
-    prefix = [x for x in items if str(x.get("id", "")).startswith(ref)]
-    if len(prefix) == 1:
-        return prefix[0]
-    named = [x for x in items if x.get("name") == ref]
-    if len(named) == 1:
-        return named[0]
-    if len(prefix) > 1 or len(named) > 1:
-        raise ValueError("匹配到多个入口，请使用完整 ID")
-    raise ValueError(f"未找到入口: {ref}")
+def require_editable_inbound(inbound: Dict[str, Any]) -> None:
+    """默认入口由 .env 决定，不能改也不能删（它的出口恒为 proxy）。"""
+    if inbound.get("builtin"):
+        raise ValueError(
+            "默认入口不能编辑或删除：它的监听地址/端口来自 .env "
+            "（SING_BOX_BIND_ADDR / SING_BOX_MIXED_PORT），出口恒为 proxy。"
+            "改 .env 后执行 sbx restart，或重跑安装器（SBX_RECONFIGURE=1）重新配置；"
+            "需要别的端口/出口请用「添加」新建自定义入口。"
+        )
 
 
 def target_from_ref(data: Dict[str, Any], value: str) -> Dict[str, Any]:
@@ -944,18 +950,26 @@ def list_nodes(data: Optional[Dict[str, Any]] = None, show_id: bool = False) -> 
         print(f"{pad_cell(mark, 6)}{pad_cell(i, 6)}{id_cell}{pad_cell(n.get('type', ''), 14)}{name}{pad_cell(src[:12], 16)}{n.get('server')}:{n.get('server_port')}")
 
 
-def list_inbounds(data: Optional[Dict[str, Any]] = None, include_default: bool = True) -> None:
+def list_inbounds(data: Optional[Dict[str, Any]] = None, show_id: bool = False) -> None:
+    """入口列表。默认只显示交互用的序号，ID 是内部唯一标识（--ids 才显示）。
+
+    序号顺序就是 inbound_endpoints 的顺序：内置默认入口恒为 1，之后按自定义入口的添加顺序。
+    列宽按终端显示宽度算（CJK 记 2 列），否则中文名会把后面的列顶歪。
+    """
     data = data or load_registry()
-    items = inbound_endpoints(data) if include_default else list(data.get("inbounds", []))
+    items = inbound_endpoints(data)
     if not items:
         print("暂无自定义入口。")
         return
-    print(f"{'ID':<10} {'名称':<22} {'监听':<24} 出口")
-    print("-" * 90)
-    for item in items:
+    id_head = pad_cell("ID", 10) if show_id else ""
+    print(f"{pad_cell('序号', 6)}{id_head}{pad_cell('名称', 22)}{pad_cell('监听', 26)}出口")
+    print("-" * (96 if show_id else 86))
+    for i, item in enumerate(items, 1):
+        id_cell = pad_cell(item.get("id", ""), 10) if show_id else ""
         addr = f"{item.get('listen')}:{item.get('port')}"
         label = "proxy" if item.get("id") == "default" else target_label(data, item.get("target"))
-        print(f"{item.get('id',''):<10} {item.get('name','')[:20]:<22} {addr:<24} {label}")
+        name = pad_cell(clip_cell(item.get("name", ""), 20), 22)
+        print(f"{pad_cell(i, 6)}{id_cell}{name}{pad_cell(addr, 26)}{label}")
 
 
 def list_subscriptions(data: Optional[Dict[str, Any]] = None) -> None:
@@ -1056,8 +1070,8 @@ def cmd_import_file(args: argparse.Namespace) -> int:
     for err in errors[:10]: eprint("跳过:", err)
     if len(errors) > 10: eprint(f"另有 {len(errors)-10} 条错误未显示。")
     return 0
-def cmd_inbound_list(_: argparse.Namespace) -> int:
-    list_inbounds(); return 0
+def cmd_inbound_list(args: argparse.Namespace) -> int:
+    list_inbounds(show_id=bool(getattr(args, "ids", False))); return 0
 
 
 def cmd_inbound_endpoints(args: argparse.Namespace) -> int:
@@ -1095,17 +1109,25 @@ def cmd_inbound_add(args: argparse.Namespace) -> int:
 
 
 def cmd_inbound_edit(args: argparse.Namespace) -> int:
-    data = load_registry(); old = resolve_inbound(data, args.ref)
-    inbound = build_inbound(data, old, name=args.name, listen=args.listen, port=args.port, target_ref=args.target)
+    data = load_registry(); old = resolve_inbound_endpoint(data, args.ref)
+    require_editable_inbound(old)
+    # 解析器返回的是 inbound_endpoints() 的合成副本（带 builtin / container_port 等字段），
+    # 不能拿它去 list.index()——要按 id 回注册表里找真正的那一条。
+    items = data.get("inbounds", [])
+    idx = next((i for i, x in enumerate(items) if x.get("id") == old["id"]), None)
+    if idx is None:
+        raise ValueError(f"入口不在注册表里（可能已被删除）: {old.get('id')}")
+    inbound = build_inbound(data, items[idx], name=args.name, listen=args.listen, port=args.port, target_ref=args.target)
     inbound["id"] = old["id"]
-    data["inbounds"][data["inbounds"].index(old)] = inbound
+    items[idx] = inbound
     validate(data); render(data); save_registry(data)
     print(f"入口已更新：{inbound['name']} -> {target_label(data, inbound['target'])}")
     return 0
 
 
 def cmd_inbound_delete(args: argparse.Namespace) -> int:
-    data = load_registry(); inbound = resolve_inbound(data, args.ref)
+    data = load_registry(); inbound = resolve_inbound_endpoint(data, args.ref)
+    require_editable_inbound(inbound)
     if not args.yes and prompt(f"确认删除入口 {inbound['name']}？输入 DELETE") != "DELETE":
         print("已取消。"); return 1
     data["inbounds"] = [x for x in data.get("inbounds", []) if x.get("id") != inbound["id"]]
@@ -1194,7 +1216,7 @@ def parser() -> argparse.ArgumentParser:
     sub.add_parser("validate").set_defaults(func=cmd_validate)
     iu=sub.add_parser("import-uri"); iu.add_argument("uri", nargs="?"); iu.set_defaults(func=cmd_import_uri)
     im=sub.add_parser("import-file"); im.add_argument("file"); im.add_argument("--source"); im.set_defaults(func=cmd_import_file)
-    il=sub.add_parser("inbound-list"); il.set_defaults(func=cmd_inbound_list)
+    il=sub.add_parser("inbound-list"); il.add_argument("--ids", action="store_true"); il.set_defaults(func=cmd_inbound_list)
     ieps=sub.add_parser("inbound-endpoints"); ieps.add_argument("--json", action="store_true"); ieps.set_defaults(func=cmd_inbound_endpoints)
     iep=sub.add_parser("inbound-endpoint"); iep.add_argument("ref", nargs="?", default="default"); iep.set_defaults(func=cmd_inbound_endpoint)
     ia=sub.add_parser("inbound-add"); ia.add_argument("--name"); ia.add_argument("--listen"); ia.add_argument("--port", type=int); ia.add_argument("--target"); ia.set_defaults(func=cmd_inbound_add)

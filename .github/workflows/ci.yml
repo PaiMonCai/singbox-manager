@@ -820,6 +820,55 @@ jobs:
 
           python lib/sbx_nodes.py inbound-list
           python lib/sbx_nodes.py inbound-endpoints --json | python -c 'import json,sys; x=json.load(sys.stdin); assert x[0]["id"]=="default"; assert x[0]["port"]==7890; assert len(x)==3'
+
+          # 入口也走“交互层序号、持久层 ID”：列表默认只给序号，--ids 才显示内部 ID
+          echo '--- 入口列表：显示序号、默认隐藏 ID ---'
+          python lib/sbx_nodes.py inbound-list > /tmp/sbx-inbound-list.txt
+          cat /tmp/sbx-inbound-list.txt
+          grep -F '序号' /tmp/sbx-inbound-list.txt
+          grep -F '默认入口' /tmp/sbx-inbound-list.txt
+          if grep -qE '(^| )default( |$)' /tmp/sbx-inbound-list.txt; then
+            echo '入口列表默认不应显示内部 ID（用 --ids）' >&2; exit 1
+          fi
+          python lib/sbx_nodes.py inbound-list --ids > /tmp/sbx-inbound-list-ids.txt
+          cat /tmp/sbx-inbound-list-ids.txt
+          grep -F 'default' /tmp/sbx-inbound-list-ids.txt
+
+          echo '--- 序号解析 / 端口引用优先 / 越界报错 ---'
+          python lib/sbx_nodes.py inbound-show 1 | grep -F '"id": "default"'
+          python lib/sbx_nodes.py inbound-show 2 | grep -F '"port": 7891'
+          python lib/sbx_nodes.py inbound-show 3 | grep -F '"port": 7892'
+          # 数字端口仍可作为引用（0.10 起的行为），端口匹配优先于序号
+          python lib/sbx_nodes.py inbound-show 7891 | grep -F '"port": 7891'
+          if python lib/sbx_nodes.py inbound-show 9 > /tmp/sbx-inbound-err.txt 2>&1; then
+            echo '越界序号不应成功' >&2; exit 1
+          fi
+          grep -F '入口序号超出范围' /tmp/sbx-inbound-err.txt
+
+          echo '--- 默认入口：详情可用，编辑/删除必须明确拒绝 ---'
+          python lib/sbx_nodes.py inbound-show default | grep -F '"id": "default"'
+          if python lib/sbx_nodes.py inbound-edit default --port 7899 > /tmp/sbx-inbound-edit.txt 2>&1; then
+            echo '默认入口不应可编辑' >&2; exit 1
+          fi
+          grep -F '默认入口不能编辑或删除' /tmp/sbx-inbound-edit.txt
+          if python lib/sbx_nodes.py inbound-delete 1 --yes > /tmp/sbx-inbound-del.txt 2>&1; then
+            echo '默认入口不应可删除' >&2; exit 1
+          fi
+          grep -F '默认入口不能编辑或删除' /tmp/sbx-inbound-del.txt
+
+          echo '--- 全数字 ID 仍按 ID 解析（完整 ID 优先于序号）---'
+          python lib/sbx_nodes.py inbound-add --name ci-digit-id --listen 127.0.0.1 --port 7893 --target proxy > /dev/null
+          python - <<'PY'
+          import json, os
+          from pathlib import Path
+          p = Path(os.environ["SBX_HOME"]) / "nodes/nodes.json"
+          data = json.loads(p.read_text())
+          data["inbounds"][-1]["id"] = "22222222"
+          p.write_text(json.dumps(data, ensure_ascii=False))
+          PY
+          python lib/sbx_nodes.py inbound-show 22222222 | grep -F '"id": "22222222"'
+          python lib/sbx_nodes.py inbound-delete 22222222 --yes > /dev/null
+          python lib/sbx_nodes.py inbound-endpoints --json | python -c 'import json,sys; assert len(json.load(sys.stdin))==3'
           python lib/sbx_nodes.py validate
           python lib/sbx_nodes.py render
 
@@ -847,6 +896,37 @@ jobs:
 
           grep -F 'published: "7891"' /tmp/sbx-compose-merged.yml
           grep -F 'published: "7892"' /tmp/sbx-compose-merged.yml
+
+          # 用一条临时入口测编辑：不碰上面断言依赖的 7891/7892 夹具，后面 Docker 步骤还要用它们的端口。
+          # 回归：解析器返回的是 inbound_endpoints() 的合成副本，
+          # 早期实现拿它去 list.index() 会直接 “is not in list” 崩掉。
+          echo '--- 按序号编辑：改名/改端口/改出口，ID 保持稳定 ---'
+          python lib/sbx_nodes.py inbound-add --name ci-edit-tmp --listen 127.0.0.1 --port 7893 --target proxy > /dev/null
+          EDIT_IDX="$(python lib/sbx_nodes.py inbound-endpoints --json | python -c 'import json,sys; print(len(json.load(sys.stdin)))')"
+          BEFORE_ID="$(python lib/sbx_nodes.py inbound-endpoints --json | python -c 'import json,sys; print(json.load(sys.stdin)[-1]["id"])')"
+          python lib/sbx_nodes.py inbound-edit "$EDIT_IDX" --name ci-edit-renamed --listen 127.0.0.1 --port 7894 --target node:11111111 \
+            > /tmp/sbx-inbound-edit-ok.txt
+          cat /tmp/sbx-inbound-edit-ok.txt
+          grep -F '入口已更新' /tmp/sbx-inbound-edit-ok.txt
+          python lib/sbx_nodes.py inbound-show "$EDIT_IDX" > /tmp/sbx-inbound-after-edit.txt
+          grep -F '"name": "ci-edit-renamed"' /tmp/sbx-inbound-after-edit.txt
+          grep -F '"port": 7894' /tmp/sbx-inbound-after-edit.txt
+          grep -F "\"id\": \"$BEFORE_ID\"" /tmp/sbx-inbound-after-edit.txt
+          AFTER_ID="$(python lib/sbx_nodes.py inbound-endpoints --json | python -c 'import json,sys; print(json.load(sys.stdin)[-1]["id"])')"
+          test "$BEFORE_ID" = "$AFTER_ID"
+          # 改完必须真的落到配置与 compose 里
+          python -c '
+          import json, os
+          from pathlib import Path
+          home = Path(os.environ["SBX_HOME"])
+          cfg = json.loads((home / "config/config.json").read_text())
+          assert 7894 in [x["listen_port"] for x in cfg["inbounds"]], cfg["inbounds"]
+          assert "127.0.0.1:7894:7894/tcp" in (home / "compose.inbounds.yml").read_text()
+          '
+          # 删掉临时入口，把夹具还原成 default + 7891 + 7892 交给后面的 Docker 步骤
+          python lib/sbx_nodes.py inbound-delete "$BEFORE_ID" --yes > /dev/null
+          python lib/sbx_nodes.py validate
+          python lib/sbx_nodes.py inbound-endpoints --json | python -c 'import json,sys; x=json.load(sys.stdin); assert len(x)==3, x; assert [i["port"] for i in x]==[7890,7891,7892], x'
 
       - name: Exercise bootstrap image configuration
         run: |
