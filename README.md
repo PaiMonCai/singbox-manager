@@ -2,7 +2,7 @@
 
 面向 Linux 服务器的 sing-box Docker 管理层。sing-box 保持官方镜像运行，宿主机通过 `sbx` 完成安装、节点管理、配置生成、校验、测试、备份恢复与升级。
 
-当前版本：**0.11.14**
+当前版本：**0.11.15**
 
 ## 一键交互式安装
 
@@ -268,6 +268,42 @@ sbx route cn-direct-full
 
 
 
+
+## 0.11.15：给 systemd 单元加固（崩溃快速失败 + 显式补 HOME）
+
+两个独立问题都是这次 watcher 事故暴露出来的：
+
+**1. 崩溃循环能烧掉 40 分钟 CPU 而没人知道**
+
+`Restart=always` + `RestartSec=3` 的慢速崩溃（每 3 秒一次）不会触发 systemd 默认的
+`StartLimitBurst=5/10s`（3 秒一次刚好卡在门槛下），于是 unit 一直 active、重启计数
+涨到 5276、白烧 40 分钟 CPU。现在 watcher 单元里显式加上：
+
+```ini
+[Unit]
+StartLimitIntervalSec=60
+StartLimitBurst=5
+```
+
+以后再崩就会**停止重启并把 unit 标成 failed** —— `systemctl status` 和
+`sbx docker-network` 的 Watcher 那几行一眼能看出问题。
+（这两个键是 systemd ≥ 229 的 `[Unit]` 写法；更老的 systemd 会忽略，不影响启动。）
+
+**2. systemd 单元里没有 HOME**
+
+0.11.14 修的是脚本里没兜底的 `$HOME`；这一版再加一层保险，生成单元时显式补上：
+
+```ini
+Environment="HOME=/root"        # 自动更新 service 同样补上
+```
+
+家目录取自 `getent passwd 0`，取不到才退回 `/root`。这样即使以后新代码又踩到
+`$HOME`，这两个单元也不会再静默失败。
+
+自动更新的 service 是 `Type=oneshot` 且没有 `Restart=`，不存在崩溃循环，所以只补了 HOME。
+
+CI：unit 生成步骤新增断言（`StartLimitIntervalSec=60`、`StartLimitBurst=5`、
+`Environment="HOME=`），watcher 与自动更新两个单元都校验。
 
 ## 0.11.14：修掉“没有 HOME 时 sbx 完全起不来”（连同自动更新一起中招）
 

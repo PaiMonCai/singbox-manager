@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # singbox-manager v0.7 self-update integration.
 
-VERSION="0.11.14"
+VERSION="0.11.15"
 
 UPDATE_REPO="${SBX_UPDATE_REPO:-PaiMonCai/singbox-manager}"
 UPDATE_BRANCH="${SBX_UPDATE_BRANCH:-main}"
@@ -428,6 +428,10 @@ manager_auto_on(){
 
   mkdir -p "$(dirname "$UPDATE_SERVICE_FILE")" "$(dirname "$UPDATE_TIMER_FILE")"
 
+  # 同上：systemd 单元没有 HOME，显式补上，避免脚本里任何 $HOME 在 set -u 下炸掉
+  local unit_home
+  unit_home="$(getent passwd 0 2>/dev/null | cut -d: -f6 || true)"
+  unit_home="${unit_home:-/root}"
   cat > "$UPDATE_SERVICE_FILE" <<EOF
 [Unit]
 Description=singbox-manager self update
@@ -439,6 +443,7 @@ Type=oneshot
 Environment="SBX_UPDATE_REPO=$UPDATE_REPO"
 Environment="SBX_UPDATE_BRANCH=$UPDATE_BRANCH"
 Environment="SBX_UPDATE_BASE_URL=$UPDATE_BASE"
+Environment="HOME=$unit_home"
 ExecStart=$UPDATE_BIN_LINK manager update --quiet
 EOF
 

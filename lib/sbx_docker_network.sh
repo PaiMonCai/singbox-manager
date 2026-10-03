@@ -408,16 +408,27 @@ docker_network_watch_on(){
   command -v systemctl >/dev/null 2>&1 || { warn "当前系统没有 systemd，无法启用 Docker watcher；可手工执行 sbx docker-network sync。"; return 1; }
   [[ -x "$DOCKER_WATCH_BIN" ]] || die "缺少 watcher: $DOCKER_WATCH_BIN"
   mkdir -p "$(dirname "$DOCKER_WATCH_SERVICE")"
+  # systemd 单元默认不带 HOME。历史上 watcher 与自动更新都因为脚本里一处没兜底的
+  # $HOME（set -u 下直接退出）而静默失败，这里显式补上，作为额外保险。
+  local unit_home
+  unit_home="$(getent passwd 0 2>/dev/null | cut -d: -f6 || true)"
+  unit_home="${unit_home:-/root}"
   cat > "$DOCKER_WATCH_SERVICE" <<EOF
 [Unit]
 Description=singbox-manager Docker network watcher
 After=docker.service
 Requires=docker.service
+# 崩溃循环要快速失败并把 unit 标成 failed，而不是每 3 秒重启一次、静默烧 CPU
+# （曾出现 restart counter 上到 5000+、白烧 40 分钟 CPU 才发现的情况）。
+# 这两个键是 systemd >= 229 的 [Unit] 写法，更老的 systemd 会忽略，不影响启动。
+StartLimitIntervalSec=60
+StartLimitBurst=5
 
 [Service]
 Type=simple
 Environment="SBX_HOME=$HOME_DIR"
 Environment="SBX_WATCH_SBX=$DOCKER_WATCH_SBX"
+Environment="HOME=$unit_home"
 ExecStart=$DOCKER_WATCH_BIN
 Restart=always
 RestartSec=3

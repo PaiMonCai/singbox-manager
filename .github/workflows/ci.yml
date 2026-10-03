@@ -678,6 +678,7 @@ jobs:
           manager_auto_on
           grep -F 'ExecStart=/usr/local/bin/sbx manager update --quiet' "$SBX_UPDATE_SERVICE_FILE"
           grep -F 'Environment="SBX_UPDATE_BASE_URL=' "$SBX_UPDATE_SERVICE_FILE"
+          grep -F 'Environment="HOME=' "$SBX_UPDATE_SERVICE_FILE"
           grep -F 'OnUnitActiveSec=24h' "$SBX_UPDATE_TIMER_FILE"
           grep -F 'RandomizedDelaySec=30min' "$SBX_UPDATE_TIMER_FILE"
           manager_auto_status | grep -F '自动更新: CONFIGURED'
@@ -1333,6 +1334,10 @@ jobs:
           docker_network_watch_on
           grep -F 'ExecStart=' "$SBX_DOCKER_WATCH_SERVICE"
           grep -F 'Environment="SBX_HOME=' "$SBX_DOCKER_WATCH_SERVICE"
+          # 加固：崩溃循环要快速失败；systemd 单元没有 HOME，必须显式补
+          grep -F 'StartLimitIntervalSec=60' "$SBX_DOCKER_WATCH_SERVICE"
+          grep -F 'StartLimitBurst=5' "$SBX_DOCKER_WATCH_SERVICE"
+          grep -F 'Environment="HOME=' "$SBX_DOCKER_WATCH_SERVICE"
           docker_network_watch_status | grep -F 'Watcher: CONFIGURED'
           docker_network_watch_off
           test ! -e "$SBX_DOCKER_WATCH_SERVICE"
