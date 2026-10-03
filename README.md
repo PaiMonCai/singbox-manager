@@ -2,7 +2,7 @@
 
 面向 Linux 服务器的 sing-box Docker 管理层。sing-box 保持官方镜像运行，宿主机通过 `sbx` 完成安装、节点管理、配置生成、校验、测试、备份恢复与升级。
 
-当前版本：**0.11.15**
+当前版本：**0.11.16**
 
 ## 一键交互式安装
 
@@ -268,6 +268,33 @@ sbx route cn-direct-full
 
 
 
+
+## 0.11.16：托管同步的竞态不再误报“接入失败”
+
+0.11.13 之后 watcher 会真的干活了，于是下面这行在新日志里出现：
+
+```text
+[sbx-docker-watch] 接入失败: sbx-watch-probe: Error response from daemon: endpoint with name sbx-watch-probe already exists in network singbox-proxy
+```
+
+它其实**不是失败**。时序是这样：
+
+```text
+01:27:05  watcher 被探针容器的 create/start 事件唤醒 → 取了 docker 快照（此时还没托管、也没接入）
+01:27:06  你的 `sbx docker-network manage` 把它登记托管并接进网络；同一瞬间 watcher 又跑了一轮 sync，
+          它按旧快照以为“没接上”就去 connect → daemon 回 “already exists”（因为 manage 已经接好了）
+01:27:19  真正的测试（disconnect + restart）→ `已自动接入` ✓
+```
+
+`sync()` 原来只看 `docker network connect` 的退出码，失败就直接打成“接入失败”。
+现在失败后会**重新 inspect 这一个容器**再决定：
+
+- 它其实已经在共享网络里 → 计为 `already`，打印 `已在共享网络中: <容器> -> <网络>`
+- 确实没接上 → 照旧报 `接入失败`（真实故障不会被掩盖）
+
+这样日志里就不会再出现误导性的“失败”，同时真失败仍然可见 —— 对靠日志判断 watcher 是否健康的人来说这点很重要。
+
+CI 在“假 docker”测试台里加了确定性用例：`FAKE_DOCKER_STATE=race` 模拟“批量快照看不到网络、按名称重新 inspect 却在网络里、此时 connect 被 daemon 以 already exists 拒绝”，断言必须打印 `已在共享网络中` 且**不得**出现 `接入失败`；对着旧代码反向验证过（去掉自检必红）。
 
 ## 0.11.15：给 systemd 单元加固（崩溃快速失败 + 显式补 HOME）
 

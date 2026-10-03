@@ -1064,6 +1064,11 @@ jobs:
             "updated":[
               {"Id":"ccc333","Name":"/new-api-new","Config":{"Image":"example/new-api:2","Labels":{"com.docker.compose.project":"new-api","com.docker.compose.service":"app"}},"State":{"Running":True},"NetworkSettings":{"Networks":{"bridge":{}}}},
               {"Id":"bbb222","Name":"/standalone","Config":{"Image":"example/app:1","Labels":{}},"State":{"Running":True},"NetworkSettings":{"Networks":{"bridge":{}}}}
+            ],
+            # 竞态：批量快照（按 Id inspect）看不到共享网络，但按名称重新 inspect 时它其实已经在网络里，
+            # 且此刻再 connect 会被 daemon 以 "already exists" 拒绝 —— 模拟 watcher 与用户 manage 撞车。
+            "race":[
+              {"Id":"ddd444","Name":"/probe","Config":{"Image":"example/app:1","Labels":{}},"State":{"Running":True},"NetworkSettings":{"Networks":{"bridge":{}}}}
             ]
           }[state]
           log=os.environ.get("FAKE_DOCKER_LOG")
@@ -1076,6 +1081,11 @@ jobs:
               for x in containers:
                 if ref in (x["Id"], x["Id"][:12], x["Name"].lstrip("/")):
                   found.append(x); break
+            if state=="race" and len(refs)==1:
+              for x in containers:
+                if refs[0]==x["Name"].lstrip("/"):
+                  y=dict(x); y["NetworkSettings"]={"Networks":{"bridge":{},"singbox-proxy":{}}}
+                  found=[y]; break
             if not found: raise SystemExit(1)
             print(json.dumps(found)); raise SystemExit(0)
           if args[:2]==["network","inspect"]:
@@ -1083,6 +1093,9 @@ jobs:
           if args[:2]==["network","connect"]:
             if log:
               with open(log,"a") as f: f.write(" ".join(args)+"\n")
+            if state=="race":
+              sys.stderr.write("Error response from daemon: endpoint with name probe already exists in network singbox-proxy\n")
+              raise SystemExit(1)
             raise SystemExit(0)
           raise SystemExit(1)
           EOF
@@ -1110,6 +1123,21 @@ jobs:
           grep -F 'network connect singbox-proxy standalone' "$FAKE_DOCKER_LOG"
           python lib/sbx_docker_targets.py remove compose:new-api/app
           ! grep -F 'compose:new-api/app' <(python lib/sbx_docker_targets.py list --network singbox-proxy)
+
+          # 回归：竞态下 daemon 回 "already exists"，但重新 inspect 说明它已经在网络里，
+          # 这时不能报“接入失败”（真实场景：用户 manage 与 watcher 的 sync 撞车）
+          : > "$FAKE_DOCKER_LOG"
+          cat > "$SBX_DOCKER_MANAGED_FILE" <<'EOF'
+          {"version":1,"targets":[{"type":"name","name":"probe","inbound_id":"default"}]}
+          EOF
+          export FAKE_DOCKER_STATE=race
+          python lib/sbx_docker_targets.py sync --network singbox-proxy \
+            > /tmp/sbx-race.out 2> /tmp/sbx-race.err
+          cat /tmp/sbx-race.out /tmp/sbx-race.err
+          grep -F '已在共享网络中: probe' /tmp/sbx-race.out
+          if grep -F '接入失败' /tmp/sbx-race.out /tmp/sbx-race.err; then
+            echo '竞态场景不应报“接入失败”' >&2; exit 1
+          fi
 
       - name: Exercise Docker proxy verification
         run: |

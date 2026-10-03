@@ -276,6 +276,21 @@ def sync(network: str, quiet: bool = False) -> Dict[str, int]:
                 result["connected"] += 1
                 if not quiet:
                     print(f"已自动接入: {name} -> {network}")
+                continue
+            # 竞态：从上面取快照到真正 connect 之间，容器可能已经被接进去了
+            # （典型场景：用户同时在跑 `sbx docker-network manage`，watcher 又被
+            #  同一个 create/start 事件唤醒）。此时 daemon 会回
+            #  "endpoint ... already exists in network"，但目标状态其实已经达成。
+            # 重新 inspect 一次再决定要不要报错，免得日志里出现假的“接入失败”。
+            current = None
+            try:
+                current = docker_json(name)
+            except (ValueError, subprocess.SubprocessError, json.JSONDecodeError):
+                current = None
+            if current is not None and connected(current, network):
+                result["already"] += 1
+                if not quiet:
+                    print(f"已在共享网络中: {name} -> {network}")
             elif not quiet:
                 print(f"接入失败: {name}: {cp.stderr.strip()}", file=sys.stderr)
     return result
