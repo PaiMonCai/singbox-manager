@@ -15,14 +15,16 @@ inbound_tx(){
     *) die "未知入口操作: $op" ;;
   esac
 
+  # 回滚要连 .env 一起还原：默认入口的监听地址/端口就写在 .env 里，
+  # 只回滚注册表会留下“端口改了、出口没改”的半套状态。
   if ((rc)); then
-    restore_raw "$rollback" no
+    restore_raw "$rollback" yes
     return "$rc"
   fi
 
   if ! python3 "$HELPER" validate >/dev/null || ! check; then
     warn "入口配置未通过 sing-box 校验，正在自动回滚。"
-    restore_raw "$rollback" no
+    restore_raw "$rollback" yes
     return 1
   fi
 
@@ -86,10 +88,16 @@ inbound_cmd(){
 sbx inbound                       入口管理菜单
 sbx inbound list [--ids]          入口列表；默认只显示序号，--ids 才显示内部 ID
 sbx inbound add                   添加 mixed 入口
-sbx inbound edit [序号|名称|ID]    编辑入口（默认入口不能编辑，它由 .env 决定）
+sbx inbound edit [序号|名称|ID]    编辑入口
 sbx inbound delete [序号|名称|ID]  删除入口（默认入口不能删除）
 sbx inbound show [序号|名称|ID]    查看入口及解析后的出口
 sbx inbound test [序号|名称|ID]    测试该入口的真实代理
+
+默认入口（序号 1）= 容器里的 mixed-in：容器内固定监听 7890，宿主机端口由 .env 的
+SING_BOX_BIND_ADDR / SING_BOX_MIXED_PORT 决定。它也能编辑：改监听地址/端口会写入
+.env（需要 sbx restart 重建容器才生效），出口可在 proxy / auto / direct /
+node:<节点> 之间选 —— proxy（默认）= 跟随【出口与分流】里的全局策略。
+不能改名，也不能删除。
 
 序号就是入口列表的第一列：内置默认入口恒为 1，之后按自定义入口的添加顺序。
 数字端口仍可作为引用（例如 sbx inbound show 7891），端口匹配优先于序号。
@@ -97,6 +105,7 @@ sbx inbound test [序号|名称|ID]    测试该入口的真实代理
 高级非交互参数：
 sbx inbound add --name NAME --listen 127.0.0.1 --port 7891 --target proxy
 sbx inbound add --name HK --listen 127.0.0.1 --port 7892 --target node:2
+sbx inbound edit 1 --port 7897 --target node:2     默认入口：改宿主机端口与出口
 
 target 支持：direct / proxy / auto / node:<节点序号|名称>
 （节点序号来自 sbx node list，按节点库顺序从 1 开始）

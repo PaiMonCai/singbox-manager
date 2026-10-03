@@ -29,6 +29,10 @@ DEFAULT_SETTINGS = {
         "interval": "3m",
         "tolerance": 50,
     },
+    # 默认入口（容器里的 mixed-in，容器内固定 7890）的出口。
+    # proxy = 跟随【出口与分流】里的全局策略（selector），这也是历史行为；
+    # 想给默认入口写死出口时改成 direct / auto / {"type":"node",...}。
+    "default_inbound_target": {"type": "proxy"},
 }
 
 # 会改写节点库的子命令：整个「读-改-写」周期必须互斥，否则并发操作会互相覆盖。
@@ -87,7 +91,37 @@ def merged_settings(value: Any) -> Dict[str, Any]:
             out["route_mode"] = value["route_mode"]
         if isinstance(value.get("urltest"), dict):
             out["urltest"].update({k: v for k, v in value["urltest"].items() if k in out["urltest"]})
+        target = value.get("default_inbound_target")
+        if isinstance(target, dict) and target.get("type") in ("proxy", "auto", "direct", "node"):
+            out["default_inbound_target"] = json.loads(json.dumps(target))
     return out
+
+
+def default_inbound_target(data: Dict[str, Any]) -> Dict[str, Any]:
+    """默认入口的出口（缺省 {type: proxy} = 跟随全局策略）。"""
+    target = (data.get("settings") or {}).get("default_inbound_target")
+    if isinstance(target, dict) and target.get("type"):
+        return target
+    return {"type": "proxy"}
+
+
+def write_env_value(key: str, value: str) -> None:
+    """就地更新 .env 里的某个键，保留其它行与文件权限（与 bin/sbx 的 setenv 行为一致）。"""
+    lines = ENV_FILE.read_text(encoding="utf-8").splitlines() if ENV_FILE.exists() else []
+    out, found = [], False
+    for line in lines:
+        if line.startswith(f"{key}="):
+            out.append(f"{key}={value}")
+            found = True
+        else:
+            out.append(line)
+    if not found:
+        out.append(f"{key}={value}")
+    tmp = ENV_FILE.with_name(ENV_FILE.name + ".tmp")
+    tmp.write_text("\n".join(out) + "\n", encoding="utf-8")
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, ENV_FILE)
+    os.chmod(ENV_FILE, 0o600)
 
 
 def load_registry() -> Dict[str, Any]:
@@ -215,6 +249,10 @@ def node_tag(node: Dict[str, Any]) -> str:
     return f"node-{node['id']}"
 
 
+# 默认入口在生成配置里的固定 tag（容器内固定监听 7890）
+DEFAULT_INBOUND_TAG = "mixed-in"
+
+
 def inbound_tag(inbound: Dict[str, Any]) -> str:
     return f"inbound-{inbound['id']}"
 
@@ -252,7 +290,7 @@ def inbound_endpoints(data: Optional[Dict[str, Any]] = None) -> List[Dict[str, A
         "listen": read_env_file().get("SING_BOX_BIND_ADDR", "127.0.0.1"),
         "port": default_host_port(),
         "container_port": 7890,
-        "target": {"type": "proxy"},
+        "target": default_inbound_target(data),
         "builtin": True,
     }]
     for inbound in data.get("inbounds", []):
@@ -300,14 +338,13 @@ def resolve_inbound_endpoint(data: Dict[str, Any], ref: Optional[str]) -> Dict[s
     raise ValueError(f"未找到入口: {raw}（可用序号 1-{len(items)}，或用 sbx inbound list 查看）")
 
 
-def require_editable_inbound(inbound: Dict[str, Any]) -> None:
-    """默认入口由 .env 决定，不能改也不能删（它的出口恒为 proxy）。"""
+def require_removable_inbound(inbound: Dict[str, Any]) -> None:
+    """默认入口删不掉：容器里始终存在一个 mixed-in 入口（容器内 7890）。"""
     if inbound.get("builtin"):
         raise ValueError(
-            "默认入口不能编辑或删除：它的监听地址/端口来自 .env "
-            "（SING_BOX_BIND_ADDR / SING_BOX_MIXED_PORT），出口恒为 proxy。"
-            "改 .env 后执行 sbx restart，或重跑安装器（SBX_RECONFIGURE=1）重新配置；"
-            "需要别的端口/出口请用「添加」新建自定义入口。"
+            "默认入口不能删除：sing-box 容器里始终有一个 mixed-in 入口（容器内固定 7890，"
+            "由 compose.yml 发布）。想换端口/监听地址请用「编辑」；"
+            "想停掉对外访问就把 .env 的 SING_BOX_BIND_ADDR 改成 127.0.0.1。"
         )
 
 
@@ -860,8 +897,13 @@ def make_proxy_groups(data: Dict[str, Any], outbounds: List[Dict[str, Any]]) -> 
 
 def route_config(data: Dict[str, Any], proxy_tag: str) -> Dict[str, Any]:
     mode = data["settings"].get("route_mode", "global")
+    # 默认入口的出口默认就是 proxy（跟随全局策略），此时不加规则、靠 final 兜底，
+    # 生成的配置与以前完全一致；只有被显式改成 direct/auto/指定节点时才加一条规则。
+    default_rules: List[Dict[str, Any]] = []
+    if default_inbound_target(data).get("type") != "proxy":
+        default_rules.append({"inbound": [DEFAULT_INBOUND_TAG], "action": "route", "outbound": target_tag(data, default_inbound_target(data))})
     inbound_rules = [{"inbound": [inbound_tag(x)], "action": "route", "outbound": target_tag(data, x.get("target"))} for x in data.get("inbounds", [])]
-    route: Dict[str, Any] = {"rules": inbound_rules + [{"ip_is_private": True, "action": "route", "outbound": "direct"}], "final": proxy_tag, "auto_detect_interface": True}
+    route: Dict[str, Any] = {"rules": default_rules + inbound_rules + [{"ip_is_private": True, "action": "route", "outbound": "direct"}], "final": proxy_tag, "auto_detect_interface": True}
     if mode in ("cn-direct-lite", "cn-direct-full"):
         route["rules"].append({"domain_suffix": [".cn"], "action": "route", "outbound": "direct"})
     if mode == "cn-direct-full":
@@ -882,7 +924,7 @@ def make_config(data: Dict[str, Any], listen_port: int = 7890, only_node: Option
         proxy_tag = make_proxy_groups(data, outbounds)
         outbounds.append({"type": "direct", "tag": "direct"})
         route = route_config(data, proxy_tag)
-    inbounds: List[Dict[str, Any]] = [{"type": "mixed", "tag": "mixed-in", "listen": "0.0.0.0", "listen_port": int(listen_port)}]
+    inbounds: List[Dict[str, Any]] = [{"type": "mixed", "tag": DEFAULT_INBOUND_TAG, "listen": "0.0.0.0", "listen_port": int(listen_port)}]
     if not only_node:
         inbounds.extend({"type": "mixed", "tag": inbound_tag(x), "listen": "0.0.0.0", "listen_port": int(x["port"])} for x in data.get("inbounds", []))
     cfg: Dict[str, Any] = {"$schema": "https://sing-box.sagernet.org/schema.json", "log": {"level": "info", "timestamp": True}, "inbounds": inbounds, "outbounds": outbounds, "route": route}
@@ -967,7 +1009,7 @@ def list_inbounds(data: Optional[Dict[str, Any]] = None, show_id: bool = False) 
     for i, item in enumerate(items, 1):
         id_cell = pad_cell(item.get("id", ""), 10) if show_id else ""
         addr = f"{item.get('listen')}:{item.get('port')}"
-        label = "proxy" if item.get("id") == "default" else target_label(data, item.get("target"))
+        label = target_label(data, item.get("target"))
         name = pad_cell(clip_cell(item.get("name", ""), 20), 22)
         print(f"{pad_cell(i, 6)}{id_cell}{name}{pad_cell(addr, 26)}{label}")
 
@@ -1019,6 +1061,10 @@ def validate(data: Optional[Dict[str, Any]] = None) -> None:
     if data.get("default") is not None and data.get("default") not in ids: raise ValueError("默认节点不存在")
     if data["settings"]["strategy"] not in ("manual", "auto"): raise ValueError("strategy 无效")
     if data["settings"]["route_mode"] not in ("global", "cn-direct-lite", "cn-direct-full"): raise ValueError("route_mode 无效")
+    # 默认入口出口：proxy 是“跟随全局策略”，允许当前没有节点（final 会退化成 direct）；
+    # 被改成 direct/auto/具体节点时按普通 target 校验。
+    if default_inbound_target(data).get("type") != "proxy":
+        target_tag(data, default_inbound_target(data))
     inbound_ids = [x.get("id") for x in data.get("inbounds", [])]
     if len(inbound_ids) != len(set(inbound_ids)): raise ValueError("入口 ID 重复")
     inbound_names = [x.get("name") for x in data.get("inbounds", [])]
@@ -1081,7 +1127,8 @@ def cmd_inbound_endpoints(args: argparse.Namespace) -> int:
         out = []
         for item in items:
             row = dict(item)
-            row["resolved_outbound"] = "proxy" if item.get("id") == "default" else target_tag(data, item.get("target"))
+            # 默认入口的出口现在也可能不是 proxy（可编辑），统一用 target_label 显示
+            row["resolved_outbound"] = target_label(data, item.get("target"))
             out.append(row)
         print(json.dumps(out, ensure_ascii=False))
     else:
@@ -1093,7 +1140,7 @@ def cmd_inbound_endpoint(args: argparse.Namespace) -> int:
     data = load_registry()
     item = resolve_inbound_endpoint(data, args.ref)
     out = dict(item)
-    out["resolved_outbound"] = "proxy" if item.get("id") == "default" else target_tag(data, item.get("target"))
+    out["resolved_outbound"] = target_label(data, out.get("target"))
     print(json.dumps(out, ensure_ascii=False))
     return 0
 
@@ -1108,9 +1155,65 @@ def cmd_inbound_add(args: argparse.Namespace) -> int:
     return 0
 
 
+def edit_default_inbound(data: Dict[str, Any], args: argparse.Namespace) -> int:
+    """编辑内置默认入口：监听地址/端口写入 .env，出口存入注册表；名称固定。"""
+    if not ENV_FILE.exists():
+        raise ValueError(f"找不到 {ENV_FILE}，无法修改默认入口（安装不完整）")
+    if args.name:
+        raise ValueError("默认入口名称固定为「默认入口」，不支持改名")
+    env = read_env_file()
+    cur_listen = env.get("SING_BOX_BIND_ADDR") or "127.0.0.1"
+    cur_port = default_host_port()
+    cur_target = default_inbound_target(data)
+    listen, port, target_ref = args.listen, args.port, args.target
+    if listen is None and port is None and target_ref is None:
+        print("默认入口：容器内固定监听 7890（compose.yml 发布），这里改的是宿主机监听地址/端口与出口。")
+        print(f"当前：{cur_listen}:{cur_port} -> {target_label(data, cur_target)}")
+        listen = prompt("宿主机监听地址", cur_listen, True)
+        port = prompt("宿主机端口", str(cur_port), True)
+        target_ref = prompt("出口（proxy 跟随全局策略 / auto / direct / node:<序号|名称>）", target_label(data, cur_target), True)
+    changed: List[str] = []
+    restart_needed = False
+    env_updates: Dict[str, str] = {}
+    if listen is not None:
+        listen = validate_listen_address(str(listen), interactive=True)
+        if listen != cur_listen:
+            env_updates["SING_BOX_BIND_ADDR"] = listen
+            restart_needed = True
+            changed.append(f"宿主机监听地址 -> {listen}")
+    if port is not None:
+        new_port = int(port)
+        if not 1 <= new_port <= 65535:
+            raise ValueError("端口必须是 1-65535")
+        for item in data.get("inbounds", []):
+            if int(item.get("port", 0)) == new_port:
+                raise ValueError(f"端口与自定义入口冲突: {new_port}（{item.get('name')}）")
+        if new_port != cur_port:
+            env_updates["SING_BOX_MIXED_PORT"] = str(new_port)
+            restart_needed = True
+            changed.append(f"宿主机端口 -> {new_port}")
+    if target_ref is not None:
+        target = target_from_ref(data, str(target_ref))
+        if target != cur_target:
+            data.setdefault("settings", {})["default_inbound_target"] = target
+            changed.append(f"出口 -> {target_label(data, target)}")
+    if not changed:
+        print("没有要修改的内容。")
+        return 0
+    # 先校验+渲染，最后才落 .env 与注册表：校验失败时不会留下“端口改了、出口没改”的半套状态
+    validate(data); render(data); save_registry(data)
+    for key, value in env_updates.items():
+        write_env_value(key, value)
+    print("默认入口已更新：" + "；".join(changed))
+    if restart_needed:
+        print("端口/监听地址改了要重建容器才生效：菜单返回时会自动重启，也可手工执行 sbx restart。")
+    return 0
+
+
 def cmd_inbound_edit(args: argparse.Namespace) -> int:
     data = load_registry(); old = resolve_inbound_endpoint(data, args.ref)
-    require_editable_inbound(old)
+    if old.get("builtin"):
+        return edit_default_inbound(data, args)
     # 解析器返回的是 inbound_endpoints() 的合成副本（带 builtin / container_port 等字段），
     # 不能拿它去 list.index()——要按 id 回注册表里找真正的那一条。
     items = data.get("inbounds", [])
@@ -1127,7 +1230,7 @@ def cmd_inbound_edit(args: argparse.Namespace) -> int:
 
 def cmd_inbound_delete(args: argparse.Namespace) -> int:
     data = load_registry(); inbound = resolve_inbound_endpoint(data, args.ref)
-    require_editable_inbound(inbound)
+    require_removable_inbound(inbound)
     if not args.yes and prompt(f"确认删除入口 {inbound['name']}？输入 DELETE") != "DELETE":
         print("已取消。"); return 1
     data["inbounds"] = [x for x in data.get("inbounds", []) if x.get("id") != inbound["id"]]
@@ -1138,7 +1241,7 @@ def cmd_inbound_show(args: argparse.Namespace) -> int:
     data = load_registry()
     inbound = resolve_inbound_endpoint(data, args.ref)
     out = dict(inbound)
-    out["resolved_outbound"] = "proxy" if inbound.get("id") == "default" else target_tag(data, inbound.get("target"))
+    out["resolved_outbound"] = target_label(data, inbound.get("target"))
     print(json.dumps(out, ensure_ascii=False, indent=2)); return 0
 
 

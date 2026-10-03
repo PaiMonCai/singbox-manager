@@ -845,16 +845,53 @@ jobs:
           fi
           grep -F '入口序号超出范围' /tmp/sbx-inbound-err.txt
 
-          echo '--- 默认入口：详情可用，编辑/删除必须明确拒绝 ---'
+          echo '--- 默认入口：详情可用，可编辑（监听/端口->.env，出口->注册表），不能删除 ---'
           python lib/sbx_nodes.py inbound-show default | grep -F '"id": "default"'
-          if python lib/sbx_nodes.py inbound-edit default --port 7899 > /tmp/sbx-inbound-edit.txt 2>&1; then
-            echo '默认入口不应可编辑' >&2; exit 1
+          cp .env.example "$SBX_HOME/.env"
+          python lib/sbx_nodes.py inbound-edit 1 --listen 127.0.0.1 --port 7897 --target node:11111111 \
+            > /tmp/sbx-inbound-edit.txt
+          cat /tmp/sbx-inbound-edit.txt
+          grep -F '默认入口已更新' /tmp/sbx-inbound-edit.txt
+          grep -F 'SING_BOX_MIXED_PORT=7897' "$SBX_HOME/.env"
+          python lib/sbx_nodes.py inbound-show 1 > /tmp/sbx-default-after.txt
+          grep -F '"port": 7897' /tmp/sbx-default-after.txt
+          # 容器内端口必须还是 7890：改的只是宿主机发布端口
+          grep -F '"container_port": 7890' /tmp/sbx-default-after.txt
+          grep -F '"type": "node"' /tmp/sbx-default-after.txt
+          # 出口写死到节点后，配置里要为 mixed-in 加一条规则
+          python -c '
+          import json, os
+          from pathlib import Path
+          cfg = json.loads((Path(os.environ["SBX_HOME"]) / "config/config.json").read_text())
+          first = cfg["route"]["rules"][0]
+          assert first == {"inbound": ["mixed-in"], "action": "route", "outbound": "node-11111111"}, first
+          '
+          # 端口与自定义入口冲突必须被拒
+          if python lib/sbx_nodes.py inbound-edit 1 --port 7891 > /tmp/sbx-inbound-conflict.txt 2>&1; then
+            echo '默认入口端口与自定义入口冲突时应失败' >&2; exit 1
           fi
-          grep -F '默认入口不能编辑或删除' /tmp/sbx-inbound-edit.txt
+          grep -F '端口与自定义入口冲突' /tmp/sbx-inbound-conflict.txt
+          # 改名必须被拒
+          if python lib/sbx_nodes.py inbound-edit 1 --name renamed-default > /tmp/sbx-inbound-rename.txt 2>&1; then
+            echo '默认入口不应可改名' >&2; exit 1
+          fi
+          grep -F '不支持改名' /tmp/sbx-inbound-rename.txt
+          # 改回 proxy + 原端口：mixed-in 规则必须消失，配置恢复原样
+          python lib/sbx_nodes.py inbound-edit 1 --target proxy > /dev/null
+          python lib/sbx_nodes.py inbound-edit 1 --port 7890 --listen 127.0.0.1 > /dev/null
+          grep -F 'SING_BOX_MIXED_PORT=7890' "$SBX_HOME/.env"
+          python -c '
+          import json, os
+          from pathlib import Path
+          cfg = json.loads((Path(os.environ["SBX_HOME"]) / "config/config.json").read_text())
+          assert all("mixed-in" not in (r.get("inbound") or []) for r in cfg["route"]["rules"]), cfg["route"]["rules"]
+          '
+          rm -f "$SBX_HOME/.env"   # 夹具原本没有 .env，恢复原状
+          # 删除默认入口必须被拒
           if python lib/sbx_nodes.py inbound-delete 1 --yes > /tmp/sbx-inbound-del.txt 2>&1; then
             echo '默认入口不应可删除' >&2; exit 1
           fi
-          grep -F '默认入口不能编辑或删除' /tmp/sbx-inbound-del.txt
+          grep -F '默认入口不能删除' /tmp/sbx-inbound-del.txt
 
           echo '--- 全数字 ID 仍按 ID 解析（完整 ID 优先于序号）---'
           python lib/sbx_nodes.py inbound-add --name ci-digit-id --listen 127.0.0.1 --port 7893 --target proxy > /dev/null
