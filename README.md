@@ -2,7 +2,7 @@
 
 面向 Linux 服务器的 sing-box Docker 管理层。sing-box 保持官方镜像运行，宿主机通过 `sbx` 完成安装、节点管理、配置生成、校验、测试、备份恢复与升级。
 
-当前版本：**0.11.9**
+当前版本：**0.11.10**
 
 ## 一键交互式安装
 
@@ -268,6 +268,26 @@ sbx route cn-direct-full
 
 
 
+
+## 0.11.10：修掉 Docker 托管里“宿主端口当成容器内端口”的错误
+
+默认入口在 sing-box 容器内**固定监听 7890**，宿主机侧发布端口是 `.env` 里的 `SING_BOX_MIXED_PORT`（两者可以不一样）；自定义入口才是 `host:port == container:port` 一一对应。
+
+代码里大多数地方都清楚这一点（`docker-network urls`、`docker-network env`、`snippet`、`verify` 的真实探测都特意用 `container_port`），但有三处漏了，会把宿主机端口当成“容器里该连的端口”告诉用户：
+
+| 位置 | 之前 | 现在 |
+| --- | --- | --- |
+| `sbx docker-network manage` / 扫描并托管 完成后的回显 | `当前代理：http://sing-box:<宿主端口>` | `容器内代理：http://sing-box:<容器内端口>`；两者不同时补一行说明宿主机侧端口是多少 |
+| 扫描并托管时的入口选择列表 | 显示入口的宿主端口 | 显示容器内端口（并说明这就是容器里要用的端口） |
+| `sbx docker-network managed` 的 `PORT` 列 | 只有一列 `PORT`，实际是宿主端口 | 拆成 `HOST_PORT` 与 `CONTAINER_PORT` 两列，列宽按显示宽度对齐（中文不再顶歪后面的列） |
+
+复现（0.11.10 之前）：把 `.env` 的 `SING_BOX_MIXED_PORT` 改成 `7895`，托管一个容器后提示 `http://sing-box:7895` —— 容器里连不上，正确值是 `7890`。
+
+顺带把 `sbx docker-network verify` 的“托管关系”那行改清楚：端口一致时保持 `-> :7890` 不变，不一致时写成 `-> 宿主 :7895 / 容器内 :7890`；未纳入托管时的提示也改成按“容器内端口”检测。
+
+遗留的 `port` 语义没有动：`docker-managed.json` 里旧版存的裸端口仍然是**宿主机端口**（迁移时按宿主端口匹配入口 ID），`verify docker <容器> <数字端口>` 的数字引用也仍按宿主端口匹配。
+
+CI 增加了回归断言：把 `SING_BOX_MIXED_PORT` 改成 7895 后，`docker_network_inbound_ports` 必须返回 `7895 7890`、托管提示必须出现 `http://sing-box:7890` 且不得出现 `7895`、入口选择列表与 `managed` 列表都必须给出容器内端口。
 
 ## 0.11.9：菜单收敛（23 项 → 11 项，每项带说明）
 

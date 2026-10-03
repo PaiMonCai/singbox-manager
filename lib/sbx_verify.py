@@ -270,9 +270,11 @@ def verify_container(ref: str, inbound_ref: Optional[str] = None, quick: bool = 
     # 环境变量比对与真实探测都必须用它，否则端口≠7890 时会对正常配置误报失败。
     cport = int(ep.get("container_port", port))
     if managed_id:
-        result.ok(f"托管关系: {name} -> [{iid}] {iname} -> :{port}")
+        # 端口在两者不同时要说清楚是哪个，否则会被当成容器里要用的端口
+        ports = f"-> :{port}" if cport == port else f"-> 宿主 :{port} / 容器内 :{cport}"
+        result.ok(f"托管关系: {name} -> [{iid}] {iname} {ports}")
     else:
-        result.warn(f"该容器未纳入托管；本次按 [{iid}] {iname} :{port} 检测")
+        result.warn(f"该容器未纳入托管；本次按 [{iid}] {iname} 容器内 :{cport} 检测")
 
     envs = proxy_env(obj)
     expected = f"sing-box:{cport}"

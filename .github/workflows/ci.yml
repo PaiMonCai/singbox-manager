@@ -1124,6 +1124,41 @@ jobs:
           docker_network_env "$CUSTOM_INBOUND_ID" | grep -F "HTTP_PROXY='http://sing-box:7891'"
           docker_network_snippet "$CUSTOM_INBOUND_ID" | grep -F 'HTTP_PROXY: http://sing-box:7891'
 
+          # 回归：默认入口在容器内固定 7890，宿主机发布端口可能被改过。
+          # 凡是指向“容器里该连哪个端口”的地方都必须用 container_port
+          # （0.11.10 之前 manage / 扫描并托管 / 入口选择列表打的是宿主端口）。
+          setenv SING_BOX_MIXED_PORT 7895
+          read -r HOST_ONLY CPORT_ONLY <<<"$(docker_network_inbound_ports default)"
+          test "$HOST_ONLY" = "7895"
+          test "$CPORT_ONLY" = "7890"
+          test "$(docker_network_inbound_port default)" = "7890"
+          docker_network_proxy_hint default > /tmp/sbx-proxy-hint.txt
+          cat /tmp/sbx-proxy-hint.txt
+          grep -F '容器内代理：http://sing-box:7890' /tmp/sbx-proxy-hint.txt
+          grep -F '宿主机侧端口是 7895' /tmp/sbx-proxy-hint.txt
+          if grep -F 'http://sing-box:7895' /tmp/sbx-proxy-hint.txt; then
+            echo '托管提示把宿主机端口当成了容器内端口' >&2; exit 1
+          fi
+          docker_network_env default | grep -F "HTTP_PROXY='http://sing-box:7890'"
+          printf '1\n' | docker_network_choose_inbound 2>/tmp/sbx-inbound-ui-3.txt >/dev/null
+          grep -F '1. [default]' /tmp/sbx-inbound-ui-3.txt
+          if grep -E '\[default\].* 7895 ' /tmp/sbx-inbound-ui-3.txt; then
+            echo '入口选择列表显示的是宿主机端口' >&2; exit 1
+          fi
+          grep -E '\[default\].* 7890 ->' /tmp/sbx-inbound-ui-3.txt
+
+          # managed 列表：宿主端口与容器内端口分成两列，别让人猜
+          cat > "$SBX_DOCKER_MANAGED_FILE" <<'EOF'
+          {"version":1,"targets":[{"type":"name","name":"ci-fake-app","inbound_id":"default"}]}
+          EOF
+          docker_network_managed_list > /tmp/sbx-managed-list.txt
+          cat /tmp/sbx-managed-list.txt
+          grep -F 'HOST_PORT' /tmp/sbx-managed-list.txt
+          grep -F 'CONTAINER_PORT' /tmp/sbx-managed-list.txt
+          grep -E 'ci-fake-app.* 7895 +7890' /tmp/sbx-managed-list.txt
+          rm -f "$SBX_DOCKER_MANAGED_FILE"
+          setenv SING_BOX_MIXED_PORT 7890
+
           python lib/sbx_nodes.py inbound-edit "$CUSTOM_INBOUND_ID" \
             --name HK-entry --listen 127.0.0.1 --port 7991 --target node:11111111
           docker_network_env "$CUSTOM_INBOUND_ID" | grep -F "HTTP_PROXY='http://sing-box:7991'"
