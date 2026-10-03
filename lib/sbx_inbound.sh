@@ -107,14 +107,16 @@ inbound_menu(){
   local x ref
   while true; do
     clear
-    menu_title '入口路由管理'
-    menu_note '每个代理入口都有稳定 ID；Docker 托管建议按 ID 绑定。'
+    menu_title '入口路由'
+    menu_note 'Docker 托管建议按入口 ID 绑定。'
     printf '\n'
     python3 "$HELPER" inbound-list || true
     menu_block '入口操作' <<'EOF'
-   1  添加                 2  编辑
-   3  删除                 4  详情
-   5  测试
+   1  添加        新增一个代理入口
+   2  编辑        修改端口 / 出口绑定
+   3  删除        删除某个入口
+   4  详情        查看入口配置
+   5  测试        测试入口能否连通
 EOF
     menu_footer '0  返回'
     menu_end

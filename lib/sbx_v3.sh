@@ -134,7 +134,7 @@ subscription(){
     update|refresh) sub_update "${1:-}" ;;
     delete|del|rm) sub_delete "${1:-}" ;;
     show) python3 "$HELPER" sub-get "${1:-}" ;;
-    menu) subscription_menu ;;
+    menu) subs_import_menu ;;
     *) die "未知 subscription 命令: $op" ;;
   esac
 }
@@ -200,15 +200,26 @@ node(){
   esac
 }
 
-subscription_menu(){
+# 订阅与一次性导入合成一个菜单：旧版「导入」的第二项又是「订阅」，同一件事两个入口。
+# 条目版式约定（所有菜单一致，便于扫读）：
+#   <3 空格><编号 1-2 位><2 空格><名称补齐到 10 显示列><2 空格><说明 ≤ 24 显示列>
+# 名称不含空格，说明也刻意压短，因此紧凑版式（宽度 42）与宽松版式（≥60 列）都不会折行。
+subs_import_menu(){
   local x r
   while true; do
     clear
-    menu_title '订阅管理'
-    menu_block '订阅操作' <<'EOF'
-   1  查看                 2  添加
-   3  更新                 4  删除
-   5  详情
+    menu_title '订阅与导入'
+    menu_note '订阅自动同步节点；导入是一次性的。'
+    menu_block '订阅' <<'EOF'
+   1  订阅列表    查看已添加的订阅
+   2  添加订阅    从 URL 添加并同步节点
+   3  更新订阅    立即重新拉取节点
+   4  删除订阅    只删订阅，不动已有节点
+   5  订阅详情    查看某个订阅的内容
+EOF
+    menu_block '一次性导入' <<'EOF'
+   6  分享链接    粘贴 vmess / vless 链接
+   7  本地文件    从 URI / 订阅文件导入
 EOF
     menu_footer '0  返回'
     menu_end
@@ -217,8 +228,10 @@ EOF
       1) subscription list ;;
       2) sub_add || true ;;
       3) sub_update || true ;;
-      4) read -r -p 'ID/名称: ' r; sub_delete "$r" || true ;;
-      5) read -r -p 'ID/名称: ' r; python3 "$HELPER" sub-get "$r" || true ;;
+      4) read -r -p '订阅 ID/名称: ' r; sub_delete "$r" || true ;;
+      5) read -r -p '订阅 ID/名称: ' r; python3 "$HELPER" sub-get "$r" || true ;;
+      6) import_uri || true ;;
+      7) read -r -p '文件路径: ' r; import_file "$r" || true ;;
       0) return ;;
       *) warn "无效选项" ;;
     esac
@@ -226,40 +239,22 @@ EOF
   done
 }
 
-import_menu(){
-  local x f
-  while true; do
-    clear
-    menu_title '导入'
-    menu_block '导入方式' <<'EOF'
-   1  分享链接
-   2  订阅
-   3  本地订阅 / URI 文件
-EOF
-    menu_footer '0  返回'
-    menu_end
-    read -r -p '请选择: ' x || return
-    case "$x" in
-      1) import_uri || true ;;
-      2) sub_add || true ;;
-      3) read -r -p '文件路径: ' f; import_file "$f" || true ;;
-      0) return ;;
-      *) warn "无效选项" ;;
-    esac
-    [[ "$x" != 0 ]] && pause
-  done
-}
-
-strategy_menu(){
+# 出口策略与路由模式合成一个菜单：二者都是「流量从哪出去」，分开放容易记混。
+outlet_menu(){
   local x
   while true; do
     clear
-    menu_title '出口策略'
-    menu_note "当前: $(python3 "$HELPER" strategy)"
-    menu_block '切换策略' <<'EOF'
-   1  manual            手动指定默认节点
-   2  auto              URLTest 自动测速
-   3  查看 URLTest 参数
+    menu_title '出口与分流'
+    menu_note "出口策略: $(python3 "$HELPER" strategy 2>/dev/null || printf '?')    路由模式: $(python3 "$HELPER" route-mode 2>/dev/null || printf '?')"
+    menu_block '出口策略' <<'EOF'
+   1  手动出口    manual：手动指定默认节点
+   2  自动测速    auto：URLTest 自动选最快
+   3  测速参数    修改测速 URL / 间隔
+EOF
+    menu_block '路由模式' <<'EOF'
+   4  全局模式    global：私网直连其余代理
+   5  轻量直连    cn-direct-lite + .cn
+   6  完整直连    cn-direct-full 规则集
 EOF
     menu_footer '0  返回'
     menu_end
@@ -268,31 +263,9 @@ EOF
       1) strategy manual || true ;;
       2) strategy auto || true ;;
       3) python3 "$HELPER" urltest; warn "修改可用: sbx urltest --url URL --interval 3m --tolerance 50" ;;
-      0) return ;;
-      *) warn "无效选项" ;;
-    esac
-    [[ "$x" != 0 ]] && pause
-  done
-}
-
-route_menu(){
-  local x
-  while true; do
-    clear
-    menu_title '路由模式'
-    menu_note "当前: $(python3 "$HELPER" route-mode)"
-    menu_block '切换模式' <<'EOF'
-   1  manual           私网直连，其余代理
-   2  cn-direct-lite   私网 + .cn 直连
-   3  cn-direct-full   私网 + .cn + CN rule-set 直连
-EOF
-    menu_footer '0  返回'
-    menu_end
-    read -r -p '请选择: ' x || return
-    case "$x" in
-      1) route_mode global || true ;;
-      2) route_mode cn-direct-lite || true ;;
-      3) route_mode cn-direct-full || true ;;
+      4) route_mode global || true ;;
+      5) route_mode cn-direct-lite || true ;;
+      6) route_mode cn-direct-full || true ;;
       0) return ;;
       *) warn "无效选项" ;;
     esac
@@ -307,7 +280,8 @@ import_cmd(){
     uri) import_uri "${1:-}" ;;
     file) import_file "${1:-}" ;;
     subscription|sub) sub_add "${1:-}" "${2:-}" ;;
-    menu) import_menu ;;
+    # 与 `sbx subscription` 共用同一张菜单，避免两个入口指向同一件事
+    menu) subs_import_menu ;;
     *) die "未知 import 命令: $op" ;;
   esac
 }

@@ -491,40 +491,89 @@ jobs:
           # 颜色由 theme 步骤单独校验，这里先剥掉 ANSI 转义再看版式
           ESC=$(printf '\033')
           strip_ansi() { sed "s/${ESC}\[[0-9;]*m//g"; }
-          run_menu() {
-            printf '0\n' | sudo env -u NO_COLOR COLUMNS=76 PATH="$THEME_BIN:$PATH" TERM=xterm "$@" \
+          run_menu() { # run_menu <输入> <COLUMNS> [额外 env...]
+            local input="$1" cols="$2"
+            shift 2
+            printf '%b' "$input" | sudo env -u NO_COLOR COLUMNS="$cols" PATH="$THEME_BIN:$PATH" TERM=xterm "$@" \
               SBX_HOME=/tmp/sbx-manager-only bash bin/sbx 2>&1 | strip_ansi || true
           }
 
-          wide="$(run_menu)"
+          wide="$(run_menu '0\n' 76)"
           printf '%s\n' "$wide" | sed -n '1,14p'
           # 标题带真实版本号，且上下有分隔线
           printf '%s' "$wide" | grep -qF "singbox-manager $(cat VERSION)"
           printf '%s' "$wide" | grep -qF '━'
           # 区块标题缩进 2 格、条目再缩进（行距与缩进）
-          printf '%s' "$wide" | grep -qE '^  【服务控制】'
-          printf '%s' "$wide" | grep -qE '^  【维护与诊断】'
-          printf '%s' "$wide" | grep -qE '^     1  状态'
+          printf '%s' "$wide" | grep -qE '^  【日常】'
+          printf '%s' "$wide" | grep -qE '^  【维护】'
+          printf '%s' "$wide" | grep -qE '^     1  节点'
           # 区块标题后有空行（comfortable 版式）
-          printf '%s\n' "$wide" | grep -A1 -F '【服务控制】' | sed -n 2p | grep -q '^$'
+          printf '%s\n' "$wide" | grep -A1 -F '【日常】' | sed -n 2p | grep -q '^$'
           # 分隔线宽度跟随终端（COLUMNS=76 → 上限 72），━ 是 3 字节字符
           rule="$(printf '%s\n' "$wide" | grep -F '━' | head -1)"
           chars="$(LC_ALL=C.UTF-8 bash -c 'printf %s "$1" | wc -m' _ "$rule")"
           test "$chars" -eq 72
 
+          # 主菜单：11 项、编号连续 1..11、每项都带说明且说明列对齐（列宽按显示宽度算，CJK 记 2）
+          printf '%s\n' "$wide" > /tmp/sbx-menu-wide.txt
+          python3 - <<'PY'
+          import re
+          import unicodedata
+
+          def w(s):
+              return sum(2 if unicodedata.east_asian_width(c) in 'WF' else 1 for c in s)
+
+          lines = [l.rstrip() for l in open('/tmp/sbx-menu-wide.txt', encoding='utf-8')]
+          items = [l for l in lines if re.match(r'^ {4,5}\d{1,2}  \S', l)]
+          body = [int(re.match(r'^ *(\d{1,2})', l).group(1))
+                  for l in items if not re.match(r'^ *0  ', l)]
+          assert len(body) == 11, '主菜单条目数应为 11，实际 %d' % len(body)
+          assert body == list(range(1, 12)), '主菜单编号不连续: %s' % body
+          cols = set()
+          for l in items:
+              if re.match(r'^ *0  ', l):
+                  continue
+              m = re.match(r'^( *\d{1,2}  \S+)( +)(\S.*)$', l)
+              assert m, '条目缺少说明: %r' % l
+              cols.add(w(m.group(1)) + len(m.group(2)))
+          assert len(cols) == 1, '主菜单说明列不对齐: %s' % sorted(cols)
+          print('主菜单 %d 项，说明列 %d' % (len(body), cols.pop()))
+          PY
+          # 关键条目逐字断言（含两处改名消歧）
+          printf '%s\n' "$wide" | grep -qE '^     6  宿主机代理  让 Docker/Git/APT 走代理$'
+          printf '%s\n' "$wide" | grep -qE '^     7  容器接入    其它容器共享出口$'
+          printf '%s\n' "$wide" | grep -qE '^    11  高级        手工编辑 / 安装信息$'
+          # 旧分组名必须彻底消失（23 项两列菜单的痕迹）
+          if printf '%s' "$wide" | grep -qE '【服务控制】|【节点与入口】|【出口与分流】|【维护与诊断】'; then
+            echo '主菜单仍残留旧分组名' >&2
+            exit 1
+          fi
+
+          # 11 个一级入口都能进到自己的子菜单（改主菜单最容易漏的就是接线）
+          for pair in '1:【查看】' '2:【订阅】' '3:【出口策略】' '4:【容器】' '5:【入口操作】' \
+                      '6:【单项开关】' '7:【托管与同步】' '8:【检查】' '9:【sing-box】' \
+                      '10:【操作】' '11:【工具】'; do
+            key="${pair%%:*}"
+            marker="${pair#*:}"
+            sub="$(run_menu "${key}\\n0\\n0\\n" 76)"
+            if ! printf '%s' "$sub" | grep -qF "$marker"; then
+              echo "入口 $key 没有进入对应子菜单（缺 $marker）" >&2
+              printf '%s\n' "$sub" >&2
+              exit 1
+            fi
+          done
+
           # compact：不缩进、不留空行
-          tight="$(run_menu SBX_MENU_DENSITY=compact)"
-          printf '%s' "$tight" | grep -qE '^   1  状态'
-          printf '%s' "$tight" | grep -qE '^【服务控制】'
-          if printf '%s\n' "$tight" | grep -A1 -F '【服务控制】' | sed -n 2p | grep -q '^$'; then
+          tight="$(run_menu '0\n' 76 SBX_MENU_DENSITY=compact)"
+          printf '%s' "$tight" | grep -qE '^   1  节点'
+          printf '%s' "$tight" | grep -qE '^【日常】'
+          if printf '%s\n' "$tight" | grep -A1 -F '【日常】' | sed -n 2p | grep -q '^$'; then
             echo 'compact 版式不应有空行' >&2; exit 1
           fi
 
           # 窄终端自动降级为 compact
-          narrow="$(printf '0\n' | sudo env -u NO_COLOR COLUMNS=52 PATH="$THEME_BIN:$PATH" TERM=xterm \
-            SBX_HOME=/tmp/sbx-manager-only bash bin/sbx 2>&1 | strip_ansi || true)"
-          printf '%s' "$narrow" | grep -qE '^【服务控制】'
-
+          narrow="$(run_menu '0\n' 52)"
+          printf '%s' "$narrow" | grep -qE '^【日常】'
       - name: Re-run installer reuses the existing config
         run: |
           rm -rf /tmp/sbx-reinstall /tmp/sbx-reinstall-bin

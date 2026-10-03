@@ -208,29 +208,36 @@ test_current(){ running || die "sing-box 未运行。"; local port; port=$(envva
 edit(){ local e="${SBX_EDITOR:-${EDITOR:-vi}}"; command -v "$e" >/dev/null || die "找不到编辑器 $e"; backup; warn "config.json 由节点库生成，后续节点操作会覆盖手工改动。"; "$e" "$CONFIG"; check; }
 
 pause(){ read -r -p '按 Enter 返回...' _ || true; }
+# 条目版式约定见 lib/sbx_v3.sh 顶部注释：编号 + 名称(补到 10 显示列) + 说明(≤24 显示列)。
+# 「重建配置」不在这里：增删改已经会自动重建并重启，手动重建属于修复动作，放在【服务】里。
 node_menu(){
   local x r p='序号(留空可列表选择): '
   while true; do
     clear
     menu_title '节点管理'
-    menu_block '节点操作' <<'EOF'
-   1  查看                 2  添加
-   3  编辑                 4  删除
-   5  默认                 6  详情
-   7  测试                 8  重建配置
+    menu_note '序号即操作时填的值，改动会自动生效。'
+    menu_block '查看' <<'EOF'
+   1  列表        查看全部节点
+   2  详情        查看节点完整配置
+   3  测试        测试节点能否连通
+EOF
+    menu_block '操作' <<'EOF'
+   4  添加        粘贴分享链接或手动填写
+   5  编辑        修改已有节点
+   6  删除        删除某个节点
+   7  默认        设为默认出口
 EOF
     menu_footer '0  返回'
     menu_end
     read -r -p '请选择: ' x || return
     case "$x" in
       1) node list ;;
-      2) node_tx add ;;
-      3) read -r -p "$p" r; node_tx edit "$r" || true ;;
-      4) read -r -p "$p" r; node_tx delete "$r" || true ;;
-      5) read -r -p "$p" r; node_tx default "$r" || true ;;
-      6) read -r -p "$p" r; python3 "$HELPER" show ${r:+"$r"} || true ;;
-      7) read -r -p "$p" r; test_node "$r" || true ;;
-      8) node render ;;
+      2) read -r -p "$p" r; python3 "$HELPER" show ${r:+"$r"} || true ;;
+      3) read -r -p "$p" r; test_node "$r" || true ;;
+      4) node_tx add ;;
+      5) read -r -p "$p" r; node_tx edit "$r" || true ;;
+      6) read -r -p "$p" r; node_tx delete "$r" || true ;;
+      7) read -r -p "$p" r; node_tx default "$r" || true ;;
       0) return ;;
       *) warn "无效选项" ;;
     esac

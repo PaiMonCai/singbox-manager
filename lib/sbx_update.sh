@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # singbox-manager v0.7 self-update integration.
 
-VERSION="0.11.8"
+VERSION="0.11.9"
 
 UPDATE_REPO="${SBX_UPDATE_REPO:-PaiMonCai/singbox-manager}"
 UPDATE_BRANCH="${SBX_UPDATE_BRANCH:-main}"
@@ -494,20 +494,18 @@ manager_auto_status(){
 }
 
 manager_menu(){
-  local x
+  local x action
   while true; do
     clear
     menu_title '管理器更新'
     menu_note "当前版本: $(manager_local_version)"
     menu_block '手动更新' <<'EOF'
-   1  检查更新
-   2  立即更新
-   3  强制重装管理器
+   1  检查更新    查询远端是否有新版本
+   2  立即更新    更新管理器自身
+   3  强制重装    重装/降级到远端版本
 EOF
     menu_block '自动更新' <<'EOF'
-   4  开启自动更新
-   5  关闭自动更新
-   6  自动更新状态
+   4  自动更新    开启 / 关闭 / 状态
 EOF
     menu_footer '0  返回'
     menu_end
@@ -516,9 +514,15 @@ EOF
       1) manager_check || true ;;
       2) manager_update || true ;;
       3) manager_update --force || true ;;
-      4) manager_auto_on || true ;;
-      5) manager_auto_off || true ;;
-      6) manager_auto_status ;;
+      4)
+        read -r -p '自动更新: 1 开启 / 2 关闭 / 3 状态: ' action
+        case "$action" in
+          1) manager_auto_on || true ;;
+          2) manager_auto_off || true ;;
+          3) manager_auto_status || true ;;
+          *) warn "无效选项" ;;
+        esac
+        ;;
       0) return ;;
       *) warn "无效选项" ;;
     esac
@@ -571,59 +575,221 @@ version(){
   printf 'singbox-manager: %s\npinned sing-box: %s\nimage: %s\nstrategy: %s\nroute: %s\ncustom inbounds: %s\nproxy: %s\n'     "$(manager_local_version)" "$(image_version)" "$(image_ref)"     "$(python3 "$HELPER" strategy)" "$(python3 "$HELPER" route-mode)"     "$(python3 "$HELPER" inbound-endpoints --json 2>/dev/null | python3 -c 'import json,sys; print(max(0,len(json.load(sys.stdin))-1))' 2>/dev/null || printf '0')"     "$(proxy_url)"
 }
 
+# ── 交互子菜单 ──────────────────────────────────────────────────────────────
+# 条目版式约定见 lib/sbx_v3.sh 顶部注释：编号 + 名称(补到 10 显示列) + 说明(≤24 显示列)。
+# 菜单里的动作一律带 `|| true`：单个操作失败不应该把整个菜单一起带崩。
+
+backup_list(){ # 按时间倒序列出已有备份（最新的排最前）
+  local f p
+  # shellcheck disable=SC2012  # 备份名固定是 sbx-<时间戳>.tar.gz，ls 足够，也不会遇到特殊文件名
+  f=$(ls -1t "$BACKUPS"/sbx-*.tar.gz 2>/dev/null || true)
+  if [[ -z "$f" ]]; then info "还没有备份。"; return 0; fi
+  info "备份目录: $BACKUPS"
+  while IFS= read -r p; do
+    printf '  %s  %s\n' "$(basename "$p")" "$(du -h "$p" 2>/dev/null | cut -f1)"
+  done <<< "$f"
+}
+
+install_info(){
+  printf '\n安装目录: %s\n版本:     %s\n' "$HOME_DIR" "$(manager_local_version)"
+  printf '配置文件: %s\n节点库:   %s\n环境变量: %s\n备份目录: %s\n' "$CONFIG" "$NODES" "$ENV" "$BACKUPS"
+  printf '镜像:     %s\n' "$(image_ref)"
+  printf '看日志:   docker compose --project-directory %s logs -f sing-box\n\n' "$HOME_DIR"
+}
+
+service_menu(){
+  local x
+  while true; do
+    clear
+    menu_title '服务'
+    if running 2>/dev/null; then menu_note '当前状态: 运行中'; else menu_note '当前状态: 已停止'; fi
+    menu_block '容器' <<'EOF'
+   1  状态        容器与服务当前状态
+   2  日志        跟踪最近 100 行
+   3  启动        启动 sing-box 容器
+   4  停止        停止 sing-box 容器
+   5  重启        重启容器（不重建配置）
+EOF
+    menu_block '配置' <<'EOF'
+   6  重建配置    按节点库重新生成并重启
+EOF
+    menu_footer '0  返回'
+    menu_end
+    read -r -p '请选择: ' x || return
+    case "$x" in
+      1) status || true ;;
+      2) logs || true ;;
+      3) start || true ;;
+      4) stop || true ;;
+      5) restart || true ;;
+      6) node render || true ;;
+      0) return ;;
+      *) warn "无效选项" ;;
+    esac
+    [[ "$x" != 0 ]] && pause
+  done
+}
+
+diagnose_menu(){
+  local x
+  while true; do
+    clear
+    menu_title '检查与诊断'
+    menu_block '检查' <<'EOF'
+   1  配置检查    sing-box check 校验配置
+   2  代理测试    经当前出口请求一次外网
+   3  系统诊断    容器/入口/Docker 体检
+EOF
+    menu_block '信息' <<'EOF'
+   4  版本        管理器 / sing-box / 镜像
+EOF
+    menu_footer '0  返回'
+    menu_end
+    read -r -p '请选择: ' x || return
+    case "$x" in
+      1) check || true ;;
+      2) test_current || true ;;
+      3) python3 "$HOME_DIR/lib/sbx_verify.py" doctor || true ;;
+      4) version || true ;;
+      0) return ;;
+      *) warn "无效选项" ;;
+    esac
+    [[ "$x" != 0 ]] && pause
+  done
+}
+
+upgrade_menu(){
+  local x v
+  while true; do
+    clear
+    menu_title '升级'
+    menu_note "管理器 $(manager_local_version)    sing-box $(image_version)"
+    menu_block 'sing-box' <<'EOF'
+   1  升级        指定目标版本并重建
+   2  拉镜像      重新 pull .env 里的镜像
+EOF
+    menu_block '管理器' <<'EOF'
+   3  检查更新    查询远端是否有新版本
+   4  立即更新    更新管理器自身
+   5  强制重装    重装/降级到远端版本
+   6  自动更新    开启 / 关闭 / 状态
+EOF
+    menu_footer '0  返回'
+    menu_end
+    read -r -p '请选择: ' x || return
+    case "$x" in
+      1) read -r -p 'sing-box 目标版本: ' v; [[ -n "$v" ]] && { upgrade "$v" || true; } ;;
+      2) pull || true ;;
+      3) manager_check || true ;;
+      4) manager_update || true ;;
+      5) manager_update --force || true ;;
+      6)
+        read -r -p '自动更新: 1 开启 / 2 关闭 / 3 状态: ' v
+        case "$v" in
+          1) manager_auto_on || true ;;
+          2) manager_auto_off || true ;;
+          3) manager_auto_status || true ;;
+          *) warn "无效选项" ;;
+        esac
+        ;;
+      0) return ;;
+      *) warn "无效选项" ;;
+    esac
+    [[ "$x" != 0 ]] && pause
+  done
+}
+
+backup_menu(){
+  local x f
+  while true; do
+    clear
+    menu_title '备份与恢复'
+    menu_note "备份目录: $BACKUPS"
+    menu_block '操作' <<'EOF'
+   1  创建备份    打包配置 / 节点 / .env
+   2  从备份恢复  留空 = 最近一个备份
+   3  备份列表    列出已有备份与大小
+EOF
+    menu_footer '0  返回'
+    menu_end
+    read -r -p '请选择: ' x || return
+    case "$x" in
+      1) backup || true ;;
+      2) read -r -p '备份文件名（留空 = 最近一个）: ' f; restore "$f" || true ;;
+      3) backup_list || true ;;
+      0) return ;;
+      *) warn "无效选项" ;;
+    esac
+    [[ "$x" != 0 ]] && pause
+  done
+}
+
+advanced_menu(){
+  local x
+  while true; do
+    clear
+    menu_title '高级'
+    menu_block '工具' <<'EOF'
+   1  手工编辑    直接改 config.json
+   2  安装信息    目录 / 版本 / 数据文件
+   3  命令速查    全部非交互子命令
+EOF
+    menu_footer '0  返回'
+    menu_end
+    read -r -p '请选择: ' x || return
+    case "$x" in
+      1) edit || true ;;
+      2) install_info || true ;;
+      3) help || true ;;
+      0) return ;;
+      *) warn "无效选项" ;;
+    esac
+    [[ "$x" != 0 ]] && pause
+  done
+}
+
+# 主菜单：23 项收敛到 11 项。分组按「你要做什么」而不是内部模块，每项都带一行说明，
+# 不必先点进去才知道它是干什么的。两处改名消歧：
+#   宿主机代理 = 宿主机的 Docker/Git/APT/npm/curl 走代理
+#   容器接入   = 其它容器共享 sing-box 出口
 menu(){
-  local x v f
+  local x
   while true; do
     clear
     menu_title "singbox-manager $(manager_local_version)"
-    menu_block '服务控制' <<'EOF'
-   1  状态                 2  启动
-   3  停止                 4  重启
-   5  日志
+    if running 2>/dev/null; then menu_note 'sing-box: 运行中'; else menu_note 'sing-box: 已停止'; fi
+    menu_block '日常' <<'EOF'
+   1  节点        列表 / 增删改 / 测试
+   2  订阅与导入  订阅 / 分享链接导入
+   3  出口与分流  出口策略 / 路由模式
+   4  服务        状态 / 日志 / 启停
 EOF
-    menu_block '节点与入口' <<'EOF'
-   6  节点管理             7  订阅管理
-   8  导入                12  入口管理
+    menu_block '接入' <<'EOF'
+   5  入口路由    多个入口绑定出口
+   6  宿主机代理  让 Docker/Git/APT 走代理
+   7  容器接入    其它容器共享出口
 EOF
-    menu_block '出口与分流' <<'EOF'
-   9  出口策略            10  路由模式
-  11  应用代理
-EOF
-    menu_block '维护与诊断' <<'EOF'
-  13  检查                14  测试代理
-  15  备份                16  恢复
-  17  版本                18  sing-box 升级
-  19  拉取当前镜像
-  20  管理器更新          21  Docker 容器网络
-  22  系统诊断            23  高级编辑
+    menu_block '维护' <<'EOF'
+   8  检查与诊断  配置检查 / 代理测试
+   9  升级        sing-box / 镜像 / 管理器
+  10  备份与恢复  备份 / 恢复 / 列表
+  11  高级        手工编辑 / 安装信息
 EOF
     menu_footer '0  退出'
     menu_end
     read -r -p '请选择: ' x || exit
     case "$x" in
-      1) status ;;
-      2) start ;;
-      3) stop ;;
-      4) restart ;;
-      5) logs || true ;;
-      6) node_menu; continue ;;
-      7) subscription_menu; continue ;;
-      8) import_menu; continue ;;
-      9) strategy_menu; continue ;;
-      10) route_menu; continue ;;
-      11) proxy_menu; continue ;;
-      12) inbound_menu; continue ;;
-      13) check || true ;;
-      14) test_current || true ;;
-      15) backup ;;
-      16) read -r -p '备份文件(留空最新): ' f; restore "$f" || true ;;
-      17) version ;;
-      18) read -r -p 'sing-box 目标版本: ' v; [[ -n "$v" ]] && upgrade "$v" || true ;;
-      19) pull ;;
-      20) manager_menu; continue ;;
-      21) docker_network_menu; continue ;;
-      22) python3 "$HOME_DIR/lib/sbx_verify.py" doctor || true ;;
-      23) edit || true ;;
+      1) node_menu; continue ;;
+      2) subs_import_menu; continue ;;
+      3) outlet_menu; continue ;;
+      4) service_menu; continue ;;
+      5) inbound_menu; continue ;;
+      6) proxy_menu; continue ;;
+      7) docker_network_menu; continue ;;
+      8) diagnose_menu; continue ;;
+      9) upgrade_menu; continue ;;
+      10) backup_menu; continue ;;
+      11) advanced_menu; continue ;;
       0) exit ;;
       *) warn "无效选项" ;;
     esac

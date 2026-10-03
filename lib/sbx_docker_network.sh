@@ -562,29 +562,36 @@ PY
   done
 }
 
+# 原名「Docker 容器共享代理网络」与「宿主机应用代理」在菜单里分不清，改名「容器接入」。
+# 15 项收敛到 11 项：开关类（共享网络 / Watcher）合成一项、进入后再选开或关；
+# 地址与 Compose 模板本来就一起看，合成一项。
 docker_network_menu(){
-  local x c
+  local x c sub
   while true; do
     clear
-    menu_title 'Docker 容器共享代理网络'
+    menu_title '容器接入'
+    menu_note '让其它 Docker 容器共享 sing-box 出口。'
     printf '\n'
     docker_network_status || true
     docker_network_watch_status || true
     menu_block '托管与同步' <<'EOF'
-   1  扫描并托管           2  查看托管目标
-   3  立即同步             4  取消托管
+   1  扫描并托管  扫描容器并选择托管
+   2  托管清单    已托管容器与绑定入口
+   3  立即同步    按清单补接网络
+   4  取消托管    不再跟随某个容器
 EOF
     menu_block '临时接入' <<'EOF'
-   5  临时接入容器         6  临时移除容器
-   7  查看成员             8  查看代理地址
-   9  Compose 模板
+   5  接入容器    临时接上共享网络
+   6  移除容器    从共享网络移除
+   7  查看成员    当前网络内的容器
 EOF
-    menu_block 'Watcher 与共享网络' <<'EOF'
-  10  Watcher 开启        11  Watcher 关闭
-  12  开启共享网络        13  关闭共享网络
+    menu_block '信息' <<'EOF'
+   8  地址与模板  容器内地址 + 接入片段
+   9  验证        某容器；留空=全部托管
 EOF
-    menu_block '验证' <<'EOF'
-  14  验证容器代理        15  验证全部托管
+    menu_block '开关' <<'EOF'
+  10  共享网络    开启 / 关闭
+  11  Watcher     开启 / 关闭
 EOF
     menu_footer '0  返回'
     menu_end
@@ -597,14 +604,31 @@ EOF
       5) read -r -p '容器名称/ID: ' c || true; docker_network_connect "$c" || true ;;
       6) read -r -p '容器名称/ID: ' c || true; docker_network_disconnect "$c" || true ;;
       7) docker_network_members || true ;;
-      8) docker_network_urls || true ;;
-      9) docker_network_snippet || true ;;
-      10) docker_network_watch_on || true ;;
-      11) docker_network_watch_off || true ;;
-      12) docker_network_on || true ;;
-      13) docker_network_off || true ;;
-      14) read -r -p '容器名称/ID: ' c; python3 "$HOME_DIR/lib/sbx_verify.py" docker "$c" || true ;;
-      15) python3 "$HOME_DIR/lib/sbx_verify.py" docker-all || true ;;
+      8) docker_network_urls || true; docker_network_snippet || true ;;
+      9)
+        read -r -p '容器名称/ID（留空 = 验证全部托管）: ' c || true
+        if [[ -n "$c" ]]; then
+          python3 "$HOME_DIR/lib/sbx_verify.py" docker "$c" || true
+        else
+          python3 "$HOME_DIR/lib/sbx_verify.py" docker-all || true
+        fi
+        ;;
+      10)
+        read -r -p '共享网络: 1 开启 / 2 关闭: ' sub
+        case "$sub" in
+          1) docker_network_on || true ;;
+          2) docker_network_off || true ;;
+          *) warn "无效选项" ;;
+        esac
+        ;;
+      11)
+        read -r -p 'Watcher: 1 开启 / 2 关闭: ' sub
+        case "$sub" in
+          1) docker_network_watch_on || true ;;
+          2) docker_network_watch_off || true ;;
+          *) warn "无效选项" ;;
+        esac
+        ;;
       0) return ;;
       *) warn "无效选项" ;;
     esac

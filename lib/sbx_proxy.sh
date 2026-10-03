@@ -351,39 +351,47 @@ proxy_all(){
   return "$failed"
 }
 
+# 改名原因：原名「应用代理」和下面的「Docker 容器网络」都带 Docker + 代理，
+# 在菜单里分不清谁是宿主机、谁是容器。现在叫「宿主机代理」，对应「容器接入」。
 proxy_menu(){
   local x target action
   while true; do
     clear
-    menu_title '宿主机应用代理'
+    menu_title '宿主机代理'
+    menu_note '宿主机工具走 sing-box 出口。'
     printf '\n'
     proxy_status
     menu_block '单项开关' <<'EOF'
-   1  Docker               2  Git
-   3  APT                  4  npm
-   5  全部开启             6  全部关闭
-   9  curl (~/.curlrc)
+   1  Docker      daemon 拉镜像走 sing-box
+   2  Git         系统 HTTP/HTTPS 代理
+   3  APT         系统 apt 代理
+   4  npm         全局 npm 代理
+   5  curl        ~/.curlrc（cron 生效）
+EOF
+    menu_block '批量' <<'EOF'
+   6  全部开启    Docker/Git/APT/npm/curl
+   7  全部关闭    清除上面全部集成
 EOF
     menu_block '调试' <<'EOF'
-   7  Shell 环境变量
-   8  测试 sing-box
+   8  环境变量    输出 export/unset 命令
+   9  测试出口    用当前出口请求外网
 EOF
     menu_footer '0  返回'
     menu_end
     read -r -p '请选择: ' x || return
     case "$x" in
-      1|2|3|4|9)
-        case "$x" in 1) target=docker;;2) target=git;;3) target=apt;;4) target=npm;;9) target=curl;; esac
+      1|2|3|4|5)
+        case "$x" in 1) target=docker;;2) target=git;;3) target=apt;;4) target=npm;;5) target=curl;; esac
         read -r -p "$target: 1 开启 / 2 关闭: " action
         case "$action" in 1) proxy_one "$target" on || true;;2) proxy_one "$target" off || true;;*) warn "无效选项";; esac
         ;;
-      5) proxy_all on || true ;;
-      6) proxy_all off || true ;;
-      7)
+      6) proxy_all on || true ;;
+      7) proxy_all off || true ;;
+      8)
         printf '\n在当前 Shell 临时启用：\n  eval "$(sbx proxy env)"\n\n取消：\n  eval "$(sbx proxy env off)"\n\n'
         proxy_env
         ;;
-      8) test_current || true ;;
+      9) test_current || true ;;
       0) return ;;
       *) warn "无效选项" ;;
     esac
@@ -409,7 +417,7 @@ sbx proxy apt on|off              APT 系统代理
 sbx proxy npm on|off              npm 全局代理
 sbx proxy curl on|off             curl 走 ~/.curlrc（对 cron/systemd 等不继承环境变量的 curl 也生效）
 sbx proxy all on|off              一键开启/关闭全部可用集成
-sbx proxy env [off]\nsbx image status|bootstrap|pull|load               输出当前 Shell 的 export/unset 命令
+sbx proxy env [off]               输出当前 Shell 的 export/unset 命令
 EOF
       ;;
     *) die "未知 proxy 命令: $target" ;;
