@@ -452,6 +452,9 @@ docker_network_watch_status(){
     if command -v systemctl >/dev/null 2>&1; then
       systemctl is-enabled "$DOCKER_WATCH_UNIT" 2>/dev/null | sed 's/^/Enabled: /' || true
       systemctl is-active "$DOCKER_WATCH_UNIT" 2>/dev/null | sed 's/^/Active:  /' || true
+      # Active 只说明进程在跑：docker events 参数/模板出错时它会一直活着但什么都不做，
+      # 所以把看日志的入口直接写在这里。
+      printf '重建容器后没自动接入就看日志: journalctl -u %s -n 20 --no-pager\n' "$DOCKER_WATCH_UNIT"
     fi
   else
     printf 'Watcher: OFF\n'

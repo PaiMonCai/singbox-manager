@@ -2,7 +2,7 @@
 
 面向 Linux 服务器的 sing-box Docker 管理层。sing-box 保持官方镜像运行，宿主机通过 `sbx` 完成安装、节点管理、配置生成、校验、测试、备份恢复与升级。
 
-当前版本：**0.11.12**
+当前版本：**0.11.13**
 
 ## 一键交互式安装
 
@@ -268,6 +268,42 @@ sbx route cn-direct-full
 
 
 
+
+## 0.11.13：修掉 Docker watcher 静默失效（docker events 模板字段）
+
+症状：`sbx docker-network` 里 Watcher 显示 `CONFIGURED` / systemd 显示 active，但重建（或重启）容器后容器并没有被自动接回共享网络。
+
+根因在 watcher 里这条命令上：
+
+```bash
+docker events --filter type=container --filter event=create --filter event=start --format '{{.ID}}' 2>/dev/null
+```
+
+Docker 26 起，`docker events` 的事件类型不再带废弃的 `ID` 字段（要用 `Actor.ID`），于是这条命令**一启动就以 `Error parsing format` 退出**：
+
+```text
+Error parsing format: template: :1:2: executing "" at <.ID>: can't evaluate field ID in type *events.Message
+```
+
+而脚本把它的 stderr 丢进了 `/dev/null`，`while true` 里每 3 秒静默重试一次 —— 所以 systemd 看到进程一直活着，判定 active；实际一次 `sync` 都没跑过。用户侧的表现就是“开了没用”。
+
+修复：
+
+- 去掉 `--format`：事件行本身不需要解析（循环体只需要“有事件发生”这个信号），不写模板就没有跨版本字段问题
+- 不再隐藏 `docker events` 的 stderr：参数/模板/daemon 出错都要能在 `journalctl` 里看到
+- 每次同步的输出加 `[sbx-docker-watch]` 前缀写进 journal（原来 `--quiet` 且重定向到 /dev/null），**接入成功与失败都看得见**
+- `sbx docker-network` 的 Watcher 状态里直接打印排查入口：`journalctl -u singbox-manager-docker-watch -n 20 --no-pager`
+
+自查：
+
+```bash
+journalctl -u singbox-manager-docker-watch -n 20 --no-pager   # 有没有 [sbx-docker-watch] 记录
+SBX_WATCH_SBX=/usr/local/bin/sbx bash /opt/singbox-manager/bin/sbx-docker-watch   # 前台跑，重建一个容器看输出
+```
+
+注意「共享网络」关掉时 `sync` 会跳过（`共享代理网络当前未启用，已跳过 sync`），这句话现在也会进 journal，不会再无声无息。
+
+CI 新增回归断言：watcher 跑 3 秒不得出现 `Error parsing format` / `sbx 不可执行`；`docker events` 必须能持续运行 2 秒以上（参数或模板错会立刻退出）。这两条断言对着旧代码验证过：把 `--format '{{.ID}}'` 加回去就必红。
 
 ## 0.11.12：默认入口也能编辑了（监听/端口/出口）
 

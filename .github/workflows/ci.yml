@@ -1287,6 +1287,32 @@ jobs:
           grep -F '"inbound_id": "default"' "$SBX_DOCKER_MANAGED_FILE"
           ! grep -F '"port":' "$SBX_DOCKER_MANAGED_FILE"
           docker_network_status | grep -F 'Docker网络: READY'
+
+          # 回归：watcher 的 docker events 参数必须能被当前 Docker 接受。
+          # 曾经用 --format '{{.ID}}'，而 Docker 26 起 *events.Message 去掉了废弃的 ID 字段
+          # （要用 Actor.ID），于是 docker events 一启动就报 "Error parsing format" 退出，
+          # 加上脚本把 stderr 丢进 /dev/null，结果 unit 显示 active 却一次 sync 都没跑过。
+          echo '--- Watcher 的 docker events 参数 ---'
+          SBX_WATCH_SBX="${{ github.workspace }}/bin/sbx" timeout 3 bash bin/sbx-docker-watch \
+            > /tmp/sbx-watch.out 2> /tmp/sbx-watch.err || true
+          cat /tmp/sbx-watch.out /tmp/sbx-watch.err
+          if grep -qF 'Error parsing format' /tmp/sbx-watch.err; then
+            echo 'watcher 的 docker events 参数在当前 Docker 上会直接报错' >&2; exit 1
+          fi
+          if grep -qF 'sbx 不可执行' /tmp/sbx-watch.err; then
+            echo 'watcher 找不到 sbx，无法验证事件流' >&2; exit 1
+          fi
+          # 事件过滤器本身也要能持续运行：参数/模板错会立刻退出，正常则一直等到 timeout
+          events_start="$(date +%s)"
+          timeout 3 docker events --filter type=container --filter event=create --filter event=start \
+            > /dev/null 2> /tmp/sbx-events.err || true
+          events_end="$(date +%s)"
+          if [ -s /tmp/sbx-events.err ]; then
+            echo 'docker events 过滤器报错:' >&2; cat /tmp/sbx-events.err >&2; exit 1
+          fi
+          if [ "$((events_end - events_start))" -lt 2 ]; then
+            echo 'docker events 立即退出，事件流不可用（watcher 会静默失效）' >&2; exit 1
+          fi
           docker_network_watch_on
           grep -F 'ExecStart=' "$SBX_DOCKER_WATCH_SERVICE"
           grep -F 'Environment="SBX_HOME=' "$SBX_DOCKER_WATCH_SERVICE"

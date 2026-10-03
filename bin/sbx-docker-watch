@@ -19,9 +19,18 @@ while true; do
 
   # docker events 在 daemon 重启时会非零退出；不能让它用 errexit 结束整个 watcher
   # （只靠 systemd 的 Restart=always 兜底不够，手工运行时就是静默死掉）。
-  docker events     --filter type=container     --filter event=create     --filter event=start     --format '{{.ID}}' 2>/dev/null |
-  while IFS= read -r _container_id; do
-    "$SBX_WATCH_SBX" docker-network sync --quiet >/dev/null 2>&1 || true
+  #
+  # 刻意不用 --format：模板字段跨 Docker 版本会变。曾经写 --format '{{.ID}}'，
+  # Docker 26 起 *events.Message 去掉了废弃的 ID 字段（要用 Actor.ID），于是
+  # docker events 一启动就以 "Error parsing format" 退出，而错误被 2>/dev/null 吞掉，
+  # 结果 unit 显示 active、却一次 sync 都没跑过。事件行本身不需要解析。
+  docker events \
+    --filter type=container \
+    --filter event=create \
+    --filter event=start |
+  while IFS= read -r _event; do
+    # 加前缀后原样写进 journalctl：接入成功/失败都要看得见，不再静默
+    "$SBX_WATCH_SBX" docker-network sync 2>&1 | sed 's/^/[sbx-docker-watch] /' || true
   done || true
 
   sleep "$SBX_WATCH_RETRY"
