@@ -9,7 +9,21 @@ APT_PROXY_FILE="${SBX_APT_PROXY_FILE:-/etc/apt/apt.conf.d/99singbox-manager-prox
 GIT_PROXY_FILE="${SBX_GIT_PROXY_FILE:-/etc/singbox-manager/git-proxy.conf}"
 # curl 只读用户级配置（没有 /etc/curlrc 这种系统级文件），
 # 默认写当前 HOME 下的 ~/.curlrc；CURL_HOME 与 SBX_CURLRC_FILE 都可覆盖。
-CURLRC_FILE="${SBX_CURLRC_FILE:-${CURL_HOME:-$HOME}/.curlrc}"
+#
+# 注意：这一行是 source 阶段求值的，而 systemd 单元（Docker watcher、每日自动更新）
+# 与 cron 里都可能没有 HOME —— 不兜底的话 `set -u` 会让整个 sbx 一启动就报
+# "HOME: unbound variable"，连 `sbx manager update` 和 `sbx docker-network sync` 都跑不动。
+proxy_user_home(){
+  [[ -n "${HOME:-}" ]] && { printf '%s' "$HOME"; return 0; }
+  local home=""
+  if command -v getent >/dev/null 2>&1; then
+    home="$(getent passwd "$(id -u)" 2>/dev/null | cut -d: -f6 || true)"
+  fi
+  [[ -n "$home" ]] && { printf '%s' "$home"; return 0; }
+  if [[ "$(id -u)" == "0" ]]; then printf '/root'; else printf '%s' "${TMPDIR:-/tmp}"; fi
+  return 0
+}
+CURLRC_FILE="${SBX_CURLRC_FILE:-${CURL_HOME:-$(proxy_user_home)}/.curlrc}"
 PROXY_BLOCK_BEGIN="# >>> singbox-manager proxy >>>"
 PROXY_BLOCK_END="# <<< singbox-manager proxy <<<"
 NPM_BLOCK_BEGIN="$PROXY_BLOCK_BEGIN"

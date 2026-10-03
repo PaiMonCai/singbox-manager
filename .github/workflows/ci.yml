@@ -344,6 +344,23 @@ jobs:
           sudo env SBX_HOME=/tmp/sbx-manager-only /tmp/sbx-ci-bin/sbx image ref
           sudo env SBX_HOME=/tmp/sbx-manager-only /tmp/sbx-ci-bin/sbx proxy status
           sudo env SBX_HOME=/tmp/sbx-manager-only /tmp/sbx-ci-bin/sbx manager auto status
+          # 回归：systemd 单元（Docker watcher、每日自动更新）与 cron 里都没有 HOME。
+          # lib/sbx_proxy.sh 曾经在 source 阶段用 $HOME，set -u 下整个 CLI 一启动就报
+          # "HOME: unbound variable" —— watcher 的 sync 与自动更新都被它静默打断。
+          echo '--- 空环境（没有 HOME）也要能跑 ---'
+          env -i PATH=/usr/local/bin:/usr/bin:/bin SBX_HOME=/tmp/sbx-manager-only \
+            /tmp/sbx-ci-bin/sbx version > /tmp/sbx-nohome-version.txt
+          cat /tmp/sbx-nohome-version.txt
+          grep -F 'singbox-manager:' /tmp/sbx-nohome-version.txt
+          if grep -qF 'unbound variable' /tmp/sbx-nohome-version.txt; then
+            echo 'sbx 在没有 HOME 的环境里起不来' >&2; exit 1
+          fi
+          env -i PATH=/usr/local/bin:/usr/bin:/bin SBX_HOME=/tmp/sbx-manager-only \
+            /tmp/sbx-ci-bin/sbx manager auto status > /tmp/sbx-nohome-auto.txt
+          grep -F '自动更新' /tmp/sbx-nohome-auto.txt
+          env -i PATH=/usr/local/bin:/usr/bin:/bin SBX_HOME=/tmp/sbx-manager-only \
+            /tmp/sbx-ci-bin/sbx proxy status > /tmp/sbx-nohome-proxy.txt
+          grep -F 'sing-box proxy' /tmp/sbx-nohome-proxy.txt
           # 上面的 HOME 里 nodes.json 是“不得改动”的哨兵文件，换成合法空库后再跑涉及节点库的命令
           sudo rm -f /tmp/sbx-manager-only/nodes/nodes.json
           sudo env SBX_HOME=/tmp/sbx-manager-only python3 /tmp/sbx-manager-only/lib/sbx_nodes.py init >/dev/null

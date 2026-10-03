@@ -2,7 +2,7 @@
 
 面向 Linux 服务器的 sing-box Docker 管理层。sing-box 保持官方镜像运行，宿主机通过 `sbx` 完成安装、节点管理、配置生成、校验、测试、备份恢复与升级。
 
-当前版本：**0.11.13**
+当前版本：**0.11.14**
 
 ## 一键交互式安装
 
@@ -268,6 +268,48 @@ sbx route cn-direct-full
 
 
 
+
+## 0.11.14：修掉“没有 HOME 时 sbx 完全起不来”（连同自动更新一起中招）
+
+0.11.13 修好 watcher 之后，容器重建仍然没有被接回共享网络，日志里换成了新错误：
+
+```text
+[sbx-docker-watch] /opt/singbox-manager/lib/sbx_proxy.sh: line 12: HOME: unbound variable
+```
+
+根因：`lib/sbx_proxy.sh` 在**被 source 的阶段**用 `$HOME` 拼 `~/.curlrc` 的路径：
+
+```bash
+CURLRC_FILE="${SBX_CURLRC_FILE:-${CURL_HOME:-$HOME}/.curlrc}"
+```
+
+而 systemd 单元和 cron 里**没有 `HOME`**，`bin/sbx` 又是 `set -Eeuo pipefail` —— 于是 `set -u` 让整个 CLI 在加载阶段就退出。所有子命令全废，不只是 `docker-network sync`：
+
+| 谁在无 HOME 的环境里跑 | 命令 | 结果 |
+| --- | --- | --- |
+| Docker watcher（systemd） | `sbx docker-network sync` | 失败 → 容器重建后接不回网络 |
+| 每日自动更新（systemd timer） | `sbx manager update --quiet` | 失败 → **自动更新一直是坏的** |
+| cron 里的任何 sbx 调用 | 任意子命令 | 失败 |
+
+自查（`0.11.14` 之前必现，之后正常）：
+
+```bash
+env -i PATH=/usr/local/bin:/usr/bin:/bin SBX_HOME=/opt/singbox-manager sbx version
+# 以前：lib/sbx_proxy.sh: line 12: HOME: unbound variable
+# 现在：singbox-manager: 0.11.14
+```
+
+修复：加 `proxy_user_home()` —— 先用 `$HOME`，没有就用 `getent passwd $(id -u)` 查该用户真实家目录，再兜底 root 的 `/root`；`CURL_HOME` / `SBX_CURLRC_FILE` 优先级不变。顺便审计了全仓顶层赋值：只有这一处引用了外部环境变量，其余都是 `${SBX_*:-默认值}` 形式。
+
+**如果你的自动更新开着，请顺手确认它现在真的会跑**（升级到 0.11.14 之后）：
+
+```bash
+journalctl -u singbox-manager-update.service -n 30 --no-pager   # 旧记录里应该都是这条 unbound variable
+systemctl start singbox-manager-update.service                   # 手动触发一次，应报“已是最新版本”
+systemctl list-timers singbox-manager-update.timer               # 看下次触发时间
+```
+
+CI 新增“空环境”断言：用 `env -i`（没有 HOME）跑 `sbx version` / `manager auto status` / `proxy status`，必须正常输出且不得出现 `unbound variable`。对着旧代码反向验证过（把 `$HOME` 改回去，断言必红）。
 
 ## 0.11.13：修掉 Docker watcher 静默失效（docker events 模板字段）
 
