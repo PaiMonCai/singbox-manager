@@ -95,21 +95,27 @@ sbx reapply
 
 **防护边界**：清单和源码来自同一个分支 / 同一个镜像地址，所以它挡得住“CDN / 镜像站改写内容”，**挡不住仓库本身被改写** —— 攻击者改了源码，也会顺带改掉同一分支里的 `SHA256SUMS`。要真正锁定内容，请把来源固定到不可变的 tag（`SBX_INSTALL_BRANCH` / `SBX_UPDATE_BRANCH`）并使用自建源（`SBX_SOURCE_BASE_URL` / `SBX_UPDATE_BASE_URL`），这样清单才具备独立可信度。
 
-### 如何发布校验清单（可选，但推荐）
+### 校验清单的发布与维护
 
-默认路径依赖 `<源 base>/SHA256SUMS`。**目前本仓库尚未发布该文件**，所以在官方源上默认只会打印一次“未找到校验清单”的警告，然后按老行为继续（启用强制校验请用 `SBX_REQUIRE_CHECKSUM=1` / `SBX_UPDATE_REQUIRE_CHECKSUM=1`）。要真正启用，按下面的方式生成并随源码一起发布：
+仓库根已发布 `SHA256SUMS`，所以安装器与 `sbx-install` 从官方源（或任何镜像该目录的源）安装时，**默认就会走清单校验**：不匹配或缺条目直接中止。若你的源没有该文件，只会打印一次“未找到校验清单”的警告然后按老行为继续；要禁止这种降级，用 `SBX_REQUIRE_CHECKSUM=1` / `SBX_UPDATE_REQUIRE_CHECKSUM=1`。
+
+维护这份清单（**改任何一个受校验的文件后都必须重新生成**）：
 
 ```bash
-# 在仓库根执行：清单条目必须与 install.sh 的 SOURCE_REQUIRED 一一对应（17 项）
-sha256sum compose.yml .env.example config/config.example.json \
+# 在仓库根执行。清单必须恰好 18 项：17 项源码（= install.sh 的 SOURCE_REQUIRED）+ install.sh
+# 自身 —— install.sh 不由 install.sh 下载，但 bin/sbx-install 要用清单校验它。
+sha256sum install.sh compose.yml .env.example config/config.example.json \
   bin/sbx bin/sbx-docker-watch bin/sbx-install \
   lib/*.py lib/*.sh VERSION > SHA256SUMS
+
+sha256sum -c SHA256SUMS   # 自校验
 ```
 
-两条硬性约束：
+三条硬性约束：
 
-- **`SHA256SUMS` 本身不要写进清单**（不列入 `SOURCE_REQUIRED`），否则会形成自我引用的死循环。
-- **任何一项源码文件改动后都必须重新生成**：清单是「不匹配即中止」的，过期清单会让所有安装与自更新直接失败。建议在 CI 里加一道一致性检查（清单存在时，重新生成后与已提交内容比对，不一致就红），把这条约束变成门禁而不是靠记忆。
+- **`SHA256SUMS` 自身不写进清单**（也不列入 `SOURCE_REQUIRED`），否则会形成自我引用的死循环。
+- **清单必须包含 `install.sh`**：`bin/sbx-install` 下载安装器后要用它校验；缺条目会被当成校验失败而否决该候选源。
+- **过期清单会让所有安装与自更新直接失败**（fail-closed）。CI 已把这条变成门禁：`Verify SHA256SUMS is up to date` 步骤会跑 `sha256sum -c` 并断言清单条目与 `SOURCE_REQUIRED + install.sh` 完全一致，不一致即红。
 
 ## 节点管理
 

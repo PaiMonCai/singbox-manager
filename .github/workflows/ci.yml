@@ -9,9 +9,43 @@ on:
 jobs:
   validate:
     runs-on: ubuntu-latest
+    # 最小权限：本工作流只读仓库内容，不写任何东西（也不使用 secrets）。
+    permissions:
+      contents: read
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        # 按 commit SHA 固定，不用浮动的 v4 标签：标签可被上游重打，SHA 不能。
+        # 升级方式：改为新的 v4.x.y 对应 SHA，并同步更新本行注释。
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - name: Verify SHA256SUMS is up to date
+        run: |
+          # 发布的校验清单必须与当前源码一致：它是「不匹配即中止安装」的，
+          # 过期清单会让所有安装与自更新直接失败，所以在这里当门禁拦住。
+          # 生成方法见 README 的「如何发布校验清单」。
+          test -f SHA256SUMS
+          sha256sum -c SHA256SUMS
+          python3 - <<'PY'
+          import re, pathlib
+
+          # 1) 清单必须恰好覆盖 SOURCE_REQUIRED（17 项）+ install.sh
+          #    （install.sh 不被 install.sh 自己下载，但 bin/sbx-install 要用清单校验它）
+          src = re.search(r'SOURCE_REQUIRED=\(\s*\n(.*?)\n\s*\)',
+                          pathlib.Path('install.sh').read_text(encoding='utf-8'), re.S).group(1)
+          want = {l.strip().strip('"') for l in src.splitlines() if l.strip()} | {'install.sh'}
+          got = set()
+          for line in pathlib.Path('SHA256SUMS').read_text(encoding='utf-8').splitlines():
+              line = line.strip()
+              if not line or line.startswith('#'):
+                  continue
+              parts = line.split(None, 1)
+              if len(parts) == 2:
+                  got.add(parts[1].strip().lstrip('*'))
+          assert len(want) == 18, '期望 18 项（17 项源码 + install.sh），实际 %d' % len(want)
+          assert want == got, '清单与期望不一致：缺少 %s / 多出 %s' % (
+              sorted(want - got) or '无', sorted(got - want) or '无')
+          print('SHA256SUMS 覆盖 %d 项，且与 SOURCE_REQUIRED + install.sh 完全一致' % len(got))
+          PY
 
       - name: Bash syntax
         run: |
