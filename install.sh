@@ -153,11 +153,6 @@ ensure_docker() {
     die "Docker 安装脚本执行失败（退出码 $rc）。"
   fi
   return 0
-
-  if command -v systemctl >/dev/null 2>&1; then
-    systemctl enable --now docker >/dev/null 2>&1 || true
-  fi
-  docker compose version >/dev/null 2>&1 || die "Docker 已安装，但未检测到 Compose v2。"
 }
 
 # ── 源码获取：候选源枚举 + 并发测速 + 按排名抓取 ──────────────────────────────
@@ -179,6 +174,19 @@ SOURCE_UA="singbox-manager-installer"
 # 传给 curl 的额外参数；最后兜底直连时会放入 -q（忽略 ~/.curlrc 里的代理配置）。
 # curl 要求 -q 出现在第一个参数位置，所以这里必须紧跟 curl 命令。
 SOURCE_CURL_EXTRA=()
+
+# 内容完整性（SHA256 清单）：
+#   SBX_SOURCE_SHA256SUMS  清单地址或本地路径；留空时默认 <候选源 base>/SHA256SUMS
+#   SBX_REQUIRE_CHECKSUM=1 严格模式：清单不可得时直接中止安装
+SOURCE_CHECKSUM_URL="${SBX_SOURCE_SHA256SUMS:-}"
+SOURCE_REQUIRE_CHECKSUM="${SBX_REQUIRE_CHECKSUM:-0}"
+SOURCE_CHECKSUM_TIMEOUT="${SBX_SOURCE_CHECKSUM_TIMEOUT:-10}"
+SOURCE_CHECKSUM_CONNECT_TIMEOUT="${SBX_SOURCE_CHECKSUM_CONNECT_TIMEOUT:-5}"
+# 每个源 base 的清单只取一次并缓存；清单不可得的源只提醒一次
+CHECKSUM_CACHE_KEYS=()
+CHECKSUM_CACHE_FILES=()
+CHECKSUM_MANIFEST_FILE=""
+CHECKSUM_WARNED_KEYS=()
 
 SOURCE_REQUIRED=(
   "compose.yml"
@@ -343,6 +351,214 @@ source_tree_complete() {
   for path in "${SOURCE_REQUIRED[@]}"; do
     [[ -f "$dir/$path" ]] || return 1
   done
+  return 0
+}
+
+# ── 下载内容的密码学校验（sha256sum 清单）────────────────────────────────────
+# 清单格式与 sha256sum 输出一致：<64 位十六进制><空格><相对路径>；容忍多个空格、
+# '*' 前缀（二进制模式）、'#' 注释行与空行；相对路径写法与 SOURCE_REQUIRED 一致。
+# 语义：
+#   清单可得 → 每个下载成功的文件都必须校验：哈希不符或清单缺条目 → 直接终止安装；
+#   清单不可得（404/网络失败/超时）或不可解析 → 每个源只提醒一次，按原有行为继续；
+#   SBX_REQUIRE_CHECKSUM=1（严格模式）→ 清单不可得时直接终止。
+hash_file() { # file → sha256（小写十六进制）
+  local file="$1"
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum "$file" | awk '{print $1}'
+  elif command -v shasum >/dev/null 2>&1; then
+    shasum -a 256 "$file" | awk '{print $1}'
+  else
+    python3 - "$file" <<'PY'
+import hashlib
+import sys
+h = hashlib.sha256()
+with open(sys.argv[1], 'rb') as fh:
+    for chunk in iter(lambda: fh.read(1 << 20), b''):
+        h.update(chunk)
+print(h.hexdigest())
+PY
+  fi
+}
+
+checksum_manifest_valid() { # manifest → 0 表示至少能解析出一条有效条目
+  local manifest="$1" line hash rest count=0
+  [[ -s "$manifest" ]] || return 1
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    line="${line%$'\r'}"
+    [[ "$line" =~ [^[:space:]] ]] || continue
+    [[ "$line" == '#'* ]] && continue
+    hash="${line%%[[:space:]]*}"
+    [[ "$hash" =~ ^[0-9a-fA-F]{64}$ ]] || continue
+    rest="${line#"$hash"}"
+    rest="${rest#"${rest%%[![:space:]]*}"}"
+    [[ -n "$rest" ]] || continue
+    count=$((count+1))
+  done < "$manifest"
+  (( count > 0 ))
+}
+
+checksum_lookup() { # manifest path → 期望的 sha256（小写）；找不到返回 1
+  local manifest="$1" want="$2" line hash rest
+  [[ -f "$manifest" ]] || return 1
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    line="${line%$'\r'}"
+    [[ "$line" =~ [^[:space:]] ]] || continue
+    [[ "$line" == '#'* ]] && continue
+    hash="${line%%[[:space:]]*}"
+    [[ "$hash" =~ ^[0-9a-fA-F]{64}$ ]] || continue
+    rest="${line#"$hash"}"
+    rest="${rest#"${rest%%[![:space:]]*}"}"
+    rest="${rest#\*}"
+    rest="${rest#./}"
+    [[ "$rest" == "$want" ]] || continue
+    printf '%s\n' "${hash,,}"
+    return 0
+  done < "$manifest"
+  return 1
+}
+
+checksum_fetch_manifest() { # url dest（短超时；本地路径直接复制）
+  local url="$1" dest="$2" src
+  case "$url" in
+    http://*|https://*)
+      curl ${SOURCE_CURL_EXTRA[@]+"${SOURCE_CURL_EXTRA[@]}"} -fsSL -A "$SOURCE_UA" \
+        --connect-timeout "$SOURCE_CHECKSUM_CONNECT_TIMEOUT" --max-time "$SOURCE_CHECKSUM_TIMEOUT" \
+        "$(source_bust_url "$url")" -o "$dest" 2>/dev/null
+      ;;
+    file://*)
+      src="${url#file://}"
+      cp -f "$src" "$dest" 2>/dev/null
+      ;;
+    *)
+      [[ -f "$url" ]] || return 1
+      cp -f "$url" "$dest" 2>/dev/null
+      ;;
+  esac
+}
+
+checksum_manifest_for() { # base → 0/1；成功时把清单本地路径写进 CHECKSUM_MANIFEST_FILE。每个源只取一次
+  local base="$1" key url dest i seq
+  CHECKSUM_MANIFEST_FILE=""
+  if [[ -n "$SOURCE_CHECKSUM_URL" ]]; then
+    key="__explicit__"
+    url="$SOURCE_CHECKSUM_URL"
+  else
+    key="${base%/}"
+    url="${key}/SHA256SUMS"
+  fi
+  key="${key}|${SOURCE_CURL_EXTRA[*]+${SOURCE_CURL_EXTRA[*]}}"
+  for ((i=0;i<${#CHECKSUM_CACHE_KEYS[@]};i++)); do
+    [[ "${CHECKSUM_CACHE_KEYS[$i]}" == "$key" ]] || continue
+    [[ -n "${CHECKSUM_CACHE_FILES[$i]}" ]] || return 1
+    CHECKSUM_MANIFEST_FILE="${CHECKSUM_CACHE_FILES[$i]}"
+    return 0
+  done
+  mkdir -p "$TMP_DIR/checksums"
+  seq=${#CHECKSUM_CACHE_KEYS[@]}
+  dest="$TMP_DIR/checksums/list.$seq"
+  CHECKSUM_CACHE_KEYS+=("$key")
+  CHECKSUM_CACHE_FILES+=("")
+  if checksum_fetch_manifest "$url" "$dest" && checksum_manifest_valid "$dest"; then
+    CHECKSUM_CACHE_FILES[$(( ${#CHECKSUM_CACHE_FILES[@]} - 1 ))]="$dest"
+    CHECKSUM_MANIFEST_FILE="$dest"
+    return 0
+  fi
+  rm -f "$dest"
+  return 1
+}
+
+checksum_warn_missing() { # key label；同一个源只提醒一次
+  local key="$1" label="$2" i
+  for ((i=0;i<${#CHECKSUM_WARNED_KEYS[@]};i++)); do
+    [[ "${CHECKSUM_WARNED_KEYS[$i]}" == "$key" ]] && return 0
+  done
+  CHECKSUM_WARNED_KEYS+=("$key")
+  warn "未找到校验清单，跳过完整性校验（${label:-$key}）：如需强制校验请设置 SBX_SOURCE_SHA256SUMS=<清单地址> SBX_REQUIRE_CHECKSUM=1。"
+  return 0
+}
+
+# 校验单个已下载文件：优先用它实际来源的源 base 的清单；找不到来源记录时逐个候选源尝试。
+# 任何哈希不符 / 清单缺条目都会 die（必须中止安装，不能带着被改写的内容继续）。
+checksum_verify_download() { # raw_dir path
+  local raw_dir="$1" path="$2" idx="" base="" label="" manifest="" expected="" actual="" key=""
+  local i spec seen_manifest=0
+  local -a bases=() labels=()
+  if [[ -f "$TMP_DIR/fetch-results/${path//\//_}.idx" ]]; then
+    idx="$(tr -d '[:space:]' < "$TMP_DIR/fetch-results/${path//\//_}.idx" 2>/dev/null || true)"
+  fi
+  if [[ "$idx" =~ ^[0-9]+$ ]] && (( idx < ${#FILES_RANKED[@]} )); then
+    IFS='|' read -r _ base label <<<"${FILES_RANKED[$idx]}"
+    bases+=("$base"); labels+=("$label")
+  fi
+  for spec in ${FILES_RANKED[@]+"${FILES_RANKED[@]}"}; do
+    IFS='|' read -r _ base label <<<"$spec"
+    for ((i=0;i<${#bases[@]};i++)); do
+      [[ "${bases[$i]}" == "$base" ]] && break
+    done
+    (( i < ${#bases[@]} )) && continue
+    bases+=("$base"); labels+=("$label")
+  done
+  for ((i=0;i<${#bases[@]};i++)); do
+    checksum_manifest_for "${bases[$i]}" || continue
+    manifest="$CHECKSUM_MANIFEST_FILE"
+    [[ -n "$manifest" ]] || continue
+    seen_manifest=1
+    if expected="$(checksum_lookup "$manifest" "$path")"; then
+      actual="$(hash_file "$raw_dir/$path")"
+      if [[ "$actual" != "$expected" ]]; then
+        die "完整性校验失败：$path 的 sha256 与校验清单不符（期望 $expected，实际 $actual，来源 ${labels[$i]}）。已中止安装，请检查该来源是否被篡改。"
+      fi
+      info "完整性校验通过: $path（${labels[$i]}）"
+      return 0
+    fi
+  done
+  if (( seen_manifest )); then
+    die "完整性校验失败：$path 在校验清单里没有条目（每个下载文件都必须有 sha256 条目）。已中止安装。"
+  fi
+  if [[ "$SOURCE_REQUIRE_CHECKSUM" == "1" ]]; then
+    die "严格校验模式（SBX_REQUIRE_CHECKSUM=1）下无法获取校验清单（${bases[0]:-未知源}），已中止安装。"
+  fi
+  if [[ -n "$SOURCE_CHECKSUM_URL" ]]; then key="__explicit__"; else key="${bases[0]:-unknown}"; fi
+  checksum_warn_missing "$key" "${labels[0]:-${bases[0]:-}}"
+  return 0
+}
+
+checksum_verify_files_tree() { # raw_dir：逐文件校验（清单可得时全部必须通过）
+  local raw_dir="$1" path
+  for path in "${SOURCE_REQUIRED[@]}"; do
+    [[ -s "$raw_dir/$path" ]] || continue
+    checksum_verify_download "$raw_dir" "$path"
+  done
+  return 0
+}
+
+# 整包（tar.gz）兜底路径：按归档文件名（basename）在清单里找条目。
+# 归档是兜底路径，清单缺条目时保持宽松（严格模式才失败）；但哈希不符一律中止。
+checksum_verify_archive() { # archive_url archive_file
+  local url="$1" file="$2" name="${1##*/}" base="${1%/*}" manifest="" expected="" actual=""
+  if [[ -n "$SOURCE_BASE_URL" ]]; then base="$SOURCE_BASE_URL"; fi
+  manifest=""
+  if checksum_manifest_for "$base"; then manifest="$CHECKSUM_MANIFEST_FILE"; fi
+  if [[ -z "$manifest" ]]; then
+    if [[ "$SOURCE_REQUIRE_CHECKSUM" == "1" ]]; then
+      die "严格校验模式（SBX_REQUIRE_CHECKSUM=1）下无法获取校验清单（${base%/}/SHA256SUMS），已中止安装。"
+    fi
+    if [[ -n "$SOURCE_CHECKSUM_URL" ]]; then base="__explicit__"; fi
+    checksum_warn_missing "$base" "$base"
+    return 0
+  fi
+  if ! expected="$(checksum_lookup "$manifest" "$name")"; then
+    if [[ "$SOURCE_REQUIRE_CHECKSUM" == "1" ]]; then
+      die "严格校验模式（SBX_REQUIRE_CHECKSUM=1）下校验清单缺少归档 $name 的条目，已中止安装。"
+    fi
+    warn "校验清单里没有归档 $name 的条目，跳过整包校验（严格模式: SBX_REQUIRE_CHECKSUM=1）。"
+    return 0
+  fi
+  actual="$(hash_file "$file")"
+  if [[ "$actual" != "$expected" ]]; then
+    die "完整性校验失败：整包 $name 的 sha256 与校验清单不符（期望 $expected，实际 $actual）。已中止安装。"
+  fi
+  info "完整性校验通过（整包）: $name"
   return 0
 }
 
@@ -554,7 +770,7 @@ fetch_files_missing() { # raw_dir
   (( conc > ${#queue[@]} )) && conc=${#queue[@]}
   info "并发下载源码：${#queue[@]} 个文件，并发 $conc，单文件失败自动换源..."
 
-  rm -rf "$results"
+  # 结果目录跨多次抓取保留（前半轮取到的文件记录了各自的来源源，校验时要用它）
   mkdir -p "$results"
   for path in "${queue[@]}"; do
     ( fetch_one_file_ranked "$raw_dir" "$path" "$results" ) &
@@ -570,7 +786,6 @@ fetch_files_missing() { # raw_dir
   for path in "${queue[@]}"; do
     if [[ ! -s "$raw_dir/$path" ]]; then
       warn "所有逐文件候选源都取不到 $path。"
-      rm -rf "$results"
       return 1
     fi
   done
@@ -587,7 +802,6 @@ fetch_files_missing() { # raw_dir
   done
   (( best >= 0 )) && FILES_STICKY=$best
 
-  rm -rf "$results"
   return 0
 }
 
@@ -600,6 +814,8 @@ fetch_archive_source() { # url → 成功时设置 ARCHIVE_DIR
     rm -f "$archive"
     return 1
   fi
+  # 整包下载成功先校验再解包：哈希不符（清单里确实有该归档条目时）直接中止。
+  checksum_verify_archive "$url" "$archive"
   if ! tar -xzf "$archive" -C "$TMP_DIR/archive"; then
     rm -f "$archive"
     return 1
@@ -649,6 +865,8 @@ get_source() {
       IFS='|' read -r kind url label <<<"$spec"
       if [[ "$kind" == "files" ]]; then
         if fetch_files_missing "$raw_dir" && source_tree_complete "$raw_dir"; then
+          # 内容完整性：清单可得时必须每个文件都校验通过，否则 die（中止安装）
+          checksum_verify_files_tree "$raw_dir"
           SOURCE_DIR="$raw_dir"
           fetched=1
           info "源码已通过 $label 准备完成。"

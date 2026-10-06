@@ -87,7 +87,7 @@ docker_network_on(){
 
   if running; then
     info "重建 sing-box 容器以持久接入共享网络..."
-    check
+    check || return 1
     dc up -d --force-recreate --pull never sing-box
   fi
 
@@ -113,7 +113,7 @@ docker_network_off(){
 
   if [[ "${SBX_DOCKER_NETWORK_NO_APPLY:-0}" != "1" ]] && running; then
     info "重建 sing-box 容器并移除持久共享网络连接..."
-    check
+    check || return 1
     dc up -d --force-recreate --pull never sing-box
   fi
 
@@ -271,10 +271,6 @@ docker_network_status(){
 
 docker_network_endpoints_json(){
   python3 "$HELPER" inbound-endpoints --json
-}
-
-docker_network_known_inbounds(){
-  python3 "$HELPER" inbound-endpoints
 }
 
 docker_network_resolve_inbound(){
@@ -702,7 +698,7 @@ docker_network_cmd(){
     managed) docker_network_managed_list ;;
     sync) docker_network_sync "${1:-}" ;;
     verify) python3 "$HOME_DIR/lib/sbx_verify.py" docker "${1:-}" "${2:-}" ;;
-    verify-all) python3 "$HOME_DIR/lib/sbx_verify.py" docker-all ;;
+    verify-all) python3 "$HOME_DIR/lib/sbx_verify.py" docker-all "$@" ;;
     watch)
       case "${1:-status}" in
         on) docker_network_watch_on ;;

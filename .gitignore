@@ -7,12 +7,18 @@
 config/config.json
 nodes/nodes.json
 nodes/.sbx-nodes.lock
+# .env 读改写用的 flock 写锁（运行期文件，不参与版本管理）
+.sbx-env.lock
 data/*
 backup/*
 *.tar.gz
 .DS_Store
 __pycache__/
 *.pyc
+
+# 原子写的中间文件（write 临时文件 + rename），崩溃时会残留在安装目录
+*.tmp
+.docker-managed.*
 
 proxy-state/*
 
@@ -21,5 +27,3 @@ compose.inbounds.yml
 compose.network.yml
 
 docker-managed.json
-
-# 本地手工跑 CI 步骤时生成的临时目录

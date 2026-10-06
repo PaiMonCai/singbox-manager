@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
 # singbox-manager v0.7 self-update integration.
 
-VERSION="0.11.16"
+# 版本号的唯一来源是安装目录的 VERSION 文件（bin/sbx 在 source 各 lib 之前读入）。
+# 这里只作单独 source（CI / 自更新单测）时的兜底：绝不能反过来覆盖上游的值。
+VERSION="${VERSION:-}"
 
 UPDATE_REPO="${SBX_UPDATE_REPO:-PaiMonCai/singbox-manager}"
 UPDATE_BRANCH="${SBX_UPDATE_BRANCH:-main}"
@@ -13,6 +15,15 @@ UPDATE_INSTALLER_LINK="${SBX_INSTALLER_LINK:-/usr/local/bin/sbx-install}"
 UPDATE_SOURCE_MIRRORS="${SBX_SOURCE_MIRRORS:-}"
 UPDATE_MIRROR_PRESET="${SBX_MIRROR_PRESET:-0}"
 UPDATE_RACE_TIMEOUT="${SBX_UPDATE_RACE_TIMEOUT:-25}"
+# 清单式完整性校验（实现见 manager_verify_manifest）：
+#   SBX_UPDATE_SHA256SUMS=<url|本地路径>  校验清单位置；留空 = <更新源 base>/SHA256SUMS
+#   SBX_UPDATE_REQUIRE_CHECKSUM=1         严格模式：取不到清单就中止（默认只警告后继续）
+#   SBX_UPDATE_SUMS_TIMEOUT=<秒>          取清单的短超时（默认 6）
+UPDATE_CHECKSUMS="${SBX_UPDATE_SHA256SUMS:-}"
+UPDATE_REQUIRE_CHECKSUM="${SBX_UPDATE_REQUIRE_CHECKSUM:-0}"
+UPDATE_SUMS_TIMEOUT="${SBX_UPDATE_SUMS_TIMEOUT:-6}"
+# 清单缓存目录：一次更新内复用（每个来源只取一次清单），用完即删
+MANAGER_SUMS_DIR="${MANAGER_SUMS_DIR:-}"
 # 显式指定过 SBX_UPDATE_BASE_URL（自建镜像 / 固定 tag / file:// 测试源）时，
 # 只在该地址内抢速，不混入由 UPDATE_REPO 推导出来的官方额外候选。
 UPDATE_BASE_EXPLICIT=0
@@ -35,7 +46,7 @@ manager_local_version(){
   if [[ -f "$HOME_DIR/VERSION" ]]; then
     tr -d '[:space:]' < "$HOME_DIR/VERSION"
   else
-    printf '%s' "$VERSION"
+    printf '%s' "${VERSION:-unknown}"
   fi
 }
 
@@ -179,7 +190,8 @@ manager_race_fetch_once(){
     bases=()
     for b in ${keep[@]+"${keep[@]}"}; do bases+=("$b"); done
     n=${#bases[@]}
-    (( n )) || { rm -rf "$dir" 2>/dev/null || true; return 1; }
+    # $dir 在下面才由 mktemp 赋值，此处还没有临时目录可清（历史残留的空操作已删除）
+    (( n )) || return 1
   fi
 
   for ((i=0;i<n;i++)); do urls[i]="$(manager_bust_url "${bases[$i]%/}/$rel")"; done
@@ -291,6 +303,203 @@ manager_check(){
   esac
 }
 
+# ── 自更新内容的清单式完整性校验 ────────────────────────────────────────────
+# 背景：更新下来的内容是以 root 身份执行的，过去只有可选的 SBX_UPDATE_SHA256，
+# 不设置就等于完全不校验。这里默认从更新源取标准 sha256sum 清单（SHA256SUMS），
+# 下载到的内容必须与清单逐项吻合，否则中止——绝不执行没核对过的内容。
+#
+# 清单格式（标准 `sha256sum` 输出）：
+#   <64 位十六进制>␠␠<相对路径>   单空格 / TAB 均可，`*` 二进制前缀可有可无
+#   `#` 注释行与空行忽略；无法解析的行忽略
+# 语义：
+#   清单可得且可解析        → 逐项比对；哈希不符、清单里缺条目 → 中止
+#   清单可得但解析不出条目  → 当作该来源没有清单（换下一个候选来源）
+#   清单不可得              → 每个来源各 warn 一次后按原行为继续
+#   清单不可得 + REQUIRE=1  → 中止
+# 位置：在“内容已选定”之后、执行之前校验；不参与也不改变候选源的抢速与择优结果。
+# 已知限制：清单只做直连抓取（短超时、每个来源一次）。必须走代理才能访问更新源的
+# 环境，请显式设置 SBX_UPDATE_SHA256SUMS，或用 REQUIRE=1 避免“取不到就跳过”。
+
+# 清单缓存目录（一次更新内复用）。
+# 注意：必须当副作用函数用（直接调用后读 $MANAGER_SUMS_DIR），
+# 写成 dir="$(manager_sums_dir)" 的话赋值发生在子 shell 里，
+# 每次调用都会新建一个临时目录 —— 缓存失效且目录残留。
+manager_sums_dir(){
+  if [[ -z "${MANAGER_SUMS_DIR:-}" ]]; then
+    MANAGER_SUMS_DIR="$(mktemp -d "${TMPDIR:-/tmp}/sbx-manager-sums.XXXXXX")" || return 1
+  fi
+  return 0
+}
+
+manager_sums_cleanup(){
+  if [[ -n "${MANAGER_SUMS_DIR:-}" && -d "$MANAGER_SUMS_DIR" ]]; then
+    rm -rf "$MANAGER_SUMS_DIR"
+  fi
+  MANAGER_SUMS_DIR=""
+  return 0
+}
+
+# 把来源地址压成安全文件名（缓存键）
+manager_sums_key(){
+  printf '%s' "$1" | tr -c 'A-Za-z0-9._-' '_'
+}
+
+# 清单是否至少含一条可解析条目（与 install.sh 的 checksum_manifest_valid 等价：
+# 取到一坨 HTML/报错页但解析不出任何条目时，按“这个来源没有清单”处理，换下一个来源）
+manager_sums_valid(){
+  [[ -n "$(manager_sums_parse < "$1")" ]]
+}
+
+# 取 $1（候选源根地址）对应的清单，成功时把清单内容写到 stdout。
+# 成败都留缓存标记：同一来源不会被取第二次（失败重试只会白等一次超时）。
+manager_sums_for_base(){
+  local base="$1" dir cache tmpf url
+  manager_sums_dir || return 1
+  dir="$MANAGER_SUMS_DIR"
+  local key
+  key="$(manager_sums_key "${base:-$UPDATE_BASE}")"
+  cache="$dir/$key"
+  if [[ -f "$cache" ]]; then cat "$cache"; return 0; fi
+  if [[ -f "$cache.miss" ]]; then return 1; fi
+
+  tmpf="$cache.part"
+  rm -f "$tmpf"
+  if [[ -n "$UPDATE_CHECKSUMS" && -f "$UPDATE_CHECKSUMS" ]]; then
+    # 显式给了本地路径：直接读，不依赖 curl 是否支持 file://
+    cp -f "$UPDATE_CHECKSUMS" "$tmpf" 2>/dev/null || true
+  else
+    if [[ -n "$UPDATE_CHECKSUMS" ]]; then
+      url="$UPDATE_CHECKSUMS"
+    else
+      url="$(manager_bust_url "${base%/}/SHA256SUMS")"
+    fi
+    curl -fsSL --connect-timeout "$UPDATE_SUMS_TIMEOUT" --max-time "$UPDATE_SUMS_TIMEOUT" \
+      "$url" -o "$tmpf" 2>/dev/null || true
+  fi
+  if [[ -s "$tmpf" ]] && manager_sums_valid "$tmpf"; then
+    mv -f "$tmpf" "$cache"
+    # 记下这份清单是从哪取的（把来源写文件而不是变量：取清单发生在命令替换的子 shell 里，
+    # 变量赋值传不回父 shell）。父 shell 靠它给出可复现的报错信息。
+    printf '%s\n' "${url:-$UPDATE_CHECKSUMS}" > "$dir/source" 2>/dev/null || true
+    cat "$cache"
+    return 0
+  fi
+  rm -f "$tmpf"
+  : > "$cache.miss"
+  return 1
+}
+
+# 按“产出更新内容的来源优先、其余候选垫后”的顺序取清单，成功时输出清单内容。
+# 取不到的来源各 warn 一次（同一来源不会重复 warn：取不到会被缓存为 miss）。
+manager_sums_find(){
+  local first="$1" base line
+  local -a bases=()
+  if [[ -n "$UPDATE_CHECKSUMS" ]]; then
+    # 显式指定清单时它与候选源无关（所有来源共用同一份），只需取一次
+    if manager_sums_for_base "${first:-$UPDATE_BASE}"; then return 0; fi
+    return 1
+  fi
+  if [[ -n "$first" ]]; then bases+=("$first"); fi
+  while IFS= read -r line; do
+    [[ -n "$line" ]] || continue
+    if [[ "$line" == "$first" ]]; then continue; fi
+    bases+=("$line")
+  done < <(manager_candidate_bases)
+  for base in ${bases[@]+"${bases[@]}"}; do
+    if manager_sums_for_base "$base"; then return 0; fi
+    warn "校验清单不可用（取不到或不是合法的 sha256sum 清单）: ${base%/}/SHA256SUMS"
+  done
+  return 1
+}
+
+# 解析清单（stdin）→ 规范化为 "<小写哈希>\t<相对路径>"；跳过注释/空行/无法解析的行
+manager_sums_parse(){
+  local line sum path
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    line="${line%$'\r'}"
+    line="${line#"${line%%[![:space:]]*}"}"     # 去首部空白
+    line="${line%"${line##*[![:space:]]}"}"     # 去尾部空白
+    [[ -n "$line" ]] || continue
+    if [[ "${line:0:1}" == "#" ]]; then continue; fi
+    if [[ "${line:0:1}" == '\' ]]; then line="${line:1}"; fi   # GNU sha256sum 的转义前缀
+    if [[ "$line" =~ ^([0-9A-Fa-f]{64})[[:space:]]+\*?(.+)$ ]]; then
+      sum="$(printf '%s' "${BASH_REMATCH[1]}" | tr 'A-F' 'a-f')"
+      path="${BASH_REMATCH[2]}"
+    else
+      continue
+    fi
+    path="${path%$'\r'}"
+    path="${path#"${path%%[![:space:]]*}"}"
+    path="${path%"${path##*[![:space:]]}"}"
+    path="${path#./}"
+    printf '%s\t%s\n' "$sum" "$path"
+  done
+}
+
+# 在规范化清单 $2 里查 $1（相对路径）的哈希
+manager_sums_lookup(){
+  local want="$1" entries="$2" sum path
+  want="${want#./}"
+  while IFS=$'\t' read -r sum path; do
+    if [[ "$path" == "$want" ]]; then
+      printf '%s\n' "$sum"
+      return 0
+    fi
+  done <<<"$entries"
+  return 1
+}
+
+# 校验本次更新下载的内容；返回 0 才允许执行，返回 1 = 中止。
+# 入口包装：无论走哪条分支都清掉临时清单目录。
+manager_verify_manifest(){
+  local rc=0
+  manager_manifest_check "$1" "$2" "$3" || rc=$?
+  manager_sums_cleanup
+  return "$rc"
+}
+
+manager_manifest_check(){
+  local src="$1" rel="$2" file="$3" raw="" entries="" got="" actual="" sums_src=""
+
+  # 先在“当前 shell”建好清单缓存目录：下面 raw="$(manager_sums_find ...)" 是命令替换，
+  # 在子 shell 里 mktemp 出来的路径父 shell 看不到（收尾时删不掉、缓存也复用不上）。
+  manager_sums_dir || return 1
+
+  if ! command -v sha256sum >/dev/null 2>&1; then
+    # 没有 sha256sum 就无法做任何哈希校验：REQUIRE=1 中止，否则显式警告后放行
+    if [[ "$UPDATE_REQUIRE_CHECKSUM" == "1" ]]; then
+      warn "SBX_UPDATE_REQUIRE_CHECKSUM=1 但系统没有 sha256sum，已中止更新。"
+      return 1
+    fi
+    warn "系统没有 sha256sum，无法校验更新内容完整性（建议安装 coreutils）。"
+    return 0
+  fi
+
+  if raw="$(manager_sums_find "$src")"; then
+    sums_src="$(cat "$MANAGER_SUMS_DIR/source" 2>/dev/null || true)"
+    sums_src="${sums_src:-未知}"
+    entries="$(printf '%s\n' "$raw" | manager_sums_parse)"
+    if ! got="$(manager_sums_lookup "$rel" "$entries")"; then
+      warn "校验清单里没有 $rel 的条目（清单来源 $sums_src），拒绝执行无法核对的更新，已中止。"
+      return 1
+    fi
+    actual="$(sha256sum "$file" 2>/dev/null | cut -d' ' -f1 || true)"
+    if [[ "$actual" != "$got" ]]; then
+      warn "$rel 校验和不匹配（清单 $got，实际 ${actual:-空}；清单来源 $sums_src），已中止更新。"
+      return 1
+    fi
+    info "$rel 已通过校验清单核对（清单来源 $sums_src）。"
+    return 0
+  fi
+
+  if [[ "$UPDATE_REQUIRE_CHECKSUM" == "1" ]]; then
+    warn "SBX_UPDATE_REQUIRE_CHECKSUM=1 但取不到校验清单，已中止更新（未做任何改动）。"
+    return 1
+  fi
+  warn "取不到校验清单（已尝试全部候选更新源），跳过完整性校验继续更新；要强制校验请设 SBX_UPDATE_REQUIRE_CHECKSUM=1。"
+  return 0
+}
+
 manager_update(){
   command -v curl >/dev/null 2>&1 || die "更新需要 curl。"
   local quiet=0 force=0 arg local_v remote_v tmp
@@ -369,6 +578,14 @@ manager_update(){
     ((quiet)) || info "install.sh 校验和匹配。"
   fi
 
+  # 清单式完整性校验（默认开启）：内容已经选定，执行之前必须核对；
+  # 不通过就直接中止，绝不会执行没核对过的内容。
+  if ! manager_verify_manifest "$src" install.sh "$tmp"; then
+    rm -f "$tmp"
+    trap - RETURN
+    return 1
+  fi
+
   # 调用方可能是 `manager_update || true`（交互菜单），那个上下文会抑制 errexit，
   # 所以必须显式检查退出码，不能依赖 set -e。
   local rc=0
@@ -398,9 +615,38 @@ manager_update(){
 
   # 只比对 VERSION 不足以说明安装完整，必须同时确认代码文件到位
   # （install.sh 已把 VERSION 放在最后安装，两者互为印证）。
-  local missing="" f
-  for f in bin/sbx lib/sbx_nodes.py lib/sbx_update.sh lib/sbx_verify.py lib/sbx_docker_network.sh VERSION; do
-    [[ -s "$HOME_DIR/$f" ]] || missing+="$f "
+  #
+  # 清单与 install.sh 的 SOURCE_REQUIRED 保持同步；改动时两处一起改。
+  # 这里只能是静态列表：install.sh 不在安装目录里，无法动态读取。
+  # 已确认不存在“合法缺失”：install.sh 对所有模式（含 SBX_MANAGER_ONLY=1 的
+  # manager-only 更新）都无条件安装这 17 项（compose.yml / .env.example /
+  # config/config.example.json 也在其中），所以缺任何一项都按失败处理。
+  local -a required=(
+    "compose.yml"
+    ".env.example"
+    "config/config.example.json"
+    "bin/sbx"
+    "lib/sbx_nodes.py"
+    "lib/sbx_v3.sh"
+    "lib/sbx_proxy.sh"
+    "lib/sbx_bootstrap.sh"
+    "lib/sbx_image.sh"
+    "lib/sbx_inbound.sh"
+    "lib/sbx_docker_network.sh"
+    "lib/sbx_docker_targets.py"
+    "bin/sbx-docker-watch"
+    "lib/sbx_verify.py"
+    "lib/sbx_update.sh"
+    "bin/sbx-install"
+    "VERSION"
+  )
+  local missing="" f target
+  for f in "${required[@]}"; do
+    # bin/sbx-install 不在 $HOME_DIR 下：install.sh 用 INSTALLER_LINK 安装它
+    # （默认 /usr/local/bin/sbx-install，自更新时透传为 $UPDATE_INSTALLER_LINK）。
+    target="$HOME_DIR/$f"
+    if [[ "$f" == "bin/sbx-install" ]]; then target="$UPDATE_INSTALLER_LINK"; fi
+    [[ -s "$target" ]] || missing+="$f "
   done
   if [[ -n "$missing" ]]; then
     warn "管理器更新不完整，缺少或为空: $missing"
@@ -468,14 +714,18 @@ EOF
     return 0
   fi
 
+  # 单元名从路径派生：SBX_UPDATE_SERVICE_FILE/SBX_UPDATE_TIMER_FILE 可被环境变量改路径，
+  # 写死默认单元名会出现“文件写到 A、systemd 却在操作默认单元”。
+  local timer_unit
+  timer_unit="$(basename "$UPDATE_TIMER_FILE")"
   systemctl daemon-reload
-  systemctl enable --now singbox-manager-update.timer
+  systemctl enable --now "$timer_unit"
   info "自动更新已开启。"
 }
 
 manager_auto_off(){
   if command -v systemctl >/dev/null 2>&1 && [[ "${SBX_UPDATE_NO_APPLY:-0}" != "1" ]]; then
-    systemctl disable --now singbox-manager-update.timer >/dev/null 2>&1 || true
+    systemctl disable --now "$(basename "$UPDATE_TIMER_FILE")" >/dev/null 2>&1 || true
   fi
   rm -f "$UPDATE_SERVICE_FILE" "$UPDATE_TIMER_FILE"
   if command -v systemctl >/dev/null 2>&1 && [[ "${SBX_UPDATE_NO_APPLY:-0}" != "1" ]]; then
@@ -490,8 +740,10 @@ manager_auto_status(){
   if [[ -f "$UPDATE_TIMER_FILE" ]]; then
     printf '自动更新: CONFIGURED\n'
     if command -v systemctl >/dev/null 2>&1; then
-      systemctl is-enabled singbox-manager-update.timer 2>/dev/null | sed 's/^/systemd:   /' || true
-      systemctl list-timers singbox-manager-update.timer --no-pager 2>/dev/null || true
+      local timer_unit
+      timer_unit="$(basename "$UPDATE_TIMER_FILE")"
+      systemctl is-enabled "$timer_unit" 2>/dev/null | sed 's/^/systemd:   /' || true
+      systemctl list-timers "$timer_unit" --no-pager 2>/dev/null || true
     fi
   else
     printf '自动更新: OFF\n'
@@ -566,6 +818,8 @@ sbx-install                     获取最新 install.sh 并执行完整安装/�
 
 可用的环境变量（用于固定更新源/校验内容/调整抢速）：
 SBX_UPDATE_REPO / SBX_UPDATE_BRANCH / SBX_UPDATE_BASE_URL   替换更新源（可指向自己的镜像或 tag）
+SBX_UPDATE_SHA256SUMS=<url|路径>                            校验清单：更新内容必须与清单逐项吻合
+SBX_UPDATE_REQUIRE_CHECKSUM=1                               取不到清单就直接中止（默认警告后继续）
 SBX_UPDATE_SHA256=<sha256>                                  校验 install.sh 后再执行
 SBX_SOURCE_MIRRORS=<base>                                   附加候选源（参与抢速，空格或逗号分隔）
 SBX_MIRROR_PRESET=1                                         额外加入公共 GitHub 加速站参与抢速（默认关闭）
@@ -684,7 +938,7 @@ EOF
     read -r -p '请选择: ' x || return
     case "$x" in
       1) read -r -p 'sing-box 目标版本: ' v; [[ -n "$v" ]] && { upgrade "$v" || true; } ;;
-      2) pull || true ;;
+      2) pull || warn "镜像拉取/配置校验未通过，已中止（详见上方输出）。" ;;
       3) manager_check || true ;;
       4) manager_update || true ;;
       5) manager_update --force || true ;;
@@ -771,7 +1025,7 @@ menu(){
 EOF
     menu_block '接入' <<'EOF'
    5  入口路由    多个入口绑定出口
-   6  宿主机代理  让 Docker/Git/APT 走代理
+   6  宿主机代理  让 Docker/Git/APT/npm/curl 走代理
    7  容器接入    其它容器共享出口
 EOF
     menu_block '维护' <<'EOF'
@@ -815,7 +1069,7 @@ sbx import uri|file                  分享链接 / 文件导入
 sbx subscription                     订阅管理
 sbx strategy manual|auto
 sbx route global|cn-direct-lite|cn-direct-full
-sbx proxy                            Docker/Git/APT/npm 应用代理
+sbx proxy                            Docker/Git/APT/npm/curl 应用代理
 sbx image status|bootstrap|pull|load
 sbx manager                          管理器更新菜单
 sbx manager check|update
@@ -840,6 +1094,9 @@ main(){
   local lightweight=0
   case "$cmd" in
     manager|self-update|doctor) lightweight=1 ;;
+    # help/version 只打印文本或读 VERSION，不需要 docker；
+    # 排障时必须能跑，否则 docker daemon 一挂连帮助都看不到。
+    help|-h|--help|version|-v|--version) lightweight=1 ;;
     proxy)
       case "${1:-menu}:${2:-}" in
         status:*|env:*|help:*|-h:*|--help:*|*:off) lightweight=1 ;;

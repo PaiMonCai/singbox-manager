@@ -9,6 +9,13 @@ ENV_FILE="${SBX_ENV_FILE:-$HOME_DIR/.env}"
 SOURCE_MIRRORS="${SBX_SOURCE_MIRRORS:-}"
 MIRROR_PRESET="${SBX_MIRROR_PRESET:-0}"
 RACE_TIMEOUT="${SBX_INSTALL_RACE_TIMEOUT:-25}"
+# 内容完整性（SHA256 清单）：
+#   SBX_SOURCE_SHA256SUMS  清单地址或本地路径；留空时默认 <候选源 base>/SHA256SUMS
+#   SBX_REQUIRE_CHECKSUM=1 严格模式：清单不可得时中止
+CHECKSUM_URL="${SBX_SOURCE_SHA256SUMS:-}"
+REQUIRE_CHECKSUM="${SBX_REQUIRE_CHECKSUM:-0}"
+CHECKSUM_TIMEOUT="${SBX_INSTALL_CHECKSUM_TIMEOUT:-10}"
+CHECKSUM_CONNECT_TIMEOUT="${SBX_INSTALL_CHECKSUM_CONNECT_TIMEOUT:-5}"
 
 if [[ ${EUID:-$(id -u)} -ne 0 ]]; then
   if command -v sudo >/dev/null 2>&1; then
@@ -19,7 +26,12 @@ if [[ ${EUID:-$(id -u)} -ne 0 ]]; then
 fi
 
 tmp="$(mktemp /tmp/sbx-install.XXXXXX.sh)"
-cleanup(){ rm -f "$tmp"; return 0; }
+checksum_dir=""
+cleanup(){
+  rm -f "$tmp"
+  if [[ -n "$checksum_dir" ]]; then rm -rf "$checksum_dir"; fi
+  return 0
+}
 trap cleanup EXIT
 
 detect_proxy(){
@@ -96,6 +108,197 @@ bust_url(){
     http://*|https://*) printf '%s?sbx=%s\n' "$1" "$(date +%s)" ;;
     *) printf '%s\n' "$1" ;;
   esac
+}
+
+# ── 下载内容的密码学校验（sha256sum 清单）────────────────────────────────────
+# 清单格式与 sha256sum 输出一致：<64 位十六进制><空格><相对路径>；容忍多个空格、
+# '*' 前缀（二进制模式）、'#' 注释行与空行。
+# 语义：清单可得 → install.sh 必须校验通过，哈希不符/清单缺条目 → 否决该候选源并换下一个；
+#       清单不可得（404/网络失败/超时）或不可解析 → 每个源只提醒一次，按原有行为继续；
+#       SBX_REQUIRE_CHECKSUM=1（严格模式）→ 没有候选源能提供可用清单时中止。
+CHECKSUM_CACHE_KEYS=()
+CHECKSUM_CACHE_FILES=()
+CHECKSUM_MANIFEST_FILE=""
+CHECKSUM_WARNED=0
+RACE_WINNER=""
+
+hash_file(){ # file → sha256（小写十六进制）
+  local file="$1"
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum "$file" | awk '{print $1}'
+  elif command -v shasum >/dev/null 2>&1; then
+    shasum -a 256 "$file" | awk '{print $1}'
+  else
+    python3 - "$file" <<'PY'
+import hashlib
+import sys
+h = hashlib.sha256()
+with open(sys.argv[1], 'rb') as fh:
+    for chunk in iter(lambda: fh.read(1 << 20), b''):
+        h.update(chunk)
+print(h.hexdigest())
+PY
+  fi
+}
+
+checksum_manifest_valid(){ # manifest → 0 表示至少能解析出一条有效条目
+  local manifest="$1" line hash rest count=0
+  [[ -s "$manifest" ]] || return 1
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    line="${line%$'\r'}"
+    [[ "$line" =~ [^[:space:]] ]] || continue
+    [[ "$line" == '#'* ]] && continue
+    hash="${line%%[[:space:]]*}"
+    [[ "$hash" =~ ^[0-9a-fA-F]{64}$ ]] || continue
+    rest="${line#"$hash"}"
+    rest="${rest#"${rest%%[![:space:]]*}"}"
+    [[ -n "$rest" ]] || continue
+    count=$((count+1))
+  done < "$manifest"
+  (( count > 0 ))
+}
+
+checksum_lookup(){ # manifest path → 期望的 sha256（小写）；找不到返回 1
+  local manifest="$1" want="$2" line hash rest
+  [[ -f "$manifest" ]] || return 1
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    line="${line%$'\r'}"
+    [[ "$line" =~ [^[:space:]] ]] || continue
+    [[ "$line" == '#'* ]] && continue
+    hash="${line%%[[:space:]]*}"
+    [[ "$hash" =~ ^[0-9a-fA-F]{64}$ ]] || continue
+    rest="${line#"$hash"}"
+    rest="${rest#"${rest%%[![:space:]]*}"}"
+    rest="${rest#\*}"
+    rest="${rest#./}"
+    [[ "$rest" == "$want" ]] || continue
+    printf '%s\n' "${hash,,}"
+    return 0
+  done < "$manifest"
+  return 1
+}
+
+checksum_fetch_manifest(){ # url dest（短超时；本地路径直接复制）
+  local url="$1" dest="$2" src
+  case "$url" in
+    http://*|https://*)
+      curl ${RACE_CURL_EXTRA[@]+"${RACE_CURL_EXTRA[@]}"} -fsSL \
+        --connect-timeout "$CHECKSUM_CONNECT_TIMEOUT" --max-time "$CHECKSUM_TIMEOUT" \
+        "$(bust_url "$url")" -o "$dest" 2>/dev/null
+      ;;
+    file://*)
+      src="${url#file://}"
+      cp -f "$src" "$dest" 2>/dev/null
+      ;;
+    *)
+      [[ -f "$url" ]] || return 1
+      cp -f "$url" "$dest" 2>/dev/null
+      ;;
+  esac
+}
+
+checksum_manifest_for_base(){ # base → 0/1；成功时把清单本地路径写进 CHECKSUM_MANIFEST_FILE。每个源只取一次
+  local base="$1" key url dest i seq
+  CHECKSUM_MANIFEST_FILE=""
+  if [[ -n "$CHECKSUM_URL" ]]; then
+    key="__explicit__"
+    url="$CHECKSUM_URL"
+  else
+    key="${base%/}"
+    url="${key}/SHA256SUMS"
+  fi
+  key="${key}|${RACE_CURL_EXTRA[*]+${RACE_CURL_EXTRA[*]}}"
+  for ((i=0;i<${#CHECKSUM_CACHE_KEYS[@]};i++)); do
+    [[ "${CHECKSUM_CACHE_KEYS[$i]}" == "$key" ]] || continue
+    [[ -n "${CHECKSUM_CACHE_FILES[$i]}" ]] || return 1
+    CHECKSUM_MANIFEST_FILE="${CHECKSUM_CACHE_FILES[$i]}"
+    return 0
+  done
+  if [[ -z "$checksum_dir" ]]; then checksum_dir="$(mktemp -d "${TMPDIR:-/tmp}/sbx-install-sum.XXXXXX")"; fi
+  seq=${#CHECKSUM_CACHE_KEYS[@]}
+  dest="$checksum_dir/list.$seq"
+  CHECKSUM_CACHE_KEYS+=("$key")
+  CHECKSUM_CACHE_FILES+=("")
+  if checksum_fetch_manifest "$url" "$dest" && checksum_manifest_valid "$dest"; then
+    CHECKSUM_CACHE_FILES[$(( ${#CHECKSUM_CACHE_FILES[@]} - 1 ))]="$dest"
+    CHECKSUM_MANIFEST_FILE="$dest"
+    return 0
+  fi
+  rm -f "$dest"
+  return 1
+}
+
+checksum_warn_missing(){ # url；同一个来源只提醒一次
+  if [[ "$CHECKSUM_WARNED" == "1" ]]; then return 0; fi
+  CHECKSUM_WARNED=1
+  printf '[WARN] 未找到校验清单，跳过完整性校验（%s）：如需强制校验请设置 SBX_SOURCE_SHA256SUMS=<清单地址> SBX_REQUIRE_CHECKSUM=1。\n' "$1" >&2
+  return 0
+}
+
+# 校验候选 install.sh：0=通过；1=否决该候选（哈希不符/清单缺条目）；2=严格模式下无清单；3=清单不可得
+verify_installer(){ # file winner_url
+  local file="$1" url="$2" base="" manifest="" expected="" actual=""
+  base="${url%/install.sh}"
+  [[ "$url" == "$base" ]] && base="${url%/*}"
+  if ! checksum_manifest_for_base "$base"; then
+    if [[ "$REQUIRE_CHECKSUM" == "1" ]]; then return 2; fi
+    return 3
+  fi
+  manifest="$CHECKSUM_MANIFEST_FILE"
+  if ! expected="$(checksum_lookup "$manifest" "install.sh")"; then
+    printf '[ERROR] 校验清单里没有 install.sh 的条目：%s\n' "${base%/}/SHA256SUMS" >&2
+    return 1
+  fi
+  actual="$(hash_file "$file")"
+  if [[ "$actual" != "$expected" ]]; then
+    printf '[ERROR] 完整性校验失败：install.sh 的 sha256 与清单不符（期望 %s，实际 %s，来源 %s）\n' \
+      "$expected" "$actual" "$url" >&2
+    return 1
+  fi
+  printf '[INFO] 完整性校验通过: install.sh（%s）\n' "${base%/}/SHA256SUMS"
+  return 0
+}
+
+# 抢速 + 按该候选自己的 base 校验：哈希不符的候选被否决后换下一个继续抢速；
+# 宽松模式下清单不可得时保持原行为（谁快谁胜出），严格模式下没有可校验的候选就中止。
+race_fetch_verified(){ # dest urls...；成功时把胜出地址写进 RACE_WINNER
+  local dest="$1"; shift
+  local -a pool=("$@") next=()
+  local winner="" rc=0 rejected=0 unavailable=0 u
+  RACE_WINNER=""
+  (( ${#pool[@]} )) || return 1
+  while (( ${#pool[@]} > 0 )); do
+    winner="$(race_fetch "$dest" ${pool[@]+"${pool[@]}"})" || break
+    rc=0
+    verify_installer "$dest" "$winner" || rc=$?
+    if (( rc == 0 )); then RACE_WINNER="$winner"; return 0; fi
+    if (( rc == 3 )); then
+      # 清单不可得：宽松模式按原行为继续（第一个胜出者即结果），严格模式换下一个候选
+      if [[ "$REQUIRE_CHECKSUM" != "1" ]]; then
+        checksum_warn_missing "$winner"
+        RACE_WINNER="$winner"
+        return 0
+      fi
+      printf '[WARN] 源 %s 无法提供校验清单，严格模式下改用其它候选源。\n' "$winner" >&2
+      unavailable=$((unavailable+1))
+    else
+      printf '[WARN] 已否决完整性校验失败的候选源：%s\n' "$winner" >&2
+      rejected=$((rejected+1))
+    fi
+    next=()
+    for u in ${pool[@]+"${pool[@]}"}; do
+      [[ "$u" == "$winner" ]] || next+=("$u")
+    done
+    pool=(${next[@]+"${next[@]}"})
+  done
+  if (( unavailable > 0 )); then
+    printf '[ERROR] 严格校验模式（SBX_REQUIRE_CHECKSUM=1）下没有任何候选源提供可用的校验清单，已中止。\n' >&2
+    exit 1
+  fi
+  if (( rejected > 0 )); then
+    printf '[ERROR] 所有候选源下载的 install.sh 都未通过完整性校验，已拒绝执行。\n' >&2
+  fi
+  return 1
 }
 
 # 读入候选 install.sh 地址，按"该源报告的版本是否最新"重排：
@@ -234,13 +437,15 @@ fetch_installer(){
   fi
 
   RACE_CURL_EXTRA=()
-  if (( ${#fresh[@]} )) && winner="$(race_fetch "$tmp" ${fresh[@]+"${fresh[@]}"})"; then
+  if (( ${#fresh[@]} )) && race_fetch_verified "$tmp" ${fresh[@]+"${fresh[@]}"}; then
+    winner="$RACE_WINNER"
     printf '[INFO] 安装器来源: %s\n' "$winner"
     return 0
   fi
   if (( ${#fresh[@]} < ${#all[@]} )); then
     printf '[WARN] 报告最新版本的来源都没取到，改用其余候选源重试。\n' >&2
-    if winner="$(race_fetch "$tmp" ${all[@]+"${all[@]}"})"; then
+    if race_fetch_verified "$tmp" ${all[@]+"${all[@]}"}; then
+      winner="$RACE_WINNER"
       printf '[INFO] 安装器来源: %s（可能命中 CDN 缓存）\n' "$winner"
       return 0
     fi
@@ -248,7 +453,8 @@ fetch_installer(){
   # 直连都失败：可能是 ~/.curlrc 里配了代理而 sing-box 没在运行，用 -q 忽略配置再试
   printf '[WARN] 直连不可用，忽略 curl 配置（-q）重试一轮...\n' >&2
   RACE_CURL_EXTRA=(-q)
-  if winner="$(race_fetch "$tmp" ${all[@]+"${all[@]}"})"; then
+  if race_fetch_verified "$tmp" ${all[@]+"${all[@]}"}; then
+    winner="$RACE_WINNER"
     printf '[INFO] 安装器来源: %s（忽略 curl 配置）\n' "$winner"
     return 0
   fi
@@ -258,11 +464,13 @@ fetch_installer(){
   if [[ -n "$proxy_url" ]]; then
     printf '[WARN] 直连更新源失败，尝试本机 sing-box: %s\n' "$proxy_url" >&2
     RACE_CURL_EXTRA=(--proxy "$proxy_url")
-    if (( ${#fresh[@]} )) && winner="$(race_fetch "$tmp" ${fresh[@]+"${fresh[@]}"})"; then
+    if (( ${#fresh[@]} )) && race_fetch_verified "$tmp" ${fresh[@]+"${fresh[@]}"}; then
+      winner="$RACE_WINNER"
       printf '[INFO] 安装器来源: %s（经本机代理）\n' "$winner"
       return 0
     fi
-    if (( ${#fresh[@]} < ${#all[@]} )) && winner="$(race_fetch "$tmp" ${all[@]+"${all[@]}"})"; then
+    if (( ${#fresh[@]} < ${#all[@]} )) && race_fetch_verified "$tmp" ${all[@]+"${all[@]}"}; then
+      winner="$RACE_WINNER"
       printf '[INFO] 安装器来源: %s（经本机代理）\n' "$winner"
       return 0
     fi

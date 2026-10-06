@@ -6,7 +6,6 @@ import getpass
 import ipaddress
 import json
 import os
-import re
 import secrets
 import sys
 import time
@@ -75,9 +74,13 @@ def eprint(*args: Any) -> None:
 def atomic_json(path: Path, data: Any, mode: int = 0o600) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(path.suffix + ".tmp")
-    with tmp.open("w", encoding="utf-8") as f:
+    # 临时文件必须「创建即 mode」：path.open("w") 会按 umask 落成 0644，
+    # 写入含密码/UUID 的明文后再 chmod 存在可读窗口，被 kill 还会永久留下 0644 临时文件。
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, mode)
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
         f.write("\n")
+    # O_CREAT 的 mode 对「已存在的临时文件」无效，仍要在 replace 前补一次收敛。
     os.chmod(tmp, mode)
     os.replace(tmp, path)
 
@@ -118,7 +121,10 @@ def write_env_value(key: str, value: str) -> None:
     if not found:
         out.append(f"{key}={value}")
     tmp = ENV_FILE.with_name(ENV_FILE.name + ".tmp")
-    tmp.write_text("\n".join(out) + "\n", encoding="utf-8")
+    # 与 atomic_json 一致：临时文件创建即 600，避免 .env 内容出现短暂的 0644 窗口。
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        f.write("\n".join(out) + "\n")
     os.chmod(tmp, 0o600)
     os.replace(tmp, ENV_FILE)
     os.chmod(ENV_FILE, 0o600)
@@ -429,12 +435,12 @@ def choose_target(data: Dict[str, Any], current: Optional[Dict[str, Any]] = None
         print("无效出口。")
 
 
-def validate_listen_address(value: str, interactive: bool = False) -> str:
+def validate_listen_address(value: str, interactive: bool = False, confirm_public: bool = True) -> str:
     try:
         addr = ipaddress.ip_address(value)
     except ValueError as exc:
         raise ValueError("入口监听地址必须是 IP 地址") from exc
-    if not addr.is_loopback:
+    if confirm_public and not addr.is_loopback:
         if not interactive:
             raise ValueError("非回环监听必须使用交互式入口管理并输入 PUBLIC 确认")
         confirm = prompt("非回环监听会暴露无认证 mixed 代理；输入 PUBLIC 确认")
@@ -482,9 +488,14 @@ def build_inbound(data: Dict[str, Any], existing: Optional[Dict[str, Any]] = Non
     if any(x.get("name") == name and x.get("id") != inbound_id for x in data.get("inbounds", [])):
         raise ValueError(f"入口名称重复: {name}")
 
+    previous_listen = existing.get("listen")
     if listen is None:
         listen = prompt("宿主机监听地址", existing.get("listen", "127.0.0.1"), True)
-    listen = validate_listen_address(listen, interactive=interactive)
+    # 只有监听地址真的变了才要求非回环的 PUBLIC 确认：非交互编辑出口
+    # （inbound edit 2 --target direct）会沿用既有 listen，不能因为既有值本身就是
+    # 0.0.0.0 就拒掉整次编辑；反过来，非交互地把回环改成非回环仍然必须报错。
+    listen_changed = previous_listen in (None, "") or str(listen) != str(previous_listen)
+    listen = validate_listen_address(listen, interactive=interactive, confirm_public=listen_changed)
 
     if port is None:
         port = prompt_port("入口端口", int(existing.get("port") or next_inbound_port(data)))
@@ -525,6 +536,19 @@ def repair_inbound_targets(data: Dict[str, Any], removed_ids: Iterable[str],
         new_id = replacements.get(str(old_id))
         inbound["target"] = {"type": "node", "node_id": new_id} if new_id else dict(fallback)
         changed += 1
+    # 默认入口的出口存在 settings 里（不是 inbounds），必须一起修：
+    # 漏掉它会让 target_tag 在每次 render/validate 时抛「引用的节点不存在」，整库永久失败。
+    settings = data.get("settings")
+    if isinstance(settings, dict):
+        target = settings.get("default_inbound_target")
+        if isinstance(target, dict):
+            if target.get("type") in ("proxy", "auto") and not data.get("nodes"):
+                settings["default_inbound_target"] = dict(fallback)
+                changed += 1
+            elif target.get("type") == "node" and target.get("node_id") in removed:
+                new_id = replacements.get(str(target.get("node_id")))
+                settings["default_inbound_target"] = {"type": "node", "node_id": new_id} if new_id else dict(fallback)
+                changed += 1
     return changed
 
 

@@ -4,7 +4,6 @@ import json
 import os
 import shutil
 import subprocess
-import sys
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -13,13 +12,25 @@ ENV_FILE = HOME / ".env"
 VERSION_FILE = HOME / "VERSION"
 NODE_HELPER = HOME / "lib" / "sbx_nodes.py"
 TARGET_HELPER = HOME / "lib" / "sbx_docker_targets.py"
-MANAGED_FILE = HOME / "docker-managed.json"
+# 与 shell 侧 lib/sbx_docker_network.sh 的 ${SBX_DOCKER_MANAGED_FILE:-$HOME_DIR/docker-managed.json}
+# 保持一致，否则用户自定义路径后 doctor 会误报「尚未创建托管清单」。
+MANAGED_FILE = Path(os.environ.get("SBX_DOCKER_MANAGED_FILE") or (HOME / "docker-managed.json"))
 SBX_BIN = os.environ.get("SBX_VERIFY_SBX", "/usr/local/bin/sbx")
 NETWORK_DEFAULT = "singbox-proxy"
 
 # managed_rows() 查询失败时会把原因记在这里，
 # 避免把「查不到」当成「没有托管目标」而返回健康状态。
 MANAGED_ROWS_ERROR: Optional[str] = None
+# 同上：endpoints()/docker_json()/network_inspect() 失败时记录真实原因，
+# 调用方据此区分「查询失败」与「结果确实为空」，不要输出确定性结论。
+ENDPOINTS_ERROR: Optional[str] = None
+DOCKER_JSON_ERROR: Optional[str] = None
+NETWORK_INSPECT_ERROR: Optional[str] = None
+
+
+def error_detail(cp: subprocess.CompletedProcess) -> str:
+    text = (cp.stderr or cp.stdout or "").strip().replace("\n", " ")
+    return text[:200] or f"退出码 {cp.returncode}"
 
 
 class Result:
@@ -67,14 +78,26 @@ def env_values() -> Dict[str, str]:
 
 
 def docker_json(ref: str) -> Optional[Dict[str, Any]]:
+    """查询容器。None + DOCKER_JSON_ERROR=None 表示容器确实不存在；
+    None + DOCKER_JSON_ERROR 有值表示查询本身失败（daemon 不可达等）。"""
+    global DOCKER_JSON_ERROR
+    DOCKER_JSON_ERROR = None
     cp = run(["docker", "inspect", ref], 8)
     if cp.returncode:
+        detail = error_detail(cp)
+        # docker 明确回答「没有这个对象」时，才是真的不存在。
+        if "no such container" in detail.lower() or "no such object" in detail.lower():
+            return None
+        DOCKER_JSON_ERROR = detail
         return None
     try:
         data = json.loads(cp.stdout)
-        return data[0] if data else None
-    except Exception:
+    except Exception as exc:
+        DOCKER_JSON_ERROR = f"docker inspect 输出无法解析: {exc}"
         return None
+    if not data:
+        return None
+    return data[0]
 
 
 def container_name(obj: Dict[str, Any]) -> str:
@@ -85,19 +108,30 @@ def network_name() -> str:
     return env_values().get("SING_BOX_DOCKER_NETWORK", NETWORK_DEFAULT)
 
 
-def endpoints() -> List[Dict[str, Any]]:
+def endpoints() -> Optional[List[Dict[str, Any]]]:
+    """返回代理入口列表。None 表示查询失败（原因见 ENDPOINTS_ERROR），
+    [] 才是「确实没有可解析的入口」。"""
+    global ENDPOINTS_ERROR
+    ENDPOINTS_ERROR = None
     cp = run(["python3", str(NODE_HELPER), "inbound-endpoints", "--json"])
     if cp.returncode:
-        return []
+        ENDPOINTS_ERROR = f"代理入口查询失败（helper 退出码 {cp.returncode}）: {error_detail(cp)}"
+        return None
     try:
         data = json.loads(cp.stdout)
-        return data if isinstance(data, list) else []
-    except Exception:
-        return []
+    except Exception as exc:
+        ENDPOINTS_ERROR = f"代理入口查询返回无法解析的内容: {exc}"
+        return None
+    if not isinstance(data, list):
+        ENDPOINTS_ERROR = "代理入口查询返回格式无效"
+        return None
+    return data
 
 
 def resolve_endpoint(ref: str) -> Optional[Dict[str, Any]]:
     items = endpoints()
+    if items is None:
+        return None
     raw = (ref or "default").strip()
     exact = [x for x in items if str(x.get("id")) == raw]
     if len(exact) == 1:
@@ -161,13 +195,20 @@ def managed_inbound_for(name: str) -> Optional[str]:
 
 
 def network_inspect() -> Optional[Dict[str, Any]]:
+    global NETWORK_INSPECT_ERROR
+    NETWORK_INSPECT_ERROR = None
     cp = run(["docker", "network", "inspect", network_name()], 8)
     if cp.returncode:
+        detail = error_detail(cp)
+        if "no such network" in detail.lower():
+            return None
+        NETWORK_INSPECT_ERROR = detail
         return None
     try:
         data = json.loads(cp.stdout)
         return data[0] if data else None
-    except Exception:
+    except Exception as exc:
+        NETWORK_INSPECT_ERROR = f"docker network inspect 输出无法解析: {exc}"
         return None
 
 
@@ -226,7 +267,11 @@ def verify_container(ref: str, inbound_ref: Optional[str] = None, quick: bool = 
 
     obj = docker_json(ref)
     if not obj:
-        result.fail(f"容器不存在: {ref}")
+        if DOCKER_JSON_ERROR:
+            result.fail(f"无法查询容器 {ref}: {DOCKER_JSON_ERROR}")
+            print("      这不等于容器不存在，请先确认 Docker 可用后重试。")
+        else:
+            result.fail(f"容器不存在: {ref}")
         return result.summary()
 
     name = container_name(obj)
@@ -240,6 +285,9 @@ def verify_container(ref: str, inbound_ref: Optional[str] = None, quick: bool = 
     net = network_inspect()
     if net:
         result.ok(f"共享网络存在: {network_name()}")
+    elif NETWORK_INSPECT_ERROR:
+        result.fail(f"无法查询共享网络 {network_name()}: {NETWORK_INSPECT_ERROR}")
+        print("      这不等于共享网络不存在，请先确认 Docker 可用后重试。")
     else:
         result.fail(f"共享网络不存在: {network_name()}")
     members = network_members(net)
@@ -260,7 +308,11 @@ def verify_container(ref: str, inbound_ref: Optional[str] = None, quick: bool = 
     chosen = inbound_ref or managed_id or "default"
     ep = resolve_endpoint(chosen)
     if not ep:
-        result.fail(f"代理入口不存在或已失效: {chosen}")
+        if ENDPOINTS_ERROR:
+            result.fail(f"无法查询代理入口: {ENDPOINTS_ERROR}")
+            print("      这不等于入口不存在或已失效，请先修复上述问题再据此判断。")
+        else:
+            result.fail(f"代理入口不存在或已失效: {chosen}")
         return result.summary()
 
     iid = str(ep.get("id"))
@@ -311,7 +363,9 @@ def verify_container(ref: str, inbound_ref: Optional[str] = None, quick: bool = 
     return result.summary()
 
 
-def verify_all(quick: bool = True) -> int:
+def verify_all(quick: bool = False) -> int:
+    """默认做真实出口探测（与 `docker <容器>` 一致），--quick 才是快路径。
+    默认值与命令行传入值保持一致，避免有人直接调用时静默跳过真实探测。"""
     rows = managed_rows()
     names: List[str] = []
     for row in rows:
@@ -397,11 +451,17 @@ def doctor() -> int:
     obj = docker_json(sbx_name)
     if obj and (obj.get("State") or {}).get("Running"):
         result.ok(f"sing-box 容器运行中: {sbx_name}")
+    elif DOCKER_JSON_ERROR:
+        result.fail(f"无法查询容器 {sbx_name}: {DOCKER_JSON_ERROR}")
+        print("      这不等于容器未运行，请先确认 Docker 可用后重试。")
     else:
         result.fail(f"sing-box 容器未运行: {sbx_name}")
 
     eps = endpoints()
-    if not eps:
+    if eps is None:
+        result.fail(f"无法查询代理入口: {ENDPOINTS_ERROR}")
+        print("      这不等于“没有可解析的代理入口”，请先修复上述问题再据此判断。")
+    elif not eps:
         result.fail("没有可解析的代理入口")
     else:
         for ep in eps:
@@ -414,6 +474,7 @@ def doctor() -> int:
                 print(f"      出口 IP: {detail}")
             else:
                 result.fail(f"入口 [{iid}] {name} :{port} 代理测试失败")
+                print(f"      {detail}")
 
     net = network_inspect()
     if net:
@@ -423,6 +484,9 @@ def doctor() -> int:
             result.ok("sing-box 已接入共享网络")
         else:
             result.fail("sing-box 未接入共享网络")
+    elif NETWORK_INSPECT_ERROR:
+        result.warn(f"无法查询 Docker 共享网络 {network_name()}: {NETWORK_INSPECT_ERROR}")
+        print("      这不等于共享网络不存在，请先确认 Docker 可用后重试。")
     else:
         result.warn(f"Docker 共享网络不存在: {network_name()}")
 
@@ -471,7 +535,6 @@ def main() -> int:
 
     da = sub.add_parser("docker-all")
     da.add_argument("--quick", action="store_true", help="只做结构检查，跳过真实出口探测")
-    da.add_argument("--active", action="store_true", help="兼容保留：真实出口探测本来就是默认行为")
 
     sub.add_parser("doctor")
 
@@ -480,7 +543,7 @@ def main() -> int:
         return verify_container(args.container, args.inbound, args.quick)
     if args.cmd == "docker-all":
         # 与 `docker <容器>` 保持一致：默认做真实探测，--quick 才是快路径
-        return verify_all(quick=args.quick and not args.active)
+        return verify_all(quick=args.quick)
     return doctor()
 
 

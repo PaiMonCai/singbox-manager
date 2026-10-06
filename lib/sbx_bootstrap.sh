@@ -34,12 +34,6 @@ bootstrap_image_repo() {
   printf '%s\n' "$repo"
 }
 
-bootstrap_image_version() {
-  local env_file="${1:-}" fallback="${2:-v1.14.2}" v
-  v="$(grep -E '^SING_BOX_VERSION=' "$env_file" 2>/dev/null | tail -n1 | cut -d= -f2- || true)"
-  printf '%s\n' "${v:-$fallback}"
-}
-
 bootstrap_target_image() {
   local version="$1" env_file="$2"
   printf '%s:%s\n' "$(bootstrap_image_repo "$env_file")" "$version"

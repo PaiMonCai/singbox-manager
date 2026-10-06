@@ -138,7 +138,25 @@ dc(){
   docker compose "${args[@]}" "$@"
 }
 envval(){ grep -E "^$1=" "$ENV" 2>/dev/null | tail -n1 | cut -d= -f2- || printf '%s' "$2"; }
-setenv(){ local k="$1" v="$2" t; t=$(mktemp); awk -v k="$k" -v v="$v" 'BEGIN{f=0} index($0,k"=")==1{print k"="v;f=1;next}{print} END{if(!f)print k"="v}' "$ENV">"$t"; cat "$t">"$ENV"; rm -f "$t"; chmod 600 "$ENV"; }
+setenv(){ # .env 是全量「读-改-写」，并发 sbx 会互相覆盖：整段用 flock 串行化（锁文件固定 $HOME_DIR/.sbx-env.lock）
+  local k="$1" v="$2" t lock="$HOME_DIR/.sbx-env.lock" fd=""
+  if command -v flock >/dev/null 2>&1; then
+    # 先把锁文件打开成 fd，再在整段读-改-写期间持锁；-w 10 限制等待，超时给可读报错。
+    if exec {fd}>"$lock"; then
+      if ! flock -w 10 "$fd"; then
+        exec {fd}>&-
+        die "等待 .env 写锁超时（$lock 正被其它 sbx 进程占用），请稍后重试。"
+      fi
+    else
+      fd=""
+      warn "无法创建锁文件 $lock，本次 .env 写入没有并发保护。"
+    fi
+  else
+    warn "未找到 flock（util-linux），.env 写入没有并发保护，可能与其它 sbx 调用互相覆盖。"
+  fi
+  t=$(mktemp); awk -v k="$k" -v v="$v" 'BEGIN{f=0} index($0,k"=")==1{print k"="v;f=1;next}{print} END{if(!f)print k"="v}' "$ENV">"$t"; cat "$t">"$ENV"; rm -f "$t"; chmod 600 "$ENV"
+  if [[ -n "$fd" ]]; then exec {fd}>&-; fi
+}
 running(){ dc ps --status running --services 2>/dev/null | grep -qx sing-box; }
 status(){ dc ps; }
 stop(){ dc stop sing-box; }
@@ -158,9 +176,22 @@ backup(){
   tar -czf "$f" -C "$t" snapshot; rm -rf "$t"; chmod 600 "$f"; BACKUP_RESULT="$f"; info "备份完成: $f"
 }
 restore_raw(){
-  local f="$1" restore_env="${2:-yes}" t e
+  local f="$1" restore_env="${2:-yes}" t e line name
   while IFS= read -r e; do [[ "$e" != *".."* ]] || die "备份路径不安全"; case "$e" in snapshot|snapshot/|snapshot/config.json|snapshot/nodes.json|snapshot/compose.inbounds.yml|snapshot/compose.network.yml|snapshot/docker-managed.json|snapshot/env) ;; *) die "备份含未知路径: $e";; esac; done < <(tar -tzf "$f")
-  t=$(mktemp -d); tar -xzf "$f" -C "$t"
+  # 成员类型白名单：只接受普通文件与目录。符号链接/硬链接/设备/FIFO 都能在解包阶段
+  # 穿透到白名单目录之外（把 snapshot 做成指向别处的链接，后续成员就写到链接目标），
+  # 必须在 tar -x 之前按类型拒绝。
+  while IFS= read -r line; do
+    [[ -n "$line" ]] || continue
+    # 名字是第 6 个字段起（含空格），这里只用于报错文案；类型看行首字符。
+    read -r _ _ _ _ _ name <<<"$line" || true
+    case "${line:0:1}" in
+      -|d) ;;
+      l|h) die "备份含链接成员（符号链接/硬链接），拒绝恢复: ${name:-$line}";;
+      *) die "备份含特殊成员（设备文件/FIFO 等），拒绝恢复: ${name:-$line}";;
+    esac
+  done < <(tar -tvzf "$f")
+  t=$(mktemp -d); tar -xzf "$f" -C "$t" --no-same-owner
   [[ -f "$t/snapshot/config.json" ]] && install -m600 "$t/snapshot/config.json" "$CONFIG"
   [[ -f "$t/snapshot/nodes.json" ]] && install -m600 "$t/snapshot/nodes.json" "$NODES"
   if [[ -f "$t/snapshot/compose.inbounds.yml" ]]; then install -m600 "$t/snapshot/compose.inbounds.yml" "$INBOUND_COMPOSE"; else rm -f "$INBOUND_COMPOSE"; fi
@@ -204,7 +235,7 @@ http_test(){
   if [[ "$code" != 204 ]]; then code=$(curl --proxy "$p" --connect-timeout 5 --max-time 15 -sS -o /dev/null -w '%{http_code}' https://github.com/ 2>/dev/null || true); [[ "$code" =~ ^(200|301|302)$ ]] || return 1; fi
   ip=$(curl --proxy "$p" --connect-timeout 5 --max-time 10 -sS https://api.ipify.org 2>/dev/null || true); [[ -n "$ip" ]] && info "代理出口 IP: $ip"; return 0
 }
-test_current(){ running || die "sing-box 未运行。"; local port; port=$(envval SING_BOX_MIXED_PORT 7890); http_test "http://127.0.0.1:$port" && info "当前代理测试通过。" || die "当前代理测试失败。"; }
+test_current(){ running || die "sing-box 未运行。"; local port host=127.0.0.1; port=$(envval SING_BOX_MIXED_PORT 7890); declare -F proxy_host >/dev/null 2>&1 && host="$(proxy_host)"; http_test "http://$host:$port" && info "当前代理测试通过。" || die "当前代理测试失败。"; }
 edit(){ local e="${SBX_EDITOR:-${EDITOR:-vi}}"; command -v "$e" >/dev/null || die "找不到编辑器 $e"; backup; warn "config.json 由节点库生成，后续节点操作会覆盖手工改动。"; "$e" "$CONFIG"; check; }
 
 pause(){ read -r -p '按 Enter 返回...' _ || true; }
@@ -246,9 +277,31 @@ EOF
 }
 # 缺任何一个 lib 都要给可读的报错。否则后面只会在 case 分发处报
 # "main: command not found"，或者更糟：静默少掉某个子命令。
-for _lib in sbx_v3.sh sbx_proxy.sh sbx_bootstrap.sh sbx_image.sh sbx_inbound.sh sbx_docker_network.sh sbx_update.sh; do
+SBX_LIBS=(sbx_v3.sh sbx_proxy.sh sbx_bootstrap.sh sbx_image.sh sbx_inbound.sh sbx_docker_network.sh sbx_update.sh)
+for _lib in "${SBX_LIBS[@]}"; do
   [[ -f "$HOME_DIR/lib/$_lib" ]] || die "缺少 $HOME_DIR/lib/$_lib，安装不完整。请重新运行 sbx-install（或把 SBX_HOME 指向正确的安装目录）。"
 done
+# 以 root 运行时，lib 里每一行都以 root 身份执行；而本脚本自己会用 `sudo -E` 把调用者的
+# SBX_HOME 带进 root 会话。若某个用户只被授予「能跑 sbx」的受限 sudo，他就能把 SBX_HOME
+# 指向自己的目录，让 root 加载他写的 lib —— 等于提权。所以在 source 之前先校验 lib 文件
+# 的属主与权限：必须 root 所有，且 group/other 不可写。
+# 只校验文件本身，不校验目录属主：CI 里安装目录可能归 runner 用户所有，lib 是 root 装的 0755。
+if [[ ${EUID:-$(id -u)} -eq 0 && "${SBX_ALLOW_UNSAFE_LIB:-0}" != "1" ]]; then
+  for _lib in "${SBX_LIBS[@]}"; do
+    _libf="$HOME_DIR/lib/$_lib"
+    _mode="$(stat -c '%a' "$_libf" 2>/dev/null || true)"
+    if [[ ! -O "$_libf" ]]; then
+      die "lib 文件可被非 root 用户修改，拒绝以 root 加载: $_libf"
+    elif [[ "$_mode" =~ ^[0-7]{3,4}$ ]]; then
+      (( (8#$_mode & 8#22) == 0 )) || die "lib 文件可被非 root 用户修改，拒绝以 root 加载: $_libf"
+    else
+      warn "无法通过 stat 读取 $_libf 的权限位，仅校验了属主。"
+    fi
+  done
+elif [[ ${EUID:-$(id -u)} -eq 0 ]]; then
+  warn "SBX_ALLOW_UNSAFE_LIB=1：已跳过 lib 属主/权限校验。以 root 加载非 root 所有或可被他人修改的代码，等同于把 root 权限交给对方，请确认目录可信。"
+fi
+unset _lib _libf _mode
 [[ -f "$HOME_DIR/lib/sbx_v3.sh" ]] && source "$HOME_DIR/lib/sbx_v3.sh"
 [[ -f "$HOME_DIR/lib/sbx_proxy.sh" ]] && source "$HOME_DIR/lib/sbx_proxy.sh"
 [[ -f "$HOME_DIR/lib/sbx_bootstrap.sh" ]] && source "$HOME_DIR/lib/sbx_bootstrap.sh"

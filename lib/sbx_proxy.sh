@@ -208,7 +208,9 @@ proxy = $url
 noproxy = $no_proxy
 $PROXY_BLOCK_END
 EOF
-  chmod 644 "$file"
+  # 只在自己新建文件时设权限：用户原有的 ~/.curlrc 可能被有意设成 600（含凭据），
+  # 无条件 chmod 644 会把它放宽。与下面 npm 分支的 ((existed)) || chmod 644 保持一致。
+  ((existed)) || chmod 644 "$file"
   printf '%s\n' "$file" > "$PROXY_STATE_DIR/curlrc"
   if (( existed == 0 )); then printf '1\n' > "$PROXY_STATE_DIR/curlrc-created"; fi
   info "curl 代理已开启: $file"

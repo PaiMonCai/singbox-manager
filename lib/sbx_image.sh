@@ -14,10 +14,6 @@ image_ref() {
   printf '%s:%s\n' "$(image_repo)" "$(image_version)"
 }
 
-image_present() {
-  docker image inspect "$(image_ref)" >/dev/null 2>&1
-}
-
 image_require() {
   local image
   image="$(image_ref)"
@@ -44,7 +40,11 @@ check() {
   image_require || return 1
   image="$(image_ref)"
   info "检查 sing-box 配置..."
-  docker run --rm --pull=never     -v "$HOME_DIR/config:/etc/sing-box:ro"     -v "$HOME_DIR/data:/var/lib/sing-box"     "$image"     check -c /etc/sing-box/config.json -D /var/lib/sing-box
+  docker run --rm --pull=never \
+    -v "$HOME_DIR/config:/etc/sing-box:ro" \
+    -v "$HOME_DIR/data:/var/lib/sing-box" \
+    "$image" \
+    check -c /etc/sing-box/config.json -D /var/lib/sing-box
 }
 
 start() {
@@ -87,12 +87,20 @@ test_node() {
     return 1
   }
 
-  docker run --rm --pull=never     -v "$t:/etc/sing-box:ro"     "$image"     check -c /etc/sing-box/config.json -D /tmp/sing-box || {
+  docker run --rm --pull=never \
+    -v "$t:/etc/sing-box:ro" \
+    "$image" \
+    check -c /etc/sing-box/config.json -D /tmp/sing-box || {
       rm -rf "$t"
       return 1
     }
 
-  docker run -d --rm --pull=never     --name "$c"     -p '127.0.0.1::7891/tcp'     -v "$t:/etc/sing-box:ro"     "$image"     -D /tmp/sing-box -c /etc/sing-box/config.json run >/dev/null || {
+  docker run -d --rm --pull=never \
+    --name "$c" \
+    -p '127.0.0.1::7891/tcp' \
+    -v "$t:/etc/sing-box:ro" \
+    "$image" \
+    -D /tmp/sing-box -c /etc/sing-box/config.json run >/dev/null || {
       rm -rf "$t"
       return 1
     }
@@ -206,8 +214,8 @@ upgrade() {
 
 pull() {
   backup
-  image_pull
-  check
+  image_pull || return 1
+  check || return 1
   dc up -d --force-recreate --pull never sing-box
 }
 

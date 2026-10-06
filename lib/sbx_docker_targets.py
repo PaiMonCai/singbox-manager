@@ -1,16 +1,48 @@
 #!/usr/bin/env python3
 import argparse
+import fcntl
 import json
 import os
 import subprocess
 import sys
 import tempfile
+import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 HOME = Path(os.environ.get("SBX_HOME", "/opt/singbox-manager"))
 STATE = Path(os.environ.get("SBX_DOCKER_MANAGED_FILE", str(HOME / "docker-managed.json")))
 STATE_VERSION = 1
+
+# 会「读-改-写」docker-managed.json 的子命令：整个事务必须互斥，
+# 否则并发的 add/remove/sync 会各自基于旧快照写回，互相覆盖导致托管目标丢失。
+# sync 不改写托管文件，但它按照托管清单去改 Docker 网络，必须看到一致快照，
+# 并且要与 add/remove 串行，避免刚被取消托管的目标又被接进网络。
+MUTATING_COMMANDS = frozenset({"add", "remove", "sync"})
+
+# 固定锁文件路径（.docker-managed.* 已在 .gitignore 中）。
+LOCK_FILE = STATE.parent / ".docker-managed.lock"
+_LOCK_HANDLE: Optional[Any] = None
+
+
+def acquire_state_lock(timeout: float = 15.0) -> None:
+    """独占托管清单的读-改-写周期。进程退出时 flock 自动释放，无需显式解锁。"""
+    global _LOCK_HANDLE
+    if _LOCK_HANDLE is not None:
+        return
+    LOCK_FILE.parent.mkdir(parents=True, exist_ok=True)
+    handle = LOCK_FILE.open("w")
+    deadline = time.monotonic() + timeout
+    while True:
+        try:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            break
+        except OSError:
+            if time.monotonic() >= deadline:
+                handle.close()
+                raise ValueError("托管清单正被其它进程占用，请稍后重试")
+            time.sleep(0.1)
+    _LOCK_HANDLE = handle
 
 
 def run(cmd: List[str], check: bool = True) -> subprocess.CompletedProcess:
@@ -399,6 +431,9 @@ def build_parser() -> argparse.ArgumentParser:
 def main() -> int:
     try:
         args = build_parser().parse_args()
+        # 只给写命令加锁：scan/list 等纯读命令保持无锁，避免把只读操作串行化。
+        if getattr(args, "cmd", None) in MUTATING_COMMANDS:
+            acquire_state_lock()
         return int(args.func(args) or 0)
     except (ValueError, subprocess.CalledProcessError, json.JSONDecodeError) as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
