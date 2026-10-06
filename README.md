@@ -74,6 +74,43 @@ sbx reapply
 - `VERSION` 文件在最后一步写入，因此“`VERSION` 已是新值”可以认为管理器文件已经装全。
 - 只更新管理器的流程（`sbx manager update`）不再询问、也不再校验 sing-box 版本与端口，因此 `.env` 里即使是 `SING_BOX_VERSION=latest` 也不会阻塞管理器更新。
 
+### 源码完整性校验（SHA256SUMS）
+
+安装器（`install.sh` / `sbx-install`）与管理器自更新都支持用 `sha256sum` 清单校验下载到的源码文件，用来发现 CDN、对象存储或第三方镜像站返回的内容被改写：
+
+| 变量 | 默认 / 作用 |
+| --- | --- |
+| `SBX_SOURCE_SHA256SUMS` | 校验清单的 URL 或本地路径；留空时默认取 `<候选源 base>/SHA256SUMS` |
+| `SBX_REQUIRE_CHECKSUM=1` | 安装器严格模式：清单不可得即中止安装 |
+| `SBX_UPDATE_SHA256SUMS` | 自更新用的校验清单；默认 `<更新源 base>/SHA256SUMS` |
+| `SBX_UPDATE_REQUIRE_CHECKSUM=1` | 自更新严格模式：清单不可得即中止更新 |
+| `SBX_UPDATE_SHA256` | 原有的单文件校验，保留；仍可单独校验 `install.sh` |
+
+语义（安装器与自更新都适用）：
+
+- 清单可得且可解析 → 下载的每个源码文件都必须匹配：**不匹配或清单里缺条目即中止**（自更新时绝不继续执行）。
+- 清单不可得（安装器侧还包括清单不可解析）→ 打印一次警告后按原行为继续；严格模式下（`..._REQUIRE_CHECKSUM=1`）清单不可得即中止。
+- 自更新多一层保险：清单取到了但不含任何可解析条目时，视为清单损坏并**直接中止**，不静默放行。
+- 清单格式是标准 `sha256sum` 输出：`<64 位十六进制哈希><空格><相对路径>`（标准 `sha256sum` 是两个空格，单空格 / TAB 也接受，`*` 二进制前缀可有可无），允许 `#` 注释与空行；路径写法与 `install.sh` 的 `SOURCE_REQUIRED` 一致（例如 `lib/sbx_nodes.py`）。
+
+**防护边界**：清单和源码来自同一个分支 / 同一个镜像地址，所以它挡得住“CDN / 镜像站改写内容”，**挡不住仓库本身被改写** —— 攻击者改了源码，也会顺带改掉同一分支里的 `SHA256SUMS`。要真正锁定内容，请把来源固定到不可变的 tag（`SBX_INSTALL_BRANCH` / `SBX_UPDATE_BRANCH`）并使用自建源（`SBX_SOURCE_BASE_URL` / `SBX_UPDATE_BASE_URL`），这样清单才具备独立可信度。
+
+### 如何发布校验清单（可选，但推荐）
+
+默认路径依赖 `<源 base>/SHA256SUMS`。**目前本仓库尚未发布该文件**，所以在官方源上默认只会打印一次“未找到校验清单”的警告，然后按老行为继续（启用强制校验请用 `SBX_REQUIRE_CHECKSUM=1` / `SBX_UPDATE_REQUIRE_CHECKSUM=1`）。要真正启用，按下面的方式生成并随源码一起发布：
+
+```bash
+# 在仓库根执行：清单条目必须与 install.sh 的 SOURCE_REQUIRED 一一对应（17 项）
+sha256sum compose.yml .env.example config/config.example.json \
+  bin/sbx bin/sbx-docker-watch bin/sbx-install \
+  lib/*.py lib/*.sh VERSION > SHA256SUMS
+```
+
+两条硬性约束：
+
+- **`SHA256SUMS` 本身不要写进清单**（不列入 `SOURCE_REQUIRED`），否则会形成自我引用的死循环。
+- **任何一项源码文件改动后都必须重新生成**：清单是「不匹配即中止」的，过期清单会让所有安装与自更新直接失败。建议在 CI 里加一道一致性检查（清单存在时，重新生成后与已提交内容比对，不一致就红），把这条约束变成门禁而不是靠记忆。
+
 ## 节点管理
 
 进入菜单：
@@ -254,20 +291,6 @@ sbx route cn-direct-full
 - `cn-direct-full`：增加中国 GeoIP / Geosite 二进制 rule-set，用于更完整的国内直连；首次使用需要能够下载规则集。
 
 升级到 0.3 后不会自动改变原有流量策略：旧节点库会迁移到新格式，但默认保持 `manual + global`，需要你主动开启 `auto` 或国内直连模式。
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
 ## 0.11.16：托管同步的竞态不再误报“接入失败”
 
@@ -476,13 +499,15 @@ sbx inbound edit 3 --port 7899
 ```
 
 - 之前 `sbx inbound edit default` / `delete default` 会报 `未找到入口: default` —— 列表里明明有这个入口。原因是编辑/删除走的是“只认自定义入口”的解析器，而列表和 `--endpoint` 走的是另一套（含内置默认入口）。现在统一成一套。
-- 默认入口**不能编辑也不能删除**（它的监听地址/端口来自 `.env` 的 `SING_BOX_BIND_ADDR` / `SING_BOX_MIXED_PORT`，出口恒为 proxy），所以现在给的是明确说明而不是“未找到”：
+- 0.11.11 及以前：默认入口**不能编辑也不能删除**（它的监听地址/端口来自 `.env` 的 `SING_BOX_BIND_ADDR` / `SING_BOX_MIXED_PORT`，出口恒为 proxy），所以当时给的是明确说明而不是“未找到”：
 
   ```text
   默认入口不能编辑或删除：它的监听地址/端口来自 .env（SING_BOX_BIND_ADDR / SING_BOX_MIXED_PORT），
   出口恒为 proxy。改 .env 后执行 sbx restart，或重跑安装器（SBX_RECONFIGURE=1）重新配置；
   需要别的端口/出口请用「添加」新建自定义入口。
   ```
+
+  > 0.11.12 起这条限制已放开：默认入口可以编辑宿主机监听地址/端口（写入 `.env`）和出口（`proxy` / `auto` / `direct` / 指定节点），只有改名与删除仍然被拒。上面这段提示语只属于 0.11.11 及以前，现状见 [0.11.12：默认入口也能编辑了](#01112默认入口也能编辑了监听端口出口)。
 
 - 序号越界现在是 `入口序号超出范围: 9（当前 1-3）`，而不是莫名其妙命中某个 ID 前缀（`9` 以前会解析成 `9d52daa0`）。完整 ID 仍然优先，所以全数字的 ID（例如 `22222222`）不会被当成序号。
 
@@ -736,14 +761,7 @@ jsDelivr 对 `@main` 这类分支路径有约 12 小时的缓存，raw 的 CDN �
 
 ## 0.11.4：节点改用序号操作，ID 退到内部
 
-节点操作不再要求你记 8 位 ID，也不需要先复制 ID 再粘贴：
-
-```text
-默认  序号   协议          名称                    来源          地址
-------------------------------------------------------------------------------------------------
-      1      vless         美国【优化|×3】          import-uri    38.47.116.141:32242
-*     2      shadowsocks   香港【ix|×4】            import-uri    5434se.viaspeed.shop:27644
-```
+节点操作不再要求你记 8 位 ID，也不需要先复制 ID 再粘贴。列表输出与 [节点管理](#节点管理) 小节一致（六列：默认 / 序号 / 协议 / 名称 / 来源 / 地址），这里不再重复示例。
 
 `sbx node` 菜单里 编辑 / 删除 / 默认 / 详情 / 测试 都只问序号（直接回车会先打印列表再让你输序号）：
 
@@ -1093,10 +1111,10 @@ sbx docker-network env a1b2c3d4
 sbx docker-network snippet a1b2c3d4
 ```
 
-交互式“扫描并托管”也改为按入口 ID 选择：
+交互式“扫描并托管”的入口选择（0.10.1 起改为输入序号，提示语也不再带 `[default]`）：
 
 ```text
-代理入口 ID [default]:
+请选择代理入口 [1]:
 ```
 
 旧版 `docker-managed.json` 中已经保存的 `port` 会在第一次查看/同步时按当前入口表迁移为 `inbound_id`。为了兼容旧脚本，数字端口仍可作为查询引用使用，但新的托管状态只保存 ID。
@@ -1587,7 +1605,7 @@ sudo SBX_SOURCE_BASE_URL=https://example.com/singbox-manager/main \
   bash /tmp/sbx-install.sh
 ```
 
-该地址下需要保持与仓库一致的相对路径，例如：
+该地址下需要保持与仓库一致的相对路径（共 17 项，与 `install.sh` 的 `SOURCE_REQUIRED` 一一对应）：
 
 ```text
 compose.yml
@@ -1599,7 +1617,17 @@ lib/sbx_v3.sh
 lib/sbx_proxy.sh
 lib/sbx_bootstrap.sh
 lib/sbx_image.sh
+lib/sbx_inbound.sh
+lib/sbx_docker_network.sh
+lib/sbx_docker_targets.py
+bin/sbx-docker-watch
+lib/sbx_verify.py
+lib/sbx_update.sh
+bin/sbx-install
+VERSION
 ```
+
+> 此清单必须与 `install.sh` 的 `SOURCE_REQUIRED` 保持同步：镜像里缺任何一项，安装器都会判定该来源不完整并跳过它（或直接失败），别只同步前几个文件。
 
 ## 0.5.2：修复重复 inbound tag
 
@@ -1681,11 +1709,11 @@ ghcr.io/sagernet/sing-box:<version>
 如果失败，会自动进入 Bootstrap 菜单：
 
 ```text
-1. 使用临时 HTTP/HTTPS 代理拉取官方镜像
-2. 使用自定义/可信镜像仓库拉取并重新 tag
+1. 使用临时 HTTP/HTTPS 代理拉取目标镜像
+2. 使用自定义 / 可信镜像仓库拉取并重新 tag
 3. docker load 本地 .tar 镜像包
-4. 再次尝试官方源
-0. 暂时跳过
+4. 明确尝试当前镜像源
+0. 取消
 ```
 
 ### 临时 HTTP 代理
@@ -1890,21 +1918,35 @@ export HTTPS_PROXY=http://127.0.0.1:7890
 ├── compose.inbounds.yml      # 有自定义入口时自动生成
 ├── compose.network.yml       # 启用 Docker 共享代理网络时生成
 ├── .env
+├── .env.example
 ├── docker-managed.json       # 有托管 Docker 目标时生成
 ├── VERSION
 ├── bin/
 │   ├── sbx
-│   └── sbx-install
-├── lib/
-│   └── sbx_nodes.py
+│   └── sbx-docker-watch      # Docker 事件 watcher（托管容器自动重连）
+├── lib/                      # 10 个文件，由 SOURCE_REQUIRED 全量安装
+│   ├── sbx_update.sh
+│   ├── sbx_nodes.py
+│   ├── sbx_docker_targets.py
+│   ├── sbx_verify.py
+│   ├── sbx_docker_network.sh
+│   ├── sbx_inbound.sh
+│   ├── sbx_proxy.sh
+│   ├── sbx_bootstrap.sh
+│   ├── sbx_image.sh
+│   └── sbx_v3.sh
 ├── nodes/
 │   ├── nodes.json
 │   └── .sbx-nodes.lock       # 节点库写锁（flock，仅加锁用，可删除）
 ├── config/
+│   ├── config.example.json
 │   └── config.json
 ├── data/
-└── backup/
+├── backup/
+└── proxy-state/              # 代理状态记录（curlrc / npm 等，权限 700）
 ```
+
+`bin/sbx-install` 不在安装目录里：安装时它被复制到 `/usr/local/bin/sbx-install`，`/usr/local/bin/sbx` 则软链到 `<安装目录>/bin/sbx`。
 
 ## 安全说明
 
@@ -1912,7 +1954,7 @@ export HTTPS_PROXY=http://127.0.0.1:7890
 - 不要把生产节点密码、UUID、Reality Key 或完整 `nodes.json` 提交到 Git。
 - `sbx node show` 默认对敏感字段做脱敏显示。
 - 升级 sing-box 前会先备份并用目标版本检查现有配置，失败时回滚版本设置。
-- 管理器自更新默认从可变的 `main` 分支拉取并以 root 执行；无人值守场景请用 `SBX_UPDATE_BRANCH` 固定到 tag，并设置 `SBX_UPDATE_SHA256` 校验。
+- 管理器自更新默认从可变的 `main` 分支拉取并以 root 执行；无人值守场景请用 `SBX_UPDATE_BRANCH` 固定到 tag，并用 `SBX_UPDATE_SHA256SUMS`（配合 `SBX_UPDATE_REQUIRE_CHECKSUM=1` 严格模式）校验整套更新文件；只想单独校验 `install.sh` 时仍可用 `SBX_UPDATE_SHA256`。安装器侧对应 `SBX_SOURCE_SHA256SUMS` / `SBX_REQUIRE_CHECKSUM=1`。注意清单与源码同源：它挡得住 CDN / 镜像站改写内容，但挡不住仓库本身被改写，详见 [源码完整性校验（SHA256SUMS）](#源码完整性校验sha256sums)。
 - Docker daemon 代理、Git/APT/npm 系统代理以及 curl 的 `~/.curlrc` 都会写入宿主机配置；关闭时请使用对应的 `sbx proxy ... off`，不要只手工删文件（会留下引用已删除配置的残留，以及指向已停代理的 curl 配置）。
 
 ## Roadmap
