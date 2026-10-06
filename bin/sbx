@@ -291,9 +291,9 @@ if [[ ${EUID:-$(id -u)} -eq 0 && "${SBX_ALLOW_UNSAFE_LIB:-0}" != "1" ]]; then
     _libf="$HOME_DIR/lib/$_lib"
     _mode="$(stat -c '%a' "$_libf" 2>/dev/null || true)"
     if [[ ! -O "$_libf" ]]; then
-      die "lib 文件可被非 root 用户修改，拒绝以 root 加载: $_libf"
+      die "lib 文件可被非 root 用户修改，拒绝以 root 加载: $_libf（真实安装由 install.sh 以 root 安装；若这是你自己的测试副本，可设 SBX_ALLOW_UNSAFE_LIB=1 跳过此校验）"
     elif [[ "$_mode" =~ ^[0-7]{3,4}$ ]]; then
-      (( (8#$_mode & 8#22) == 0 )) || die "lib 文件可被非 root 用户修改，拒绝以 root 加载: $_libf"
+      (( (8#$_mode & 8#22) == 0 )) || die "lib 文件可被非 root 用户修改，拒绝以 root 加载: $_libf（真实安装由 install.sh 以 root 安装；若这是你自己的测试副本，可设 SBX_ALLOW_UNSAFE_LIB=1 跳过此校验）"
     else
       warn "无法通过 stat 读取 $_libf 的权限位，仅校验了属主。"
     fi

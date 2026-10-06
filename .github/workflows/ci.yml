@@ -382,6 +382,10 @@ jobs:
           # 节点库权限是 600 且由 sudo 写；本步骤所有读写统一用 sudo，避免跨用户权限差异
           sudo mkdir -p "$NODE_HOME/nodes" "$NODE_HOME/config" "$NODE_HOME/data" "$NODE_HOME/backup"
           sudo cp -a lib bin compose.yml "$NODE_HOME/"
+          # cp -a 会保留属主，拷出来仍是 runner 所有；而真实 install.sh 是用 `install -m 0755`
+          # 以 root 安装的（root 所有）。bin/sbx 在 root 下会拒绝 source 非 root 所有的 lib
+          # （防止受限 sudo 用户借 SBX_HOME 让 root 加载自己的代码），所以这里要还原成真实形态。
+          sudo chown -R root:root "$NODE_HOME/lib" "$NODE_HOME/bin"
           sudo tee "$NODE_HOME/.env" >/dev/null <<'ENV'
           SING_BOX_IMAGE=ghcr.io/sagernet/sing-box
           SING_BOX_VERSION=v1.14.2
