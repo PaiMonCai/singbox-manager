@@ -2,7 +2,7 @@
 
 面向 Linux 服务器的 sing-box Docker 管理层。sing-box 保持官方镜像运行，宿主机通过 `sbx` 完成安装、节点管理、配置生成、校验、测试、备份恢复与升级。
 
-当前版本：**0.11.16**
+当前版本：**0.11.17**
 
 ## 目录
 
@@ -486,6 +486,25 @@ sbx proxy status
 ```
 
 这样 Docker 拉镜像、Git、APT 与 npm 都会统一经过本机 sing-box。
+
+## Docker 容器里的 SOCKS5 / SOCKS5H
+
+`sbx docker-network urls` 现在会同时显示两个 SOCKS URL：
+
+```text
+SOCKS5:  socks5://sing-box:7890
+SOCKS5H: socks5h://sing-box:7890
+```
+
+它们连接的是**同一个 sing-box SOCKS5 / mixed 入口**，不是两个不同服务。区别主要是客户端如何解释代理 URL：`socks5h` 明确表示把目标域名交给 SOCKS 代理端解析；`socks5` 的兼容性更好，不同客户端对 DNS 解析位置的具体行为可能不同。
+
+因此：
+
+- 普通情况下可继续使用 `socks5h://`，尤其是希望明确使用代理端 DNS 的工具；
+- 如果应用或依赖库报 `proxy: unknown scheme: socks5h`，直接把 scheme 改成 `socks5://`，**地址和端口不用改**；
+- `sbx docker-network env` / Compose snippet 仍默认生成 `ALL_PROXY=socks5h://...`，保持原有远程 DNS 语义；遇到不兼容客户端时手工改成 `socks5://...` 即可。
+
+这类兼容性问题常见于部分旧版 Go / WebSocket 代理实现：HTTP 请求可能正常，但 WebSocket 使用另一套代理解析代码后拒绝 `socks5h`。这不代表 sing-box 或 SOCKS5 本身不支持 WebSocket。
 
 ## 常用命令
 
