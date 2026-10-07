@@ -5,6 +5,7 @@ singbox-manager 的逐版本变更记录，按时间倒序（最新在上）。
 
 ## 版本索引
 
+- [0.11.17：SOCKS5H 不再是唯一展示入口，补上兼容地址](#01117socks5h-不再是唯一展示入口补上兼容地址)
 - [0.11.16：托管同步的竞态不再误报“接入失败”](#01116托管同步的竞态不再误报接入失败)
 - [0.11.15：给 systemd 单元加固（崩溃快速失败 + 显式补 HOME）](#01115给-systemd-单元加固崩溃快速失败--显式补-home)
 - [0.11.14：修掉“没有 HOME 时 sbx 完全起不来”（连同自动更新一起中招）](#01114修掉没有-home-时-sbx-完全起不来连同自动更新一起中招)
@@ -35,6 +36,39 @@ singbox-manager 的逐版本变更记录，按时间倒序（最新在上）。
 - [0.5.1：禁止运行期隐式拉镜像](#051禁止运行期隐式拉镜像)
 
 ---
+
+## 0.11.17：SOCKS5H 不再是唯一展示入口，补上兼容地址
+
+Docker 共享代理网络之前把 SOCKS 地址只展示成：
+
+```text
+socks5h://sing-box:7890
+```
+
+这会误导用户把 `socks5h` 当成 sing-box 的另一种入口协议。实际上 `socks5://` 与
+`socks5h://` 都连接同一个 SOCKS5 / mixed 入口；`h` 主要是客户端侧的 URL 语义，
+用于强调目标域名由代理端解析。
+
+部分客户端或旧版依赖库只接受 `socks5://`。典型症状是 HTTP/SSE 正常，但 WebSocket
+建连直接报：
+
+```text
+proxy: unknown scheme: socks5h
+```
+
+本版把 `docker-network connect`、`docker-network urls` 和托管成功后的代理提示统一改成
+**同时展示**：
+
+```text
+SOCKS5:  socks5://sing-box:7890
+SOCKS5H: socks5h://sing-box:7890
+```
+
+并明确说明：遇到 `unknown scheme: socks5h` 时只需改成 `socks5://`，地址和端口不变。
+
+为了不悄悄改变已有用户的 DNS 行为，`sbx docker-network env` 和 Compose snippet 的
+`ALL_PROXY` **仍默认使用 `socks5h://`**；env 输出会额外带一行注释说明兼容回退方式。
+README 同步补充 SOCKS5 / SOCKS5H 的区别和 WebSocket 兼容性说明。
 
 ## 0.11.16：托管同步的竞态不再误报“接入失败”
 
