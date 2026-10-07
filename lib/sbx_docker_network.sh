@@ -164,7 +164,9 @@ docker_network_connect(){
   printf '\n容器内代理地址：\n'
   local cport; cport="$(docker_network_inbound_port default 2>/dev/null || printf '7890')"
   printf '  HTTP/HTTPS: http://%s:%s\n' "$DOCKER_NETWORK_ALIAS" "$cport"
-  printf '  SOCKS5:     socks5h://%s:%s\n' "$DOCKER_NETWORK_ALIAS" "$cport"
+  printf '  SOCKS5:     socks5://%s:%s  （兼容优先）\n' "$DOCKER_NETWORK_ALIAS" "$cport"
+  printf '  SOCKS5H:    socks5h://%s:%s  （远程 DNS；客户端需支持 socks5h scheme）\n' "$DOCKER_NETWORK_ALIAS" "$cport"
+  warn "若应用报 proxy: unknown scheme: socks5h，请改用上面的 socks5://；两者连接同一个 sing-box SOCKS5 入口。"
   warn "network connect 只建立网络连通性，不会修改该容器已有环境变量。"
   warn "如果该容器由 Compose 管理，建议把 external network 写进它自己的 compose 文件以便重建后仍保留。"
 }
@@ -205,7 +207,8 @@ for i,item in enumerate(items):
     port=item.get('container_port', item['port'])
     print(f"[{item['id']}] {item['name']} -> {item.get('resolved_outbound','') or (item.get('target') or {}).get('type','?')}")
     print(f"  HTTP/HTTPS: http://{host}:{port}")
-    print(f"  SOCKS5:     socks5h://{host}:{port}")
+    print(f"  SOCKS5:     socks5://{host}:{port}  (兼容优先)")
+    print(f"  SOCKS5H:    socks5h://{host}:{port}  (远程 DNS；客户端需支持 socks5h scheme)")
 PY
 }
 
@@ -214,6 +217,7 @@ docker_network_env(){
   port="$(docker_network_inbound_port "$inbound_ref")" || die "代理入口不存在: $inbound_ref"
   printf "export HTTP_PROXY='http://%s:%s'\n" "$DOCKER_NETWORK_ALIAS" "$port"
   printf "export HTTPS_PROXY='http://%s:%s'\n" "$DOCKER_NETWORK_ALIAS" "$port"
+  printf "# ALL_PROXY 默认使用 socks5h 让代理端解析目标域名；若应用不识别 socks5h，请改成 socks5://%s:%s\n" "$DOCKER_NETWORK_ALIAS" "$port"
   printf "export ALL_PROXY='socks5h://%s:%s'\n" "$DOCKER_NETWORK_ALIAS" "$port"
   printf "export http_proxy='http://%s:%s'\n" "$DOCKER_NETWORK_ALIAS" "$port"
   printf "export https_proxy='http://%s:%s'\n" "$DOCKER_NETWORK_ALIAS" "$port"
@@ -311,7 +315,9 @@ docker_network_proxy_hint(){
   id="$(docker_network_inbound_id "$ref" 2>/dev/null || true)"
   name="$(docker_network_inbound_name "$ref" 2>/dev/null || true)"
   printf '代理入口: [%s] %s\n' "${id:-$ref}" "$name"
-  printf '容器内代理：http://%s:%s\n' "$DOCKER_NETWORK_ALIAS" "$container_port"
+  printf '容器内 HTTP/HTTPS：http://%s:%s\n' "$DOCKER_NETWORK_ALIAS" "$container_port"
+  printf '容器内 SOCKS5：    socks5://%s:%s  （兼容优先）\n' "$DOCKER_NETWORK_ALIAS" "$container_port"
+  printf '容器内 SOCKS5H：   socks5h://%s:%s  （远程 DNS；客户端需支持 socks5h scheme）\n' "$DOCKER_NETWORK_ALIAS" "$container_port"
   if [[ "$container_port" != "$host_port" ]]; then
     printf '  （宿主机侧端口是 %s，容器里请用 %s）\n' "$host_port" "$container_port"
   fi
