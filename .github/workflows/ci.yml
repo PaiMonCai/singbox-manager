@@ -1335,9 +1335,14 @@ jobs:
           test "$(docker_network_inbound_port default)" = "7890"
           docker_network_proxy_hint default > /tmp/sbx-proxy-hint.txt
           cat /tmp/sbx-proxy-hint.txt
-          grep -F '容器内代理：http://sing-box:7890' /tmp/sbx-proxy-hint.txt
+          # 0.11.17 起这里拆成三行：HTTP/HTTPS、SOCKS5（兼容优先）、SOCKS5H（远程 DNS）。
+          # 改动这段展示文案时必须同步下面三条断言，否则整个 step 会在这里直接 exit 1。
+          grep -F '容器内 HTTP/HTTPS：http://sing-box:7890' /tmp/sbx-proxy-hint.txt
+          grep -F '容器内 SOCKS5：    socks5://sing-box:7890' /tmp/sbx-proxy-hint.txt
+          grep -F '容器内 SOCKS5H：   socks5h://sing-box:7890' /tmp/sbx-proxy-hint.txt
           grep -F '宿主机侧端口是 7895' /tmp/sbx-proxy-hint.txt
-          if grep -F 'http://sing-box:7895' /tmp/sbx-proxy-hint.txt; then
+          # 三条地址都必须用容器内端口；任何一条漏成宿主端口都算回归
+          if grep -F -e 'http://sing-box:7895' -e 'socks5://sing-box:7895' -e 'socks5h://sing-box:7895' /tmp/sbx-proxy-hint.txt; then
             echo '托管提示把宿主机端口当成了容器内端口' >&2; exit 1
           fi
           docker_network_env default | grep -F "HTTP_PROXY='http://sing-box:7890'"
